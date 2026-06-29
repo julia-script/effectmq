@@ -1,0 +1,44 @@
+{
+  "name": "effectmq",
+  "version": "1.0.0",
+  "description": "Effect-based message queue",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "turbo run lint",
+    "lint:fix": "pnpm biome check --write --unsafe"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@biomejs/biome": "^2.5.1",
+    "@effect/platform-node": "4.0.0-beta.85",
+    "@effect/sql-sqlite-node": "4.0.0-beta.85",
+    "@xstate/store": "^4.2.0",
+    "effect": "4.0.0-beta.85",
+    "msgpackr": "2.0.4",
+    "tsx": "^4.22.4"
+  },
+  "devDependencies": {
+    "@testcontainers/redis": "^12.0.3",
+    "@types/node": "^22.0.0",
+    "ioredis": "^5.11.1",
+    "testcontainers": "^12.0.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

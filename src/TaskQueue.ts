@@ -134,7 +134,7 @@ export const extendLock = Effect.fnUntraced(function* <
   );
 });
 
-export const unlock = Effect.fnUntraced(function* <
+export const release = Effect.fnUntraced(function* <
   Payload extends AnyStructSchema,
   Success extends Schema.Top,
   Error extends Schema.Top,

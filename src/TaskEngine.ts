@@ -84,69 +84,7 @@ export class TaskEngine extends Context.Service<
   }
 >()("TaskEngine") {}
 
-// const CompletionPolicySchema = Schema.Literals([
-// 	"delete",
-// 	"keep",
-// 	"mark-as-success",
-// 	"mark-as-failure",
-// ]);
-// export type CompletionPolicy = typeof CompletionPolicySchema.Type;
-// const TaskInsertSchema = Schema.Struct({
-// 	prefix: Schema.String,
-// 	id: Schema.String,
-// 	name: Schema.String,
-// 	payload: Schema.String,
-// 	delay: Schema.Number,
-// 	maxRetries: Schema.Number,
-// 	onSuccessPolicy: CompletionPolicySchema,
-
-// 	onFailurePolicy: CompletionPolicySchema,
-// });
-
-// export class StalledErrorSchema extends Schema.TaggedErrorClass<StalledErrorSchema>()(
-// 	"~effectmq/Error/Stalled",
-// 	{
-// 		timestamp: Schema.Number,
-// 	},
-// ) {
-// 	static of(timestamp: number) {
-// 		return new StalledErrorSchema({ timestamp });
-// 	}
-// }
-// export class CanceledErrorSchema extends Schema.TaggedErrorClass<CanceledErrorSchema>()(
-// 	"~effectmq/Error/Canceled",
-// 	{
-// 		timestamp: Schema.Number,
-// 	},
-// ) {
-// 	static of(timestamp: number) {
-// 		return new CanceledErrorSchema({ timestamp });
-// 	}
-// }
-// export const EngineErrorSchema = Schema.Union([
-// 	StalledErrorSchema,
-// 	CanceledErrorSchema,
-// ]);
-
-// export type EngineError = typeof EngineErrorSchema.Type;
-// export const AnyErrorSchema = Schema.Unknown
-// export type AnyError = AnyStructSchema;
-// export const EngineTaskSchema = Schema.Struct({
-// 	id: Schema.String,
-// 	name: Schema.String,
-// 	payload: Schema.String,
-// 	delay: Schema.Number,
-// 	maxRetries: Schema.Number,
-// 	onSuccessPolicy: CompletionPolicySchema,
-// 	onFailurePolicy: CompletionPolicySchema,
-// 	createdAt: Schema.Date,
-// 	updatedAt: Schema.Date,
-// 	errors: Schema.Array(AnyErrorSchema),
-// 	success: Schema.optional(Schema.String),
-// });
-// export type EngineTask = typeof EngineTaskSchema.Type;
 const importMap = {
-  // debugTime: /*lua*/`local now = redis.call("TIME")[1]`,
   scheduleHash: /*lua*/ `local function scheduleHash(prefix, name) return prefix .. ":schedule:" .. name end`,
   taskHash: /*lua*/ `local function taskHash(prefix, id) return prefix .. ":task:" .. id end`,
   delayedList: /*lua*/ `local function delayedList(prefix) return prefix .. ":scheduled" end`,
@@ -201,7 +139,8 @@ const importMap = {
   getTaskErrors: /*lua*/ `local function getTaskErrors(prefix, id) 
     return cjson.decode(redis.call("HGET", taskHash(prefix, id), "errors")) 
   end`,
-  setTaskErrors: /*lua*/ `local function setTaskErrors(prefix, id, errors) return redis.call("HSET", taskHash(prefix, id), "errors", cjson.encode(errors)) end`,
+  setTask: /*lua*/ `local function setTask(prefix, id, ...) return redis.call("HSET", taskHash(prefix, id), "updatedAt", now, ...) end`,
+  setTaskErrors: /*lua*/ `local function setTaskErrors(prefix, id, errors) return setTask(prefix, id, "errors", cjson.encode(errors)) end`,
   appendTaskError: /*lua*/ `local function appendTaskError(prefix, id, error) 
 		local errorsList = getTaskErrors(prefix, id)
 		errorsList[#errorsList + 1] = error
@@ -209,11 +148,20 @@ const importMap = {
 		return errorsList
 	end`,
   failTask: /*lua*/ `local function failTask(prefix, id, error)
-		local errorsList = appendTaskError(prefix, id, error)
+		-- error arrives as a JSON string (writeError) or a Lua table (syncLocks); normalize to a table
+		-- so the stored errors list holds objects, not double-encoded strings
+		local errorObj = error
+		if type(error) == "string" then
+			local ok, decoded = pcall(cjson.decode, error)
+			errorObj = ok and decoded or error
+		end
+		local errorsList = appendTaskError(prefix, id, errorObj)
 	   local onFailurePolicy = getTaskField(prefix, id, "onFailurePolicy")
-		 local maxRetries = getTaskField(prefix, id, "maxRetries")
+		 local maxRetries = tonumber(getTaskField(prefix, id, "maxRetries"))
 
-		 if error._tag ~= "~effectmq/Error/Canceled" and #errorsList < maxRetries then
+		 local errorTag = type(errorObj) == "table" and errorObj._tag or nil
+
+		 if errorTag ~= "~effectmq/Error/Canceled" and #errorsList < maxRetries then
 			  addToWaitList(prefix, id)
 			  return
 			end
@@ -225,7 +173,6 @@ const importMap = {
         removeFromAllLists(prefix, id)
       end
 	end`,
-  setTask: /*lua*/ `local function setTask(prefix, id, ...) return redis.call("HSET", taskHash(prefix, id), "updatedAt", now, ...) end`,
   exists: /*lua*/ `local function exists(key) return redis.call("EXISTS", key) end`,
   lockTask: /*lua*/ `local function lockTask(prefix, id, workerId, lockTimeout) 
     addToActiveLists(prefix, id)
@@ -394,6 +341,7 @@ const buildScripts = (debugMode: boolean) => {
       elseif successPolicy == "keep" then
         removeFromAllLists(prefix, id)
       end
+      unlockTask(prefix, id)
       return task
     `,
         debugMode,
@@ -430,6 +378,7 @@ const buildScripts = (debugMode: boolean) => {
 
       local task = getTask(prefix, id)
 			failTask(prefix, id, error)
+			unlockTask(prefix, id)
 			return task
     `,
         debugMode,
@@ -647,9 +596,9 @@ const buildScripts = (debugMode: boolean) => {
 				elseif list == "active" then
 					return redis.call("ZRANGEBYSCORE", activeList(prefix), 0, "inf")
 				elseif list == "failed" then
-					return redis.call("LRANGE", failedList(prefix), 0, -1)
+					return redis.call("ZRANGEBYSCORE", failedList(prefix), 0, "inf")
 				elseif list == "success" then
-					return redis.call("LRANGE", successList(prefix), 0, -1)
+					return redis.call("ZRANGEBYSCORE", successList(prefix), 0, "inf")
 				end
 				return redis.error_reply("Invalid list")
 				`,
@@ -746,7 +695,10 @@ export const make = ({
           .send<string[]>("HGETALL", withPrefix(`${prefix}:task:${id}`))
           .pipe(
             Effect.flatMap((fields) =>
-              fields.length > 0 ? parseTask(fields) : Effect.succeed(null),
+              // the task hash does not store its own id, so inject it like the Lua getTask does
+              fields.length > 0
+                ? parseTask(["id", id, ...fields])
+                : Effect.succeed(null),
             ),
             Effect.mapError(TaskEngineError.of("Failed to get task")),
           ),
@@ -765,9 +717,6 @@ export const make = ({
         id: string,
         error: string,
       ) {
-        // const encoded = yield* Schema.encodeUnknownEffect()(
-        // 	error,
-        // ).pipe(Effect.mapError(TaskEngineError.of("Failed to encode error")));
         return yield* writeErrorResult(
           withPrefix(prefix),
           workerId,

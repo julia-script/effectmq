@@ -41,7 +41,7 @@ export class TaskEngine extends Context.Service<
     ) => Effect.Effect<EngineTask | null, TaskEngineError>;
     readonly getList: (
       prefix: string,
-      list: "wait" | "scheduled",
+      list: "wait" | "scheduled" | "active" | "failed" | "success",
     ) => Effect.Effect<string[], TaskEngineError>;
 
     readonly writeSuccess: (
@@ -275,7 +275,7 @@ const declare = (code: string, debugMode: boolean = false) => {
     }
   }
   if (debugMode) {
-    result = /*lua*/ `local now = 1000 * tonumber(redis.call("GET", "${MOCKTIME_KEY}") or tonumber(redis.call("TIME")[1]))\n${result}`;
+    result = /*lua*/ `local now = tonumber(redis.call("GET", "${MOCKTIME_KEY}") or (1000 * tonumber(redis.call("TIME")[1])))\n${result}`;
   } else {
     result = /*lua*/ `local now = 1000 * tonumber(redis.call("TIME")[1])\n${result}`;
   }
@@ -289,12 +289,12 @@ export const setMockTime = (time: Duration.Input) =>
   Effect.gen(function* () {
     const redis = yield* Redis.Redis;
     yield* redis.send("SET", MOCKTIME_KEY, String(Duration.toMillis(time)));
-  });
+  }).pipe(Effect.mapError(TaskEngineError.of("Failed to set mock time")));
 export const stepMockTime = (time: Duration.Input) =>
   Effect.gen(function* () {
     const redis = yield* Redis.Redis;
     yield* redis.send("INCRBY", MOCKTIME_KEY, String(Duration.toMillis(time)));
-  });
+  }).pipe(Effect.mapError(TaskEngineError.of("Failed to step mock time")));
 
 const buildScripts = (debugMode: boolean) => {
   const CreateOrUpdateTaskScript = Redis.script(
@@ -627,6 +627,36 @@ const buildScripts = (debugMode: boolean) => {
       ),
     },
   ).withReturnType<[boolean, number | null]>();
+
+  const GetListScript = Redis.script(
+    (
+      prefix: string,
+      list: "wait" | "scheduled" | "active" | "failed" | "success",
+    ) => [prefix, list],
+    {
+      numberOfKeys: 0,
+      lua: declare(
+        /*lua*/ `
+				local prefix = ARGV[1]
+				syncAll(prefix)
+				local list = ARGV[2]
+				if list == "scheduled" then
+					return redis.call("ZRANGEBYSCORE", delayedList(prefix), "0", "inf")
+				elseif list == "wait" then
+					return redis.call("LRANGE", waitList(prefix), 0, -1)
+				elseif list == "active" then
+					return redis.call("ZRANGEBYSCORE", activeList(prefix), 0, "inf")
+				elseif list == "failed" then
+					return redis.call("LRANGE", failedList(prefix), 0, -1)
+				elseif list == "success" then
+					return redis.call("LRANGE", successList(prefix), 0, -1)
+				end
+				return redis.error_reply("Invalid list")
+				`,
+        debugMode,
+      ),
+    },
+  ).withReturnType<string[]>();
   return {
     CreateOrUpdateTaskScript,
     WriteSuccessResultScript,
@@ -637,6 +667,7 @@ const buildScripts = (debugMode: boolean) => {
     RemoveLockScript,
     SetScheduleScript,
     ConsumeScheduleScript,
+    GetListScript,
   };
 };
 
@@ -673,7 +704,7 @@ export const make = ({
     const scripts = buildScripts(debugMode);
     const withPrefix = (key: string) => `${prefix}:${key}`;
 
-    const send = <T>(command: string, ...args: ReadonlyArray<string>) =>
+    const _send = <T>(command: string, ...args: ReadonlyArray<string>) =>
       redis
         .send(command, ...args)
         .pipe(
@@ -693,6 +724,8 @@ export const make = ({
 
     const setSchedule = redis.eval(scripts.SetScheduleScript);
     const consumeSchedule = redis.eval(scripts.ConsumeScheduleScript);
+
+    const getList = redis.eval(scripts.GetListScript);
 
     return TaskEngine.of({
       [TypeId]: TypeId,
@@ -744,13 +777,14 @@ export const make = ({
           Effect.mapError(TaskEngineError.of("Failed to write error result")),
         );
       }),
-      getList: (prefix: string, list: "wait" | "scheduled") =>
+      getList: (
+        prefix: string,
+        list: "wait" | "scheduled" | "active" | "failed" | "success",
+      ) =>
         Effect.gen(function* () {
-          const hash = withPrefix(`${prefix}:${list}`);
-          if (list === "scheduled") {
-            return yield* send<string[]>("ZRANGEBYSCORE", hash, "0", "inf");
-          }
-          return yield* send<string[]>("LRANGE", hash, "0", "-1");
+          return yield* getList(withPrefix(prefix), list).pipe(
+            Effect.mapError(TaskEngineError.of("Failed to get list")),
+          );
         }),
       takeTask: Effect.fnUntraced(function* (
         prefix: string,

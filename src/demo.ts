@@ -1,6 +1,5 @@
 import { NodeRedis } from "@effect/platform-node";
 import { Cron, Effect, Layer, Schema } from "effect";
-import { Redis } from "effect/unstable/persistence";
 import { Scheduler, Task, TaskEngine, TaskQueue } from "./index.js";
 
 const layers = Layer.provideMerge(TaskEngine.layer(), NodeRedis.layer({}));
@@ -13,8 +12,6 @@ const foo = Task.make({
   }),
 });
 const program = Effect.gen(function* () {
-  const redis = yield* Redis.Redis;
-  yield* redis.send("FLUSHALL");
   const queue = TaskQueue.make("myqueue", foo);
 
   yield* TaskQueue.offer(queue, { message: "test" });

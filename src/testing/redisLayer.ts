@@ -1,40 +1,94 @@
-import {
-  RedisContainer,
-  type StartedRedisContainer,
-} from "@testcontainers/redis";
-import { Effect, Layer } from "effect";
+import { RedisContainer } from "@testcontainers/redis";
+import { Effect, Layer, ManagedRuntime } from "effect";
 import * as Redis from "effect/unstable/persistence/Redis";
 import { Redis as IORedis } from "ioredis";
+import { TaskEngine } from "../index.js";
 
-
-export const startRedis = async () => {
-  const container = await new RedisContainer("redis:7").start();
-  const client = new IORedis({
-    host: container.getHost(),
-    port: container.getMappedPort(6379),
+const redisContainer = (image: string) => {
+  const ef = Effect.tryPromise({
+    try: () => new RedisContainer(image).start(),
+    catch: (cause) => new Redis.RedisError({ cause }),
   });
 
-  const redisService = Redis.make({
-    send: <A = unknown>(command: string, ...args: ReadonlyArray<string>) =>
-      Effect.tryPromise({
-        try: () => client.call(command, ...args) as Promise<A>,
-        catch: (cause) => new Redis.RedisError({ cause }),
-      }),
+  return Effect.acquireRelease(ef, (container) =>
+    Effect.promise(() => container.stop()),
+  );
+};
+export const redisContainerLayer = ({
+  image = "redis:7",
+}: {
+  image?: string;
+} = {}) =>
+  Effect.gen(function* () {
+    const container = yield* redisContainer(image);
+
+    const client = yield* Effect.acquireRelease(
+      Effect.succeed(
+        new IORedis({
+          host: container.getHost(),
+          port: container.getMappedPort(6379),
+        }),
+      ),
+      (client) => Effect.succeed(client.disconnect()),
+    );
+
+    return yield* Redis.make({
+      send: <A = unknown>(command: string, ...args: ReadonlyArray<string>) =>
+        Effect.tryPromise({
+          try: () => client.call(command, ...args) as Promise<A>,
+          catch: (cause) => new Redis.RedisError({ cause }),
+        }),
+    });
+  }).pipe(Layer.effect(Redis.Redis));
+const taskEngineLayer = TaskEngine.layer({
+  debugMode: true,
+});
+// const
+
+const layers = taskEngineLayer.pipe(Layer.provideMerge(redisContainerLayer()));
+export const TestRuntime = ManagedRuntime.make(layers);
+
+export const getLists = (prefix: string) =>
+  Effect.gen(function* () {
+    const taskEngine = yield* TaskEngine.TaskEngine;
+    return {
+      wait: yield* taskEngine.getList(prefix, "wait"),
+      scheduled: yield* taskEngine.getList(prefix, "scheduled"),
+      active: yield* taskEngine.getList(prefix, "active"),
+      failed: yield* taskEngine.getList(prefix, "failed"),
+      success: yield* taskEngine.getList(prefix, "success"),
+    };
   });
 
-  const layer = Layer.effect(Redis.Redis, redisService);
+// // );
+// export const startRedis = async () => {
+//   const container = await new RedisContainer("redis:7").start();
+//   const client = new IORedis({
+//     host: container.getHost(),
+//     port: container.getMappedPort(6379),
+//   });
 
-  const stop = async () => {
-    client.disconnect();
-    await container.stop();
-  };
+//   const redisService = Redis.make({
+//     send: <A = unknown>(command: string, ...args: ReadonlyArray<string>) =>
+//       Effect.tryPromise({
+//         try: () => client.call(command, ...args) as Promise<A>,
+//         catch: (cause) => new Redis.RedisError({ cause }),
+//       }),
+//   });
 
-  return { container, client, layer, stop };
-};
+//   const layer = Layer.effect(Redis.Redis, redisService);
 
-export type StartedRedis = {
-  container: StartedRedisContainer;
-  client: IORedis;
-  layer: Layer.Layer<Redis.Redis>;
-  stop: () => Promise<void>;
-};
+//   const stop = async () => {
+//     client.disconnect();
+//     await container.stop();
+//   };
+
+//   return { container, client, layer, stop };
+// };
+
+// export type StartedRedis = {
+//   container: StartedRedisContainer;
+//   client: IORedis;
+//   layer: Layer.Layer<Redis.Redis>;
+//   stop: () => Promise<void>;
+// };

@@ -1,3 +1,12 @@
+/**
+ * effectmq — an Effect-based, Redis-backed message queue.
+ *
+ * Public entry point. Most applications use {@link TaskQueue} (typed enqueue /
+ * process) and {@link Scheduler} (cron-driven work); {@link TaskEngine} is the
+ * lower-level service they build on, and {@link Task} defines task types.
+ *
+ * @module
+ */
 export * as Scheduler from "./Scheduler.js";
 export * as Task from "./Task.js";
 export * as TaskEngine from "./TaskEngine.js";

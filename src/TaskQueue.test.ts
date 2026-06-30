@@ -49,9 +49,13 @@ describe("TaskQueue", () => {
   test("complete routes a handler failure to the engine and reports false", () =>
     Effect.gen(function* () {
       const queue = makeQueue("tq-complete-fail");
-      yield* TaskQueue.offer(queue, { userId: "u3", amount: 7 }, {
-        onFailurePolicy: "mark-as-failure",
-      });
+      yield* TaskQueue.offer(
+        queue,
+        { userId: "u3", amount: 7 },
+        {
+          onFailurePolicy: "mark-as-failure",
+        },
+      );
 
       const done = yield* TaskQueue.complete(queue, () =>
         Effect.fail({ reason: "nope" }),

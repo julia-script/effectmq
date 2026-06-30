@@ -1,122 +1,29 @@
+/**
+ * Typed task definitions: the schema-bearing description of a unit of work
+ * (payload, success, and error types) that a {@link TaskQueue} processes.
+ *
+ * @module
+ */
 import { Schema } from "effect";
 import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
 import type { TaskSchema } from "./Schemas.js";
 
 const TypeId = "~effectmq/Task" as const;
 
-// const makeTaskSchema = <
-// 	Payload extends AnyStructSchema,
-// 	Success extends Schema.Top,
-// 	Error extends Schema.Top,
-// >(
-// 	payloadSchema: Payload,
-// 	successSchema: Success,
-// 	errorSchema: Error,
-// ) =>
-// 	Schema.Struct({
-// 		...TaskEngine.EngineTaskSchema.fields,
-// 		success: Schema.optional(successSchema),
-// 		errors: Schema.Array(
-// 			Schema.Union([TaskEngine.EngineErrorSchema, errorSchema]),
-// 		),
-// 		payload: Schema.fromJsonString(payloadSchema),
-// 	});
-
-// const abc: Schema.Codec<{ a: string; b: number }, { a: string; b: string }> =
-// 	Schema.Struct({
-// 		a: Schema.String,
-// 		b: Schema.Number.pipe(Schema.fromJsonString),
-// 	});
-
-// type TaskSchema<
-// 	Payload extends AnyStructSchema,
-// 	Success extends Schema.Top,
-// 	Error extends Schema.Top,
-// > = Schema.Schema<Task<Payload["Type"], Success["Type"], Error["Type"]>>;
-
-// const makeTaskFromEngineTask = <
-// 	Payload extends AnyStructSchema,
-// 	Success extends Schema.Top,
-// 	Error extends Schema.Top,
-// >(
-// 	payloadSchema: Payload,
-// 	successSchema: Success,
-// 	errorSchema: Error,
-// ): Schema.decodeTo<
-// 	TaskSchema<Payload, Success, Error>,
-// 	typeof TaskEngine.EngineTaskSchema
-// > => {
-// 	const a = payloadSchema.pipe(Schema.fromJsonString);
-// 	// throw new Error("Not implemented");
-// 	const b = Schema.decodeTo<TaskSchema<Payload, Success, Error>>(
-// 		Schema.Struct({
-// 			...TaskEngine.EngineTaskSchema.fields,
-// 			payload: a,
-// 			success: Schema.optional(successSchema),
-// 			errors: Schema.Array(
-// 				Schema.Union([TaskEngine.EngineErrorSchema, errorSchema]),
-// 			),
-// 		}),
-// 		// Schema.Struct({
-// 		// 	...TaskEngine.EngineTaskSchema.fields,
-// 		// 	payload: payloadSchema.pipe(Schema.fromJsonString),
-// 		// 	success: Schema.optional(successSchema.pipe(Schema.fromJsonString)),
-// 		// 	errors: Schema.Array(
-// 		// 		Schema.Union([
-// 		// 			TaskEngine.EngineErrorSchema,
-// 		// 			errorSchema.pipe(Schema.fromJsonString),
-// 		// 		]),
-// 		// 	),
-// 		// }),
-// 		// {
-// 		//   decode: SchemaGetter.transform((value) => JSON.parse(value)),
-// 		//   encode: SchemaGetter.transform((value) => JSON.stringify(value)),
-// 		// }
-// 		// ),
-// 	);
-// 	return b;
-// 	// return Schema.Struct({
-// 	// 	...TaskEngine.EngineTaskSchema.fields,
-// 	// 	payload: payloadSchema.pipe(
-// 	//     Schema.encodeTo(Schema.String, {
-// 	//       decode: SchemaGetter.transform((value) => JSON.parse(value)),
-// 	//       encode: SchemaGetter.transform((value) => JSON.stringify(value)),
-// 	//     })
-// 	//   ),
-
-// 	// 	// success: Schema.optional(Schema.fromJsonString(successSchema)),
-// 	// 	// errors: Schema.Array(
-// 	// 	// 	Schema.Union([TaskEngine.EngineErrorSchema, errorSchema]),
-// 	// 	// ),
-// 	// });
-// };
-
-// const makeTaskSchema2 = <Payload extends AnyStructSchema, Success extends Schema.Top, Error extends Schema.Top>(config: {
-//   payload: Payload,
-//   success: Success,
-//   error: Error,
-// }): Schema.Schema<Task<Payload["Type"], Success["Type"], Error["Type"]>> => Schema.TaggedStruct("Task", {
-//   id: Schema.String,
-//   // ...TaskEngine.EngineTaskSchema.fields,
-//   payload: Schema.toType(config.payload),
-//   success: Schema.optional(Schema.toType(config.success)),
-//   errors: Schema.Array(
-//     Schema.Union([TaskEngine.EngineErrorSchema, Schema.toType(config.error)]),
-//   ),
-// })
-
-// class Circle<T extends Schema.Top> extends Schema.TaggedClass<Circle>()("Circle", {
-//   radius: Schema.Number
-
-// }) {}
-
-// class TaskSchema<Payload extends AnyStructSchema, Success extends Schema.Top, Error extends Schema.Top> extends Schema.TaggedClass<TaskSchema>()(
+/**
+ * A decoded task as seen by a handler: the typed payload/success/error fields
+ * plus the engine-assigned `id` and `name`.
+ */
 export type Task<
   Payload extends AnyStructSchema,
   Success extends Schema.Top,
   Error extends Schema.Top,
 > = TaskSchema<Payload, Success, Error>["Type"] & { id: string; name: string };
 
+/**
+ * The schema-bearing definition of a task type: its name, payload/success/error
+ * schemas, and how to derive an idempotency key from a payload.
+ */
 export interface TaskDefinition<
   Payload extends AnyStructSchema,
   Success extends Schema.Top = Schema.Void,
@@ -130,14 +37,6 @@ export interface TaskDefinition<
   readonly errorSchema: Error;
 
   readonly idempotencyKey: (payload: Payload["Type"]) => string;
-  // readonly offer: (
-  // 	payload: Payload["Type"],
-  // 	options?: TaskOptions,
-  // ) => Effect.Effect<
-  // 	string,
-  // 	SchemaError | TaskEngine.TaskEngineError,
-  // 	TaskEngine.TaskEngine | Payload["EncodingServices"]
-  // >;
 }
 type ResolvePayload<T extends AnyStructSchema | Schema.Struct.Fields> =
   T extends AnyStructSchema
@@ -151,6 +50,17 @@ const resolvePayloadSchema = <T extends AnyStructSchema | Schema.Struct.Fields>(
     ? (payload as ResolvePayload<T>)
     : (Schema.Struct(payload) as ResolvePayload<T>);
 };
+
+/**
+ * Define a task type.
+ *
+ * `payload` may be either a `Schema.Struct` or a bare fields object (which is
+ * wrapped into a struct). `successSchema`/`errorSchema` default to
+ * `Schema.Void`/`Schema.Never`. When `idempotencyKey` is omitted, a random
+ * key is generated per offer, so identical payloads are treated as distinct.
+ *
+ * @returns A {@link TaskDefinition} to pass to `TaskQueue.make`.
+ */
 export const make = <
   Payload extends AnyStructSchema | Schema.Struct.Fields,
   Success extends Schema.Top = Schema.Void,

@@ -1,9 +1,20 @@
+/**
+ * Cron-driven scheduler: runs a handler on a cron schedule, using the
+ * {@link TaskEngine} to coordinate the next-run time across workers so the
+ * handler fires once per scheduled tick rather than once per worker.
+ *
+ * @module
+ */
 import { Duration, Effect, Effectable, Schedule } from "effect";
 import * as Cron from "effect/Cron";
 import * as TaskEngine from "./TaskEngine.js";
 
 const TypeId = "~effectmq/Scheduler" as const;
-// Activity
+
+/**
+ * A runnable scheduler. It is an `Effect` that, when run, loops forever:
+ * consuming each due cron tick and invoking the handler exactly once per tick.
+ */
 export interface Scheduler<E, R>
   extends Effect.Effect<
     void,
@@ -15,6 +26,12 @@ export interface Scheduler<E, R>
   readonly cron: Cron.Cron;
 }
 
+/**
+ * Create a {@link Scheduler} that runs `handler` on the given `cron` schedule.
+ * The `name` keys the shared schedule state in the engine, so multiple workers
+ * running the same named scheduler will collectively fire the handler once per
+ * cron tick.
+ */
 export const make = <E, R>(config: {
   cron: Cron.Cron;
   name: string;

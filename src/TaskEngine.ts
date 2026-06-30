@@ -1,3 +1,11 @@
+/**
+ * The low-level task engine: a Redis-backed service implementing the queue
+ * primitives (create/take/complete/fail, locking, delayed and cron schedules)
+ * as atomic Lua scripts. Most consumers should use the higher-level
+ * `TaskQueue`/`Scheduler` APIs rather than calling the engine directly.
+ *
+ * @module
+ */
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
@@ -12,7 +20,6 @@ import {
 } from "./Schemas.js";
 
 const TypeId = "~effectmq/TaskEngine" as const;
-// type
 
 type TaskEngineConfig = {
   debugMode?: boolean;
@@ -28,6 +35,11 @@ export class TaskEngineError extends Data.TaggedError("TaskEngineError")<{
   }
 }
 
+/**
+ * The task engine service. Provides the atomic queue operations (create, take,
+ * write success/error, lock management) and schedule coordination, backed by
+ * Redis. Obtain an implementation via {@link layer}.
+ */
 export class TaskEngine extends Context.Service<
   TaskEngine,
   {
@@ -232,11 +244,17 @@ const declare = (code: string, debugMode: boolean = false) => {
   return result;
 };
 
+/**
+ * Override the engine's notion of "now" (only honored when the engine is built
+ * with `debugMode`). Intended for deterministic tests of delays and schedules.
+ */
 export const setMockTime = (time: Duration.Input) =>
   Effect.gen(function* () {
     const redis = yield* Redis.Redis;
     yield* redis.send("SET", MOCKTIME_KEY, String(Duration.toMillis(time)));
   }).pipe(Effect.mapError(TaskEngineError.of("Failed to set mock time")));
+
+/** Advance the mock clock by `time` (debug-mode only). See {@link setMockTime}. */
 export const stepMockTime = (time: Duration.Input) =>
   Effect.gen(function* () {
     const redis = yield* Redis.Redis;
@@ -643,6 +661,12 @@ const parseTask = (task: string[]) => {
 };
 export const makePrefix = (...prefixes: string[]) => prefixes.join(":");
 
+/**
+ * Build a {@link TaskEngine} implementation against the ambient `Redis`
+ * service. `debugMode` enables the mockable clock (see {@link setMockTime});
+ * `prefix` namespaces all keys; `workerId` identifies this worker for locking.
+ * Usually consumed via {@link layer}.
+ */
 export const make = ({
   debugMode = false,
   prefix = "@@effectmq",
@@ -653,14 +677,6 @@ export const make = ({
     const scripts = buildScripts(debugMode);
     const withPrefix = (key: string) => `${prefix}:${key}`;
 
-    const _send = <T>(command: string, ...args: ReadonlyArray<string>) =>
-      redis
-        .send(command, ...args)
-        .pipe(
-          Effect.mapError(
-            TaskEngineError.of(`Failed to send command ${command}`),
-          ),
-        ) as Effect.Effect<T, TaskEngineError, never>;
     const createTask = redis.eval(scripts.CreateOrUpdateTaskScript);
     const writeSuccessResult = redis.eval(scripts.WriteSuccessResultScript);
     const writeErrorResult = redis.eval(scripts.WriteErrorResultScript);
@@ -786,5 +802,6 @@ export const make = ({
     });
   });
 
+/** A `Layer` providing the {@link TaskEngine} service; requires a `Redis` service. */
 export const layer = (config?: TaskEngineConfig) =>
   Layer.effect(TaskEngine, make(config));

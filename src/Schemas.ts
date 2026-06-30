@@ -1,6 +1,18 @@
+/**
+ * Shared schemas for the task model: completion policies, the built-in task
+ * error types, and {@link makeTaskSchema} which assembles a fully-typed task
+ * schema from payload/success/error schemas.
+ *
+ * @module
+ */
 import * as Schema from "effect/Schema";
 import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
 
+/**
+ * Policy applied to a task once it completes (on success or failure):
+ * `delete` removes it, `keep` clears it from all lists, and
+ * `mark-as-success`/`mark-as-failure` move it to the corresponding list.
+ */
 const CompletionPolicySchema = Schema.Literals([
   "delete",
   "keep",
@@ -8,6 +20,7 @@ const CompletionPolicySchema = Schema.Literals([
   "mark-as-failure",
 ]);
 
+/** A completion policy value (`delete` | `keep` | `mark-as-success` | `mark-as-failure`). */
 export type CompletionPolicy = typeof CompletionPolicySchema.Type;
 export class StalledErrorSchema extends Schema.TaggedErrorClass<StalledErrorSchema>()(
   "~effectmq/Error/Stalled",
@@ -29,12 +42,20 @@ export class CanceledErrorSchema extends Schema.TaggedErrorClass<CanceledErrorSc
     return new CanceledErrorSchema({ timestamp });
   }
 }
+/** Union of the engine's built-in task errors (`Stalled`, `Canceled`). */
 export const TaskErrorSchema = Schema.Union([
   StalledErrorSchema,
   CanceledErrorSchema,
 ]);
 
 export type TaskErrorSchema = typeof TaskErrorSchema.Type;
+
+/**
+ * Build a fully-typed task schema from a task's `payload`, `success`, and
+ * `error` schemas. The resulting struct decodes the stored task hash: the
+ * payload/success fields are JSON-decoded, and `errors` accepts both the
+ * built-in {@link TaskErrorSchema} and the task's own error type.
+ */
 export const makeTaskSchema = <
   Payload extends AnyStructSchema,
   Success extends Schema.Top,

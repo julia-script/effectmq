@@ -1,3 +1,11 @@
+/**
+ * The high-level, typed queue API over {@link TaskEngine}. A `TaskQueue` pairs
+ * a queue name with a {@link Task} definition; use {@link offer} to enqueue
+ * work, {@link complete} to process a task end-to-end, or the lower-level
+ * {@link takeUnsafe}/{@link succeed}/{@link fail} primitives directly.
+ *
+ * @module
+ */
 import { Fiber, Schedule } from "effect";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -11,6 +19,7 @@ import * as TaskEngine from "./TaskEngine.js";
 
 const TypeId = "~effectmq/TaskQueue" as const;
 
+/** A named queue bound to a typed {@link Task.TaskDefinition}. */
 export interface TaskQueue<
   Payload extends AnyStructSchema,
   Success extends Schema.Top = Schema.Void,
@@ -20,6 +29,7 @@ export interface TaskQueue<
   readonly name: string;
   readonly task: Task.TaskDefinition<Payload, Success, Error>;
 }
+/** Create a {@link TaskQueue} from a queue `name` and a task definition. */
 export const make = <
   Payload extends AnyStructSchema,
   Success extends Schema.Top = Schema.Void,
@@ -39,6 +49,13 @@ interface TakeOptions {
   readonly lockTimeout?: Duration.Input;
   readonly poolInterval?: Duration.Input;
 }
+/**
+ * Take the next available task from the queue, polling every `poolInterval`
+ * until one is available, and lock it for `lockTimeout`. The returned task is
+ * decoded into its typed form. "Unsafe" because the caller is responsible for
+ * the lock lifecycle (extend/release) and for reporting success/failure;
+ * prefer {@link complete} for the managed path.
+ */
 export const takeUnsafe = Effect.fnUntraced(function* <
   Payload extends AnyStructSchema,
   Success extends Schema.Top = Schema.Void,
@@ -87,6 +104,11 @@ export interface TaskOptions {
   onSuccessPolicy?: CompletionPolicy;
   onFailurePolicy?: CompletionPolicy;
 }
+/**
+ * Enqueue `payload` onto the queue. The payload is encoded via the task's
+ * payload schema and the task id is derived from the definition's
+ * idempotency key. Honors `delay` and the success/failure policy options.
+ */
 export const offer = Effect.fnUntraced(function* <
   Payload extends AnyStructSchema,
   Success extends Schema.Top,
@@ -161,6 +183,7 @@ const succeed = Effect.fnUntraced(function* <
   );
 });
 
+/** Report a typed failure for a taken task, routing it per the queue's failure policy. */
 export const fail = Effect.fnUntraced(function* <
   Payload extends AnyStructSchema,
   Success extends Schema.Top,
@@ -184,6 +207,13 @@ export type TaskHandler<
   task: Task.Task<Payload, Success, Error>,
 ) => Effect.Effect<Success["Type"], Error["Type"], R>;
 
+/**
+ * Take the next task and run it to completion: it locks the task, keeps the
+ * lock alive with a background heartbeat, runs `handler`, then reports the
+ * outcome to the engine. Resolves `true` when the handler succeeds and `false`
+ * when it fails (the failure is routed per the queue's failure policy).
+ * Dual-signature: `complete(queue, handler)` or `complete(handler)(queue)`.
+ */
 export const complete: {
   <
     Payload extends AnyStructSchema,

@@ -1,9 +1,9 @@
 {
   "name": "effectmq",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Effect-based message queue",
   "type": "module",
-  "private": true,
+  "packageManager": "pnpm@10.33.2",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -19,23 +19,23 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "turbo run lint",
-    "lint:fix": "pnpm biome check --write --unsafe"
+    "lint:fix": "pnpm biome check --write --unsafe",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release": "pnpm build && changeset publish"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "dependencies": {
-    "@biomejs/biome": "^2.5.1",
-    "@effect/platform-node": "4.0.0-beta.85",
-    "@effect/sql-sqlite-node": "4.0.0-beta.85",
-    "@xstate/store": "^4.2.0",
-    "effect": "4.0.0-beta.85",
-    "msgpackr": "2.0.4",
-    "tsx": "^4.22.4"
+  "peerDependencies": {
+    "effect": ">=4.0.0-beta.85"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.1",
+    "@changesets/cli": "^2.31.0",
     "@testcontainers/redis": "^12.0.3",
     "@types/node": "^22.0.0",
+    "effect": "4.0.0-beta.85",
     "ioredis": "^5.11.1",
     "testcontainers": "^12.0.3",
     "typescript": "^6.0.3",

@@ -1,5 +1,5 @@
 /**
- * effectmq — an Effect-based, Redis-backed message queue.
+ * `@juliascript/effectmq` — an Effect-based, Redis-backed message queue.
  *
  * Public entry point. Most applications use {@link TaskQueue} (typed enqueue /
  * process) and {@link Scheduler} (cron-driven work); {@link TaskEngine} is the

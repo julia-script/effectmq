@@ -1,7 +1,5 @@
 # @juliascript/effectmq
 
-*A message queue for people who have made peace with Effect.*
-
 It's a task queue built on [Effect](https://effect.website): typed payloads, typed results, typed errors, all the way down. You describe a unit of work as a schema, hand it to a queue, and process it with a handler that is just an `Effect`. Retries, delays, idempotency, cron schedules: handled. The available engine is backed by Redis, but, like many things in Effect, it can be swapped for a different implementation.
 
 ```bash

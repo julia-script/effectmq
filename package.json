@@ -26,7 +26,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "peerDependencies": {
     "effect": ">=4.0.0-beta.85"
   },
@@ -36,8 +36,10 @@
     "@testcontainers/redis": "^12.0.3",
     "@types/node": "^22.0.0",
     "effect": "4.0.0-beta.85",
+    "@effect/platform-node": "4.0.0-beta.85",
     "ioredis": "^5.11.1",
     "testcontainers": "^12.0.3",
+    "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"
   }

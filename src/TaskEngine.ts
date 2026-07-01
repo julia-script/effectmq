@@ -1,22 +1,28 @@
 /**
  * The low-level task engine: a Redis-backed service implementing the queue
- * primitives (create/take/complete/fail, locking, delayed and cron schedules)
- * as atomic Lua scripts. Most consumers should use the higher-level
- * `TaskQueue`/`Scheduler` APIs rather than calling the engine directly.
+ * primitives (create/take/complete/fail, locking, delayed and cron schedules,
+ * and a per-queue event stream) as atomic Lua scripts. Most consumers should
+ * use the higher-level `TaskQueue`/`Scheduler` APIs rather than calling the
+ * engine directly.
  *
  * @module
  */
+import { Schedule } from "effect";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as Redis from "effect/unstable/persistence/Redis";
 import {
   type EngineTask,
+  EngineTaskFromRedisEntriesSchema,
   type EngineTaskInsert,
-  EngineTaskSchema,
+  type Event,
+  IncomingRedisEventSchema,
 } from "./Schemas.js";
 
 const TypeId = "~effectmq/TaskEngine" as const;
@@ -93,6 +99,20 @@ export class TaskEngine extends Context.Service<
       toConsume: Date,
       next: Date,
     ) => Effect.Effect<{ consumed: boolean; next?: Date }, TaskEngineError>;
+    /**
+     * Stream lifecycle events for a queue, read from its Redis Stream
+     * (`<prefix>:<name>:events`) via `XREAD`. Starts from `cursor` (defaulting
+     * to now) and polls every `pollInterval` (default 1s), advancing the cursor
+     * past each yielded event. Events are raw {@link Event}s; `TaskQueue.stream`
+     * decodes their payloads against the queue's schemas.
+     */
+    readonly stream: (
+      name: string,
+      options?: {
+        cursor?: string;
+        pollInterval?: Duration.Duration;
+      },
+    ) => Stream.Stream<Event, TaskEngineError | Schema.SchemaError>;
   }
 >()("TaskEngine") {}
 
@@ -104,49 +124,112 @@ const importMap = {
   successList: /*lua*/ `local function successList(prefix) return prefix .. ":success" end`,
   failedList: /*lua*/ `local function failedList(prefix) return prefix .. ":failed" end`,
   activeList: /*lua*/ `local function activeList(prefix) return prefix .. ":active" end`,
+  eventStream: /*lua*/ `local function eventStream(prefix) return prefix .. ":events" end`,
   lockHash: /*lua*/ `local function lockHash(prefix, id) return prefix .. ":lock:" .. id end`,
+
   removeFromFailedList: /*lua*/ `local function removeFromFailedList(prefix, id) return redis.call("ZREM", failedList(prefix), id) end`,
   removeFromSuccessList: /*lua*/ `local function removeFromSuccessList(prefix, id) return redis.call("ZREM", successList(prefix), id) end`,
   removeFromWaitList: /*lua*/ `local function removeFromWaitList(prefix, id) return redis.call("LREM", waitList(prefix), 0, id) end`,
   removeFromDelayedList: /*lua*/ `local function removeFromDelayedList(prefix, id) return redis.call("ZREM", delayedList(prefix), id) end`,
   removeFromActiveLists: /*lua*/ `local function removeFromActiveLists(prefix, id) return redis.call("ZREM", activeList(prefix), id) end`,
-  removeFromAllLists: /*lua*/ `local function removeFromAllLists(prefix, id) 
-    removeFromFailedList(prefix, id)
-    removeFromSuccessList(prefix, id)
-    removeFromWaitList(prefix, id)
-    removeFromDelayedList(prefix, id)
-    removeFromActiveLists(prefix, id)
-  end`,
-  addToActiveLists: /*lua*/ `local function addToActiveLists(prefix, id) 
-    removeFromAllLists(prefix, id)
-    return redis.call("ZADD", activeList(prefix), now, id) 
-  end`,
-  addToWaitList: /*lua*/ `local function addToWaitList(prefix, id) 
-    removeFromAllLists(prefix, id)
-    return redis.call("RPUSH", waitList(prefix), id) 
-  end`,
-  addToDelayedList: /*lua*/ `local function addToDelayedList(prefix, id, readyAt)
-    removeFromAllLists(prefix, id)
-    return redis.call("ZADD", delayedList(prefix), readyAt, id)
-  end`,
-  addToSuccessList: /*lua*/ `local function addToSuccessList(prefix, id) 
-    removeFromAllLists(prefix, id)
-    return redis.call("ZADD", successList(prefix), now, id) 
-  end`,
-  addToFailedList: /*lua*/ `local function addToFailedList(prefix, id) 
-    removeFromAllLists(prefix, id)
-    return redis.call("ZADD", failedList(prefix), now, id) 
-  end`,
-  deleteTask: /*lua*/ `local function deleteTask(prefix, id) 
-    removeFromAllLists(prefix, id)
-    return redis.call("DEL", taskHash(prefix, id)) 
+
+  publishEvent: /*lua*/ `local function publishEvent(prefix, id, eventType, payload) return redis.call("XADD", eventStream(prefix), "*", "taskId", id, "_tag", eventType, "payload", cjson.encode(payload)) end`,
+  indexOf: /*lua*/ `local function indexOf(list, id) 
+    if list == "wait" then
+      return redis.call("LPOS", list, id)
+    end
+    return redis.call("ZRANK", list, id) 
+  end
+  `,
+  findTaskList: /*lua*/ `local function findTaskList(prefix, id)
+    if indexOf(waitList(prefix), id) ~= nil then
+      return "wait"
+    end
+    if indexOf(delayedList(prefix), id) ~= nil then
+      return "scheduled"
+    end
+    if indexOf(activeList(prefix), id) ~= nil then
+      return "active"
+    end
+    if indexOf(failedList(prefix), id) ~= nil then
+      return "failed"
+    end
+    if indexOf(successList(prefix), id) ~= nil then
+      return "success"
+    end
+    return nil
+  end
+  `,
+  removeFromCurrentLists: /*lua*/ `local function removeFromCurrentLists(prefix, id) 
+    if removeFromWaitList(prefix, id) > 0 then
+      return 'wait'
+    end
+    if removeFromDelayedList(prefix, id) > 0 then
+      return 'scheduled'
+    end
+    if removeFromActiveLists(prefix, id) > 0 then
+      return 'active'
+    end
+    if removeFromFailedList(prefix, id) > 0 then
+      return 'failed'
+    end
+    if removeFromSuccessList(prefix, id) > 0 then
+      return 'success'
+    end
+    return nil
   end`,
 
+  addToActiveLists: /*lua*/ `local function addToActiveLists(prefix, id)
+    return redis.call("ZADD", activeList(prefix), now, id)
+  end`,
+  addToWaitList: /*lua*/ `local function addToWaitList(prefix, id)
+    return redis.call("RPUSH", waitList(prefix), id)
+  end`,
+  addToDelayedList: /*lua*/ `local function addToDelayedList(prefix, id, readyAt)
+    return redis.call("ZADD", delayedList(prefix), readyAt, id)
+  end`,
+  addToSuccessList: /*lua*/ `local function addToSuccessList(prefix, id)
+    return redis.call("ZADD", successList(prefix), now, id)
+  end`,
+  addToFailedList: /*lua*/ `local function addToFailedList(prefix, id)
+    return redis.call("ZADD", failedList(prefix), now, id)
+  end`,
+
+  // the add* helpers no longer clear other lists; moveToList is the single entry
+  // point that removes from the current list, adds to the target, and emits task.moved
+  moveToList: /*lua*/ `local function moveToList(prefix, id, list)
+    local currentList = removeFromCurrentLists(prefix, id)
+    if currentList == list then
+      return
+    end
+    if list == "wait" then
+      addToWaitList(prefix, id)
+    elseif list == "scheduled" then
+      addToDelayedList(prefix, id, now)
+    elseif list == "active" then
+      addToActiveLists(prefix, id)
+    elseif list == "failed" then
+      addToFailedList(prefix, id)
+    elseif list == "success" then
+      addToSuccessList(prefix, id)
+    end
+    publishEvent(prefix, id, "task.moved", { from = currentList, to = list })
+  end`,
+  deleteTask: /*lua*/ `local function deleteTask(prefix, id) 
+    moveToList(prefix, id, nil)
+    return redis.call("DEL", taskHash(prefix, id)) 
+  end`,
   popWaitList: /*lua*/ `local function popWaitList(prefix) return redis.call("LPOP", waitList(prefix)) end`,
 
   getActiveList: /*lua*/ `local function getActiveList(prefix) return redis.call("ZRANGE", activeList(prefix), 0, -1) end`,
 
-  getTask: /*lua*/ `local function getTask(prefix, id) return {"id", id,  unpack(redis.call("HGETALL", taskHash(prefix, id))) } end`,
+  getTask: /*lua*/ `local function getTask(prefix, id) 
+   local fields = redis.call("HGETALL", taskHash(prefix, id))
+   if #fields > 0 then
+    return {"id", id,  unpack(fields) }
+   end
+   return nil
+  end`,
   getTaskField: /*lua*/ `local function getTaskField(prefix, id, field) return redis.call("HGET", taskHash(prefix, id), field) end`,
   getTaskErrors: /*lua*/ `local function getTaskErrors(prefix, id) 
     return cjson.decode(redis.call("HGET", taskHash(prefix, id), "errors")) 
@@ -173,21 +256,29 @@ const importMap = {
 
 		 local errorTag = type(errorObj) == "table" and errorObj._tag or nil
 
-		 if errorTag ~= "~effectmq/Error/Canceled" and #errorsList < maxRetries then
-			  addToWaitList(prefix, id)
+     local willRetry = errorTag ~= "~effectmq/Error/Canceled" and #errorsList < maxRetries
+      publishEvent(prefix, id, "task.failed", { 
+        error = errorObj, 
+        maxRetries = maxRetries, 
+        retryCount = #errorsList - 1, 
+        policy = onFailurePolicy,  
+        willRetry = willRetry
+      })
+		 if willRetry then
+			  moveToList(prefix, id, "wait")
 			  return
 			end
       if onFailurePolicy == "delete" then
         deleteTask(prefix, id)
       elseif onFailurePolicy == "mark-as-failure" then
-        addToFailedList(prefix, id)
+        moveToList(prefix, id, "failed")
       elseif onFailurePolicy == "keep" then
-        removeFromAllLists(prefix, id)
+        moveToList(prefix, id, nil)
       end
 	end`,
   exists: /*lua*/ `local function exists(key) return redis.call("EXISTS", key) end`,
   lockTask: /*lua*/ `local function lockTask(prefix, id, workerId, lockTimeout) 
-    addToActiveLists(prefix, id)
+    moveToList(prefix, id, "active")
     return redis.call("SET", lockHash(prefix, id), workerId, "EX", lockTimeout) 
   end`,
   unlockTask: /*lua*/ `local function unlockTask(prefix, id) return redis.call("DEL", lockHash(prefix, id)) end`,
@@ -210,11 +301,10 @@ const importMap = {
   syncDelayed: /*lua*/ `local function syncDelayed(prefix)
   -- we lazily move tasks from the delayed list to the wait list so we need to sync
   -- before performing any other operations
-    local delayedList = prefix .. ":scheduled"
+    local delayedList = delayedList(prefix)
     local items = redis.call("ZRANGEBYSCORE", delayedList, 0, now)
     for i, item in ipairs(items) do
-      redis.call("ZREM", delayedList, item)
-      redis.call("RPUSH", prefix .. ":wait", item)
+      moveToList(prefix, item, "wait")
     end
   end`,
   syncAll: /*lua*/ `local function syncAll(prefix)
@@ -268,7 +358,7 @@ const buildScripts = (debugMode: boolean) => {
       throwOnExists,
       params.id,
       params.name,
-      params.payload,
+      JSON.stringify(params.payload),
       params.delay,
       params.maxRetries,
       params.onSuccessPolicy,
@@ -291,12 +381,13 @@ const buildScripts = (debugMode: boolean) => {
       local onSuccessPolicy = ARGV[8]
       local onFailurePolicy = ARGV[9]
       local hash = taskHash(prefix, id)
+      local existingTask = getTask(prefix, id)
 
-      if throwOnExists == true and exists(hash) then
+      if throwOnExists == true and existingTask ~= nil then
         return redis.error_reply("task already exists")
       end
 
-      setTask(
+    setTask(
         prefix, id, 
         "name", name, 
 				"createdAt", now,
@@ -307,6 +398,12 @@ const buildScripts = (debugMode: boolean) => {
         "onFailurePolicy", onFailurePolicy, 
         "errors", "[]"
       )
+      local newTask = getTask(prefix, id)
+      if existingTask ~= nil then
+        publishEvent(prefix, id, "task.updated", { existingTask = existingTask, newTask = newTask})
+      else
+        publishEvent(prefix, id, "task.created", { newTask = newTask})
+      end
 
       if delay > 0 then
         addToDelayedList(prefix, id, now + delay)
@@ -314,7 +411,7 @@ const buildScripts = (debugMode: boolean) => {
         addToWaitList(prefix, id)
       end
 
-      return getTask(prefix, id)
+      return newTask
 
       `,
         debugMode,
@@ -339,6 +436,15 @@ const buildScripts = (debugMode: boolean) => {
       local result = ARGV[4]
       local hash = taskHash(prefix, id)
 
+      -- result arrives as a JSON string; normalize to a Lua value for the event
+      -- payload so publishEvent's cjson.encode wraps it exactly once (mirrors the
+      -- errorObj handling in failTask), not double-encoded
+      local successObj = result
+      if type(result) == "string" then
+        local ok, decoded = pcall(cjson.decode, result)
+        successObj = ok and decoded or result
+      end
+
       syncAll(prefix)
 
       if not exists(hash) then
@@ -351,13 +457,19 @@ const buildScripts = (debugMode: boolean) => {
       local task = getTask(prefix, id)
       local successPolicy = getTaskField(prefix, id, "onSuccessPolicy")
 
+      publishEvent(prefix, id, "task.completed", {
+        success = successObj,
+        policy = successPolicy
+      })
+
+
     
       if successPolicy == "delete" then
         deleteTask(prefix, id)
       elseif successPolicy == "mark-as-success" then
-        addToSuccessList(prefix, id)
+        moveToList(prefix, id, "success")
       elseif successPolicy == "keep" then
-        removeFromAllLists(prefix, id)
+        moveToList(prefix, id, nil)
       end
       unlockTask(prefix, id)
       return task
@@ -638,27 +750,11 @@ const buildScripts = (debugMode: boolean) => {
   };
 };
 
-const parseTask = (task: string[]) => {
-  const result: Record<string, unknown> = {};
-  for (let i = 0; i < task.length; i += 2) {
-    const key = task[i];
-    let value: unknown = task[i + 1];
-    if (key === "errors") {
-      value = JSON.parse(value as string);
-    }
-    if (key === "createdAt" || key === "updatedAt") {
-      value = new Date(Number(value));
-    }
-    if (key === "delay" || key === "maxRetries") {
-      value = Number(value);
-    }
-
-    result[key] = value;
-  }
-  return Schema.decodeUnknownEffect(EngineTaskSchema)(result).pipe(
+/** Decode a flat `["id", id, "name", name, ...]` field list from Redis into an {@link EngineTask}. */
+const parseTask = (task: string[]) =>
+  Schema.decodeEffect(EngineTaskFromRedisEntriesSchema)(task).pipe(
     Effect.mapError(TaskEngineError.of("Failed to decode task")),
   );
-};
 export const makePrefix = (...prefixes: string[]) => prefixes.join(":");
 
 /**
@@ -694,17 +790,19 @@ export const make = ({
 
     return TaskEngine.of({
       [TypeId]: TypeId,
-      createTask: (task: EngineTaskInsert) =>
-        createTask(
+      createTask: (task: EngineTaskInsert) => {
+        return createTask(
           {
             ...task,
+
             prefix: withPrefix(task.prefix),
           },
           false,
         ).pipe(
           Effect.flatMap(parseTask),
           Effect.mapError(TaskEngineError.of("Failed to create task")),
-        ),
+        );
+      },
 
       getTask: (prefix: string, id: string) =>
         redis
@@ -797,6 +895,45 @@ export const make = ({
             next: next ? new Date(next) : undefined,
           })),
           Effect.mapError(TaskEngineError.of("Failed to consume schedule")),
+        );
+      },
+
+      stream: (
+        name,
+        options: { cursor?: string; pollInterval?: Duration.Duration } = {},
+      ) => {
+        const { cursor = `${Date.now()}`, pollInterval = Duration.seconds(1) } =
+          options;
+        const responseSchema = Schema.Array(
+          Schema.Tuple([Schema.String, Schema.Array(IncomingRedisEventSchema)]),
+        );
+        const decode = Schema.decodeUnknownEffect(responseSchema);
+
+        const streamKey = `${withPrefix(name)}:events`;
+        return Stream.paginate(cursor, (cursor) =>
+          Effect.gen(function* () {
+            const reply = yield* redis
+              .send("XREAD", "STREAMS", streamKey, cursor)
+              .pipe(
+                Effect.mapError(TaskEngineError.of("Failed to poll stream")),
+                Effect.repeat({
+                  schedule: Schedule.spaced(pollInterval),
+                  until: (value) => !!value,
+                }),
+              );
+            if (!reply) {
+              yield* Effect.sleep(pollInterval);
+            }
+
+            const entries = yield* decode(reply).pipe(
+              Effect.tapError((error) => Effect.log(error.toString())),
+            );
+            const events = entries[0][1];
+
+            const nextCursor = events[events.length - 1].id;
+
+            return [events, Option.some(nextCursor)] as const;
+          }),
         );
       },
     });

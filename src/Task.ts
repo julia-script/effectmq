@@ -6,7 +6,6 @@
  */
 import { Schema } from "effect";
 import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
-import type { TaskSchema } from "./Schemas.js";
 
 const TypeId = "~effectmq/Task" as const;
 
@@ -14,18 +13,14 @@ const TypeId = "~effectmq/Task" as const;
  * A decoded task as seen by a handler: the typed payload/success/error fields
  * plus the engine-assigned `id` and `name`.
  */
-export type Task<
-  Payload extends AnyStructSchema,
-  Success extends Schema.Top,
-  Error extends Schema.Top,
-> = TaskSchema<Payload, Success, Error>["Type"] & { id: string; name: string };
+export type { Task } from "./Schemas.js";
 
 /**
  * The schema-bearing definition of a task type: its name, payload/success/error
  * schemas, and how to derive an idempotency key from a payload.
  */
 export interface TaskDefinition<
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
 > {
@@ -38,12 +33,14 @@ export interface TaskDefinition<
 
   readonly idempotencyKey: (payload: Payload["Type"]) => string;
 }
-type ResolvePayload<T extends AnyStructSchema | Schema.Struct.Fields> =
+export type ResolvePayload<T extends AnyStructSchema | Schema.Struct.Fields> =
   T extends AnyStructSchema
     ? T
     : Schema.Struct<T extends Schema.Struct.Fields ? T : never>;
 
-const resolvePayloadSchema = <T extends AnyStructSchema | Schema.Struct.Fields>(
+export const resolvePayloadSchema = <
+  T extends AnyStructSchema | Schema.Struct.Fields,
+>(
   payload: T,
 ): ResolvePayload<T> => {
   return Schema.isSchema(payload)
@@ -70,7 +67,7 @@ export const make = <
   successSchema: Success;
   errorSchema: Error;
   payload: Payload;
-  idempotencyKey?: (payload: Payload["Type"]) => string;
+  idempotencyKey?: (payload: ResolvePayload<Payload>["Type"]) => string;
 }): TaskDefinition<ResolvePayload<Payload>, Success, Error> => {
   const payloadSchema = resolvePayloadSchema(config.payload);
   const successSchema = (config.successSchema ?? Schema.Void) as Success;

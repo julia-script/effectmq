@@ -93,7 +93,7 @@ const emails = TaskQueue.make("emails", SendEmail);
 
 ## Offer work, then do it
 
-`offer` enqueues a payload. `complete` takes the next task, runs your handler, and reports the outcome back to the engine, returning `true` on success and `false` when the handler fails. The task your handler receives is fully decoded: `task.payload` is the real object, not a JSON string.
+`offer` enqueues a payload. `complete` takes the next task, runs your handler, reports the outcome back to the engine, and returns the task's id (a failing handler is routed per the queue's failure policy). The task your handler receives is fully decoded: `task.payload` is the real object, not a JSON string.
 
 ```ts
 import { Effect } from "effect";
@@ -104,20 +104,49 @@ const program = Effect.gen(function* () {
     subject: "Welcome",
   });
 
-  // Take one task, run it, report success/failure.
-  const ok = yield* TaskQueue.complete(emails, (task) =>
+  // Take one task, run it, report the outcome. Resolves with the task id.
+  const taskId = yield* TaskQueue.complete(emails, (task) =>
     Effect.gen(function* () {
       const id = yield* sendViaProvider(task.payload); // your code
       return id; // matches successSchema
       // ...or `yield* new EmailRejected({ reason })` to fail with the typed error
     }),
   );
-  // ok === true  → handler succeeded, resolved per onSuccessPolicy
-  // ok === false → handler failed, routed per onFailurePolicy
+  // Success resolves per onSuccessPolicy; a failing handler is routed per onFailurePolicy.
 });
 ```
 
 One `complete` processes one task. To process *many*, set your workers up accordingly.
+
+---
+
+## Streaming & events
+
+The engine publishes a lifecycle event to a per-queue Redis Stream every time a task changes state. `TaskQueue.stream` hands you those events as an Effect `Stream`, decoded against your queue's schemas: `task.created` and `task.updated` carry fully-typed tasks, `task.failed` carries your typed error, `task.completed` carries your typed success value, and `task.moved` reports the list transition.
+
+```ts
+import { Effect, Stream } from "effect";
+
+const watch = TaskQueue.stream(emails).pipe(
+  Stream.runForEach((event) => Effect.log(event._tag, event.taskId)),
+);
+```
+
+Because it's just a stream of terminal events, you can also *wait on a specific task*. `wait` blocks until a task id reaches a terminal state, resolving with its success value or failing with its typed error. `execute` is the offer-and-wait shortcut: enqueue a payload and get its outcome back in one call.
+
+```ts
+// Offer + await the result in one call.
+const messageId = yield* TaskQueue.execute(emails, {
+  to: "ada@example.com",
+  subject: "Welcome",
+}); // resolves with successSchema, or fails with EmailRejected
+
+// Or await a task you already offered.
+const task = yield* TaskQueue.offer(emails, payload);
+const result = yield* TaskQueue.wait(emails, task.id);
+```
+
+`execute` opens the stream *before* offering, so even a handler that finishes near-instantly won't slip its terminal event past you. Streams poll Redis (default every second); pass a cursor to resume from a known event id.
 
 ---
 

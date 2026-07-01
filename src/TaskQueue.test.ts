@@ -37,7 +37,7 @@ describe("TaskQueue", () => {
         return Effect.succeed("ok");
       });
 
-      expect(done).toBe(true);
+      expect(done).toBe("u2");
       // handler received the decoded typed payload, not the raw JSON string
       expect(seenPayload).toEqual({ userId: "u2", amount: 42 });
 
@@ -61,7 +61,7 @@ describe("TaskQueue", () => {
         Effect.fail({ reason: "nope" }),
       );
 
-      expect(done).toBe(false);
+      expect(done).toBe("u3");
       const lists = yield* getLists(queue.name);
       expect(lists.failed).toEqual(["u3"]);
     }).pipe(TestRuntime.runPromise));

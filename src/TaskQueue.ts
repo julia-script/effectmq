@@ -6,14 +6,14 @@
  *
  * @module
  */
-import { Fiber, Schedule } from "effect";
+import { Fiber, Schedule, Stream } from "effect";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Function from "effect/Function";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
-import { type CompletionPolicy, makeTaskSchema } from "./Schemas.js";
+import { type CompletionPolicy, decodeTask } from "./Schemas.js";
 import type * as Task from "./Task.js";
 import * as TaskEngine from "./TaskEngine.js";
 
@@ -21,7 +21,7 @@ const TypeId = "~effectmq/TaskQueue" as const;
 
 /** A named queue bound to a typed {@link Task.TaskDefinition}. */
 export interface TaskQueue<
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
 > {
@@ -31,7 +31,7 @@ export interface TaskQueue<
 }
 /** Create a {@link TaskQueue} from a queue `name` and a task definition. */
 export const make = <
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
 >(
@@ -57,7 +57,7 @@ interface TakeOptions {
  * prefer {@link complete} for the managed path.
  */
 export const takeUnsafe = Effect.fnUntraced(function* <
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
 >(
@@ -76,24 +76,17 @@ export const takeUnsafe = Effect.fnUntraced(function* <
     options?.lockTimeout ?? Duration.seconds(30),
   );
 
-  while (true) {
-    const task = yield* engine.takeTask(
-      TaskEngine.makePrefix(queue.name),
-      lockTimeout,
+  const task = yield* engine
+    .takeTask(TaskEngine.makePrefix(queue.name), lockTimeout)
+    .pipe(
+      Effect.repeat({
+        until: (task) => task !== null,
+        schedule: Schedule.spaced(poolInterval),
+      }),
     );
 
-    if (task) {
-      const taskSchema = makeTaskSchema({
-        payload: queue.task.payloadSchema,
-        success: queue.task.successSchema,
-        error: queue.task.errorSchema,
-      });
-      const decode = Schema.decodeEffect(taskSchema);
-      const decodedTask = yield* decode(task);
-      return decodedTask as Task.Task<Payload, Success, Error>;
-    }
-    yield* Effect.sleep(poolInterval);
-  }
+  const decodedTask = yield* decodeTask(queue.task, task);
+  return decodedTask;
 });
 
 const encodeToString = <A extends Schema.Top>(schema: A) =>
@@ -110,15 +103,19 @@ export interface TaskOptions {
  * idempotency key. Honors `delay` and the success/failure policy options.
  */
 export const offer = Effect.fnUntraced(function* <
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
 >(
   queue: TaskQueue<Payload, Success, Error>,
   payload: Payload["Type"],
   options?: TaskOptions,
-) {
-  const encodePayload = encodeToString(queue.task.payloadSchema);
+): Effect.fn.Return<
+  Task.Task<Payload, Success, Error>,
+  TaskEngine.TaskEngineError | Schema.SchemaError,
+  TaskEngine.TaskEngine | Payload["DecodingServices"]
+> {
+  const encodePayload = Schema.encodeEffect(queue.task.payloadSchema);
   const id = queue.task.idempotencyKey(payload);
   const engine = yield* TaskEngine.TaskEngine;
 
@@ -132,11 +129,13 @@ export const offer = Effect.fnUntraced(function* <
     onSuccessPolicy: options?.onSuccessPolicy ?? "delete",
     onFailurePolicy: options?.onFailurePolicy ?? "delete",
   });
-  return task;
+
+  const res = yield* decodeTask(queue.task, task);
+  return res satisfies Task.Task<Payload, Success, Error>;
 });
 
 export const extendLock = Effect.fnUntraced(function* <
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
 >(
@@ -210,9 +209,8 @@ export type TaskHandler<
 /**
  * Take the next task and run it to completion: it locks the task, keeps the
  * lock alive with a background heartbeat, runs `handler`, then reports the
- * outcome to the engine. Resolves `true` when the handler succeeds and `false`
- * when it fails (the failure is routed per the queue's failure policy).
- * Dual-signature: `complete(queue, handler)` or `complete(handler)(queue)`.
+ * outcome to the engine.
+ * @returns The task id
  */
 export const complete: {
   <
@@ -224,7 +222,7 @@ export const complete: {
     handler: TaskHandler<Payload, Success, Error, R>,
   ): (
     self: TaskQueue<Payload, Success, Error>,
-  ) => Effect.Effect<boolean, never, R>;
+  ) => Effect.Effect<string, never, R>;
   <
     Payload extends AnyStructSchema,
     Success extends Schema.Top,
@@ -233,7 +231,7 @@ export const complete: {
   >(
     self: TaskQueue<Payload, Success, Error>,
     handler: TaskHandler<Payload, Success, Error, R>,
-  ): Effect.Effect<boolean, never, R>;
+  ): Effect.Effect<string, never, R>;
 } = Function.dual(
   2,
   <
@@ -258,11 +256,154 @@ export const complete: {
       yield* Fiber.interrupt(heartBeat);
       if (Result.isSuccess(result)) {
         yield* succeed(self, task, result.success);
-        return true;
       } else {
         yield* fail(self, task, result.failure);
-        return false;
       }
+      return task.id;
     });
   },
 );
+
+/**
+ * Stream this queue's lifecycle events, decoded against the queue's schemas.
+ *
+ * Wraps the engine's raw event stream and decodes each event's task-shaped
+ * payload: `task.created`/`task.updated` yield typed {@link Task.Task}s,
+ * `task.failed` yields a typed error, and `task.completed` yields a typed
+ * success value. `cursor` resumes from a prior event id (defaults to now, so
+ * only future events are delivered).
+ */
+export const stream = <
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+>(
+  queue: TaskQueue<Payload, Success, Error>,
+  {
+    cursor = `${Date.now()}-0`,
+  }: {
+    cursor?: string;
+  } = {},
+) =>
+  Effect.gen(function* () {
+    const engine = yield* TaskEngine.TaskEngine;
+
+    return engine.stream(queue.name, { cursor }).pipe(
+      Stream.mapEffect((event) =>
+        Effect.gen(function* () {
+          if (event._tag === "task.created") {
+            const task = event.payload.newTask;
+            return {
+              ...event,
+              payload: {
+                newTask: yield* decodeTask(queue.task, task),
+              },
+            };
+          }
+          if (event._tag === "task.updated") {
+            const { existingTask, newTask } = event.payload;
+            return {
+              ...event,
+              payload: {
+                existingTask: yield* decodeTask(queue.task, existingTask),
+                newTask: yield* decodeTask(queue.task, newTask),
+              },
+            };
+          }
+          if (event._tag === "task.failed") {
+            const decodeError = Schema.decodeEffect(queue.task.errorSchema);
+            return {
+              ...event,
+              payload: {
+                ...event.payload,
+                error: yield* decodeError(event.payload.error),
+              },
+            };
+          }
+          if (event._tag === "task.completed") {
+            const decodeSuccess = Schema.decodeEffect(queue.task.successSchema);
+            return {
+              ...event,
+              payload: {
+                ...event.payload,
+                success: yield* decodeSuccess(event.payload.success),
+              },
+            };
+          }
+
+          return event;
+        }),
+      ),
+    );
+  }).pipe(Stream.unwrap);
+
+/**
+ * Await a task's terminal event: resolves with its decoded success value once
+ * the task completes, or fails with its decoded error if it fails terminally.
+ * Watches the queue's event {@link stream} for the matching `taskId`.
+ */
+export const wait = Effect.fnUntraced(function* <
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+>(
+  queue: TaskQueue<Payload, Success, Error>,
+  taskId: string,
+): Effect.fn.Return<
+  Success["Type"],
+  Error["Type"],
+  TaskEngine.TaskEngine | Payload["DecodingServices"]
+> {
+  const events = stream(queue);
+  const [result] = yield* events.pipe(
+    Stream.filter(
+      (event) =>
+        event.taskId === taskId &&
+        (event._tag === "task.completed" || event._tag === "task.failed"),
+    ),
+    Stream.take(1),
+    Stream.runCollect,
+  );
+  if (result._tag === "task.completed") {
+    return result.payload.success;
+  } else if (result._tag === "task.failed") {
+    return yield* Effect.fail(result.payload.error);
+  }
+});
+/**
+ * Offer a task and await its outcome in one call: resolves with the decoded
+ * success value or fails with the decoded error. Opens the event stream before
+ * offering so a fast handler's terminal event isn't missed.
+ */
+export const execute = Effect.fnUntraced(function* <
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+>(
+  queue: TaskQueue<Payload, Success, Error>,
+  payload: Payload["Type"],
+  options?: TaskOptions,
+): Effect.fn.Return<
+  Success["Type"],
+  Error["Type"],
+  TaskEngine.TaskEngine | Payload["DecodingServices"]
+> {
+  const events = stream(queue);
+  const task = yield* offer(queue, payload, options);
+
+  const [result] = yield* events.pipe(
+    Stream.filter((event) => {
+      return (
+        event.taskId === task.id &&
+        (event._tag === "task.completed" || event._tag === "task.failed")
+      );
+    }),
+    Stream.take(1),
+    Stream.runCollect,
+  );
+  if (result._tag === "task.completed") {
+    return result.payload.success;
+  } else if (result._tag === "task.failed") {
+    return yield* Effect.fail(result.payload.error);
+  }
+});

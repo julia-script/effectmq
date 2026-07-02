@@ -9,8 +9,8 @@ const makeQueue = (name: string) => {
   const def = Task.make({
     name,
     payload: { userId: Schema.String, amount: Schema.Number },
-    successSchema: Schema.String,
-    errorSchema: Schema.Struct({ reason: Schema.String }),
+    success: Schema.String,
+    error: Schema.Struct({ reason: Schema.String }),
     idempotencyKey: (p) => p.userId,
   });
   return TaskQueue.make(name, def);
@@ -88,8 +88,8 @@ describe("Task events", () => {
       const failed = failEvents.find((e) => e._tag === "task.failed");
       expect(failed?._tag).toBe("task.failed");
       if (failed?._tag === "task.failed") {
-        // No retries configured → won't retry, and the error is decoded typed.
-        expect(failed.payload.willRetry).toBe(false);
+        // No retry schedule configured → no retryAt, and the error is decoded typed.
+        expect(failed.payload.retryAt).toBeUndefined();
         expect(failed.payload.error).toEqual({ reason: "nope" });
       }
     }).pipe(TestRuntime.runPromise));

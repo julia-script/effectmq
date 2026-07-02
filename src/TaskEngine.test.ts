@@ -151,40 +151,88 @@ describe("TaskEngine", () => {
       `);
     }).pipe(TestRuntime.runPromise));
 
-  test("failure retries until maxRetries then applies onFailurePolicy", () =>
+  // The engine routes purely on the `retryAt` it is handed: the retry/cap
+  // decision lives in TaskQueue.fail. These cover the routing contract.
+  test("writeError with a future retryAt schedules the task", () =>
     Effect.gen(function* () {
       const taskEngine = yield* TaskEngine.TaskEngine;
-      yield* TaskEngine.setMockTime(1000000000000);
-      const prefix = "fail-retry";
+      const now = 1000000000000;
+      yield* TaskEngine.setMockTime(now);
+      const prefix = "retry-scheduled";
       yield* taskEngine.createTask({
         id: "r1",
-        name: "retry task",
+        name: "t",
         payload: "p",
         delay: 0,
-        maxRetries: 2,
+        maxRetries: 5,
         onSuccessPolicy: "delete",
         onFailurePolicy: "mark-as-failure",
         prefix,
       });
 
-      // first failure: one error < maxRetries(2) => back to wait
       yield* taskEngine.takeTask(prefix, 1000);
-      yield* taskEngine.writeError(prefix, "r1", stalled(1));
-      let lists = yield* getLists(prefix);
-      expect(lists.wait).toEqual(["r1"]);
-      expect(lists.failed).toEqual([]);
-      let task = yield* taskEngine.getTask(prefix, "r1");
-      expect(task?.errors).toHaveLength(1);
+      yield* taskEngine.writeError(prefix, "r1", stalled(1), now + 5000);
 
-      // second failure: errors(2) not < maxRetries(2) => terminal, failure policy
-      yield* taskEngine.takeTask(prefix, 1000);
-      yield* taskEngine.writeError(prefix, "r1", stalled(2));
-      lists = yield* getLists(prefix);
+      const lists = yield* getLists(prefix);
+      expect(lists.scheduled).toEqual(["r1"]);
       expect(lists.wait).toEqual([]);
-      expect(lists.active).toEqual([]);
-      expect(lists.failed).toEqual(["r1"]);
-      task = yield* taskEngine.getTask(prefix, "r1");
-      expect(task?.errors).toHaveLength(2);
+      expect(lists.failed).toEqual([]);
+      const task = yield* taskEngine.getTask(prefix, "r1");
+      expect(task?.errors).toHaveLength(1);
+      expect(task?.errors[0].retryAt).toBe(now + 5000);
+    }).pipe(TestRuntime.runPromise));
+
+  test("writeError with a past retryAt returns the task to wait", () =>
+    Effect.gen(function* () {
+      const taskEngine = yield* TaskEngine.TaskEngine;
+      const now = 1000000000000;
+      yield* TaskEngine.setMockTime(now);
+      const prefix = "retry-wait";
+      yield* taskEngine.createTask({
+        id: "r2",
+        name: "t",
+        payload: "p",
+        delay: 0,
+        maxRetries: 5,
+        onSuccessPolicy: "delete",
+        onFailurePolicy: "mark-as-failure",
+        prefix,
+      });
+
+      yield* taskEngine.takeTask(prefix, 1000);
+      yield* taskEngine.writeError(prefix, "r2", stalled(1), now - 1);
+
+      const lists = yield* getLists(prefix);
+      expect(lists.wait).toEqual(["r2"]);
+      expect(lists.scheduled).toEqual([]);
+      expect(lists.failed).toEqual([]);
+    }).pipe(TestRuntime.runPromise));
+
+  test("writeError without a retryAt applies the failure policy immediately", () =>
+    Effect.gen(function* () {
+      const taskEngine = yield* TaskEngine.TaskEngine;
+      yield* TaskEngine.setMockTime(1000000000000);
+      const prefix = "retry-none";
+      yield* taskEngine.createTask({
+        id: "r3",
+        name: "t",
+        payload: "p",
+        delay: 0,
+        maxRetries: 5,
+        onSuccessPolicy: "delete",
+        onFailurePolicy: "mark-as-failure",
+        prefix,
+      });
+
+      yield* taskEngine.takeTask(prefix, 1000);
+      yield* taskEngine.writeError(prefix, "r3", stalled(1));
+
+      const lists = yield* getLists(prefix);
+      expect(lists.failed).toEqual(["r3"]);
+      expect(lists.wait).toEqual([]);
+      expect(lists.scheduled).toEqual([]);
+      const task = yield* taskEngine.getTask(prefix, "r3");
+      expect(task?.errors[0].retryAt).toBeUndefined();
     }).pipe(TestRuntime.runPromise));
 
   test("Canceled error skips retries and applies onFailurePolicy immediately", () =>

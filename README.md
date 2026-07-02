@@ -22,8 +22,8 @@ import { Task, TaskEngine, TaskQueue } from "@juliascript/effectmq";
 const SendEmail = Task.make({
   name: "send-email",
   payload: { to: Schema.String, subject: Schema.String },
-  successSchema: Schema.String,
-  errorSchema: Schema.Never,
+  success: Schema.String,
+  error: Schema.Never,
 });
 
 const emails = TaskQueue.make("emails", SendEmail);
@@ -71,7 +71,7 @@ A task is a *schema*, not a function. You declare what goes in (`payload`), what
 A tagged error makes failures pattern-matchable downstream, so reach for `Schema.TaggedErrorClass` rather than a bare struct.
 
 ```ts
-import { Schema } from "effect";
+import { Schedule, Schema } from "effect";
 import { Task, TaskQueue } from "@juliascript/effectmq";
 
 class EmailRejected extends Schema.TaggedErrorClass<EmailRejected>()(
@@ -82,10 +82,12 @@ class EmailRejected extends Schema.TaggedErrorClass<EmailRejected>()(
 const SendEmail = Task.make({
   name: "send-email",
   payload: { to: Schema.String, subject: Schema.String },
-  successSchema: Schema.String, // e.g. a provider message id
-  errorSchema: EmailRejected,
+  success: Schema.String, // e.g. a provider message id
+  error: EmailRejected,
   // optional, but it's how you ensure the same job isn't enqueued twice
   idempotencyKey: (p) => `email:${p.to}:${p.subject}`,
+  // retry with exponential backoff; maxRetries caps it (default 5)
+  retry: Schedule.exponential("1 second"),
 });
 
 const emails = TaskQueue.make("emails", SendEmail);
@@ -139,7 +141,7 @@ Because it's just a stream of terminal events, you can also *wait on a specific 
 const messageId = yield* TaskQueue.execute(emails, {
   to: "ada@example.com",
   subject: "Welcome",
-}); // resolves with successSchema, or fails with EmailRejected
+}); // resolves with the success value, or fails with EmailRejected
 
 // Or await a task you already offered.
 const task = yield* TaskQueue.offer(emails, payload);
@@ -217,7 +219,7 @@ const nightlyReport = Scheduler.make({
 ## Notes
 
 - **Completion policies.** `offer` accepts `onSuccessPolicy` and `onFailurePolicy`, each one of `delete` | `keep` | `mark-as-success` | `mark-as-failure`. They decide where a finished task lands: gone, quietly retained, or parked on the success/failed list for inspection. Defaults are `delete`.
-- **Retries.** Set `maxRetries` on `offer`; a failing task goes back to the wait list until the count is exhausted, then the failure policy applies. A `Canceled` error skips remaining retries.
+- **Retries.** Declare `retry` on the task definition (`Task.make`) as an Effect `Schedule` — or a `{ while, until, times, schedule }` options object. On failure the next run time is computed from the schedule and the task lands on the scheduled list until then; when the schedule is exhausted, the failure policy applies. `maxRetries` caps the attempts so an unbounded schedule (e.g. `Schedule.forever`) can't loop forever: it defaults to `5`, is overridable per-`offer` (the per-offer value wins), and set it to `null` for truly unbounded retries. A `Canceled` error skips remaining retries.
 - **Idempotency.** The `idempotencyKey` is the task id. Same key, same task: offering again updates rather than duplicates.
 - **Delays.** `offer(..., { delay })` schedules the task for the future; it sits on the scheduled list until its time comes.
 - **The engine.** `TaskEngine` is the low-level, Lua-backed layer all of this sits on. You provide its layer; you rarely call it directly.

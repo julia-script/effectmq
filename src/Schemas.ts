@@ -21,6 +21,18 @@ const CompletionPolicySchema = Schema.Literals([
   "mark-as-failure",
 ]);
 
+export const errorEntrySchema = <Error extends Schema.Top>(error: Error) =>
+  Schema.Struct({
+    error: error,
+    timestamp: DateFromNumberSchema,
+    retryAt: Schema.optional(DateFromNumberSchema),
+  });
+
+export type ErrorEntry<Error> = {
+  error: Error;
+  timestamp: Date;
+  retryAt?: Date;
+};
 /** A completion policy value (`delete` | `keep` | `mark-as-success` | `mark-as-failure`). */
 export type CompletionPolicy = typeof CompletionPolicySchema.Type;
 export class StalledErrorSchema extends Schema.TaggedErrorClass<StalledErrorSchema>()(
@@ -76,11 +88,9 @@ export interface Task<
   readonly name: string;
   readonly payload: Payload["Type"];
   readonly success?: Success["Type"] | undefined;
-  readonly errors: readonly (
-    | Error["Type"]
-    | StalledErrorSchema
-    | CanceledErrorSchema
-  )[];
+  readonly errors: readonly ErrorEntry<
+    Error["Type"] | StalledErrorSchema | CanceledErrorSchema
+  >[];
   readonly createdAt: Date;
   readonly updatedAt: Date;
   readonly delay: number;
@@ -118,10 +128,11 @@ export const makeTaskSchema = <
     updatedAt: Schema.Date,
 
     payload: payloadDecoder,
-    errors: Schema.Unknown.pipe(
-      Schema.decodeTo(Schema.Union([TaskErrorSchema, config.errorSchema])),
-      Schema.Array,
-    ),
+    errors: errorEntrySchema(
+      Schema.Unknown.pipe(
+        Schema.decodeTo(Schema.Union([TaskErrorSchema, config.errorSchema])),
+      ),
+    ).pipe(Schema.Array),
 
     success: Schema.Unknown.pipe(
       Schema.decodeTo(config.successSchema),
@@ -147,7 +158,12 @@ export const decodeTask = <
   Task<Payload, Success, Error>,
   Schema.SchemaError,
   Error["DecodingServices"]
-> => Schema.decodeEffect(makeTaskSchema<Payload, Success, Error>(config))(task);
+> => {
+  const decode = Schema.decodeEffect(
+    makeTaskSchema<Payload, Success, Error>(config),
+  );
+  return decode(task);
+};
 
 export const encodeTask = <
   Payload extends Schema.Top,
@@ -183,7 +199,11 @@ export const EngineTaskSchema = Schema.Struct({
   ),
   payload: Schema.Unknown.pipe(Schema.fromJsonString),
   success: Schema.Unknown.pipe(Schema.optional),
-  errors: Schema.Unknown.pipe(Schema.Array).pipe(Schema.fromJsonString),
+  errors: Schema.Struct({
+    timestamp: Schema.Number,
+    error: Schema.Unknown,
+    retryAt: Schema.optional(Schema.Number),
+  }).pipe(Schema.Array, Schema.fromJsonString),
 });
 
 export type EngineTask = typeof EngineTaskSchema.Type;
@@ -255,18 +275,17 @@ export const EventSchema = Schema.Union([
   }),
   Schema.TaggedStruct("task.failed", {
     ...eventBase,
+    // the payload is JSON-decoded once here; error/retryAt are already values
     payload: Schema.Struct({
-      maxRetries: Schema.Number,
-      retryCount: Schema.Number,
       policy: CompletionPolicySchema,
-      error: Schema.Unknown.pipe(Schema.fromJsonString),
-      willRetry: Schema.Boolean,
+      error: Schema.Unknown,
+      retryAt: Schema.Number.pipe(Schema.optional),
     }).pipe(Schema.fromJsonString),
   }),
   Schema.TaggedStruct("task.completed", {
     ...eventBase,
     payload: Schema.Struct({
-      success: Schema.Unknown.pipe(Schema.fromJsonString),
+      success: Schema.Unknown,
       policy: CompletionPolicySchema,
     }).pipe(Schema.fromJsonString),
   }),

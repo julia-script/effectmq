@@ -65,12 +65,13 @@ export class TaskEngine extends Context.Service<
     readonly writeSuccess: (
       prefix: string,
       id: string,
-      result: string,
+      result: unknown,
     ) => Effect.Effect<void, TaskEngineError>;
     readonly writeError: (
       prefix: string,
       id: string,
-      error: string,
+      error: unknown,
+      retryAt?: Duration.Input,
     ) => Effect.Effect<void, TaskEngineError>;
     readonly extendLock: (
       prefix: string,
@@ -160,21 +161,39 @@ const importMap = {
     return nil
   end
   `,
+  getListSize: /*lua*/ `local function getListSize(list) 
+  if list == "wait" then
+    return redis.call("LLEN", list)
+  end
+  if list == "scheduled" then
+    return redis.call("ZCARD", list)
+  end
+  if list == "active" then
+    return redis.call("ZCARD", list)
+  end
+  if list == "failed" then
+    return redis.call("ZCARD", list)
+  end
+  if list == "success" then
+    return redis.call("ZCARD", list)
+  end
+  return 0
+  end`,
   removeFromCurrentLists: /*lua*/ `local function removeFromCurrentLists(prefix, id) 
-    if removeFromWaitList(prefix, id) > 0 then
-      return 'wait'
+     if removeFromWaitList(prefix, id) > 0 then
+      return "wait"
     end
     if removeFromDelayedList(prefix, id) > 0 then
-      return 'scheduled'
+      return "scheduled"
     end
-    if removeFromActiveLists(prefix, id) > 0 then
-      return 'active'
+    if removeFromActiveLists(prefix, id)  > 0 then
+      return "active"
     end
     if removeFromFailedList(prefix, id) > 0 then
-      return 'failed'
+      return "failed"
     end
     if removeFromSuccessList(prefix, id) > 0 then
-      return 'success'
+      return "success"
     end
     return nil
   end`,
@@ -197,7 +216,7 @@ const importMap = {
 
   // the add* helpers no longer clear other lists; moveToList is the single entry
   // point that removes from the current list, adds to the target, and emits task.moved
-  moveToList: /*lua*/ `local function moveToList(prefix, id, list)
+  moveToList: /*lua*/ `local function moveToList(prefix, id, list, readyAt)
     local currentList = removeFromCurrentLists(prefix, id)
     if currentList == list then
       return
@@ -205,7 +224,7 @@ const importMap = {
     if list == "wait" then
       addToWaitList(prefix, id)
     elseif list == "scheduled" then
-      addToDelayedList(prefix, id, now)
+      addToDelayedList(prefix, id, readyAt)
     elseif list == "active" then
       addToActiveLists(prefix, id)
     elseif list == "failed" then
@@ -213,13 +232,14 @@ const importMap = {
     elseif list == "success" then
       addToSuccessList(prefix, id)
     end
+
     publishEvent(prefix, id, "task.moved", { from = currentList, to = list })
   end`,
   deleteTask: /*lua*/ `local function deleteTask(prefix, id) 
     moveToList(prefix, id, nil)
     return redis.call("DEL", taskHash(prefix, id)) 
   end`,
-  popWaitList: /*lua*/ `local function popWaitList(prefix) return redis.call("LPOP", waitList(prefix)) end`,
+  popWaitList: /*lua*/ `local function popWaitList(prefix) return redis.call("LINDEX", waitList(prefix), 0) end`,
 
   getActiveList: /*lua*/ `local function getActiveList(prefix) return redis.call("ZRANGE", activeList(prefix), 0, -1) end`,
 
@@ -236,36 +256,56 @@ const importMap = {
   end`,
   setTask: /*lua*/ `local function setTask(prefix, id, ...) return redis.call("HSET", taskHash(prefix, id), "updatedAt", now, ...) end`,
   setTaskErrors: /*lua*/ `local function setTaskErrors(prefix, id, errors) return setTask(prefix, id, "errors", cjson.encode(errors)) end`,
-  appendTaskError: /*lua*/ `local function appendTaskError(prefix, id, error) 
+  appendTaskError: /*lua*/ `local function appendTaskError(prefix, id, error, retryAt) 
 		local errorsList = getTaskErrors(prefix, id)
-		errorsList[#errorsList + 1] = error
+		errorsList[#errorsList + 1] = {error = error, timestamp = now, retryAt = retryAt}
 		setTaskErrors(prefix, id, errorsList)
 		return errorsList
 	end`,
-  failTask: /*lua*/ `local function failTask(prefix, id, error)
+
+  exists: /*lua*/ `local function exists(key) return redis.call("EXISTS", key) end`,
+  lockTask: /*lua*/ `local function lockTask(prefix, id, workerId, lockTimeout) 
+    moveToList(prefix, id, "active")
+    return redis.call("SET", lockHash(prefix, id), workerId, "EX", lockTimeout) 
+  end`,
+  unlockTask: /*lua*/ `local function unlockTask(prefix, id) return redis.call("DEL", lockHash(prefix, id)) end`,
+  isLocked: /*lua*/ `local function isLocked(prefix, id) return redis.call("EXISTS", lockHash(prefix, id)) > 0 end`,
+  getLockId: /*lua*/ `local function getLockId(prefix, id) return redis.call("GET", lockHash(prefix, id)) end`,
+  isLockedBy: /*lua*/ `local function isLockedBy(prefix, id, workerId) return getLockId(prefix, id) == workerId end`,
+  failTask: /*lua*/ `
+  local function failTask(prefix, id, error, retryAt) 
 		-- error arrives as a JSON string (writeError) or a Lua table (syncLocks); normalize to a table
 		-- so the stored errors list holds objects, not double-encoded strings
+    
+    unlockTask(prefix, id)
+
 		local errorObj = error
 		if type(error) == "string" then
 			local ok, decoded = pcall(cjson.decode, error)
 			errorObj = ok and decoded or error
 		end
-		local errorsList = appendTaskError(prefix, id, errorObj)
+			-- retryAt arrives as -1 (or nil) when no retry is scheduled; normalize
+			-- to nil so it is omitted from the stored error and the event payload
+			if (retryAt or -1) < 0 then retryAt = nil end
+		 appendTaskError(prefix, id, errorObj, retryAt)
 	   local onFailurePolicy = getTaskField(prefix, id, "onFailurePolicy")
-		 local maxRetries = tonumber(getTaskField(prefix, id, "maxRetries"))
 
-		 local errorTag = type(errorObj) == "table" and errorObj._tag or nil
+		 local errorTag = type(errorObj) == "table" and type(errorObj.error) == "table" and errorObj.error._tag or nil
 
-     local willRetry = errorTag ~= "~effectmq/Error/Canceled" and #errorsList < maxRetries
+     local willRetry = errorTag ~= "~effectmq/Error/Canceled" and retryAt ~= nil
       publishEvent(prefix, id, "task.failed", { 
         error = errorObj, 
-        maxRetries = maxRetries, 
-        retryCount = #errorsList - 1, 
         policy = onFailurePolicy,  
-        willRetry = willRetry
+        retryAt = retryAt
       })
 		 if willRetry then
-			  moveToList(prefix, id, "wait")
+        if retryAt > now then
+
+            moveToList(prefix, id, "scheduled", retryAt)
+
+          else
+            moveToList(prefix, id, "wait")
+          end
 			  return
 			end
       if onFailurePolicy == "delete" then
@@ -276,15 +316,6 @@ const importMap = {
         moveToList(prefix, id, nil)
       end
 	end`,
-  exists: /*lua*/ `local function exists(key) return redis.call("EXISTS", key) end`,
-  lockTask: /*lua*/ `local function lockTask(prefix, id, workerId, lockTimeout) 
-    moveToList(prefix, id, "active")
-    return redis.call("SET", lockHash(prefix, id), workerId, "EX", lockTimeout) 
-  end`,
-  unlockTask: /*lua*/ `local function unlockTask(prefix, id) return redis.call("DEL", lockHash(prefix, id)) end`,
-  isLocked: /*lua*/ `local function isLocked(prefix, id) return redis.call("EXISTS", lockHash(prefix, id)) > 0 end`,
-  getLockId: /*lua*/ `local function getLockId(prefix, id) return redis.call("GET", lockHash(prefix, id)) end`,
-  isLockedBy: /*lua*/ `local function isLockedBy(prefix, id, workerId) return getLockId(prefix, id) == workerId end`,
   syncLocks: /*lua*/ `local function syncLocks(prefix)
     -- clear expired locks. Locks will be removed automatically when the lock expires,
     -- but they could remain in the active list if the task is not completed
@@ -294,10 +325,11 @@ const importMap = {
 				failTask(prefix, id, {
 					_tag = "Stalled",
 					timestamp = now,
-				})
+				}, 0)
       end
     end
   end`,
+
   syncDelayed: /*lua*/ `local function syncDelayed(prefix)
   -- we lazily move tasks from the delayed list to the wait list so we need to sync
   -- before performing any other operations
@@ -315,22 +347,22 @@ const importMap = {
 export type TaskEngineService = TaskEngine["Service"];
 const MOCKTIME_KEY = "$$$effectmq/debug/mocktime";
 const declare = (code: string, debugMode: boolean = false) => {
-  let result: string = `-- code\n${code}`;
+  let header = ``;
 
   for (const [key, value] of Object.entries(importMap).reverse()) {
     const reg = new RegExp(`\\b${key}\\b`, "g");
-    if (reg.test(result)) {
-      result = `${value}\n${result}\n`;
+    if (reg.test(code) || reg.test(header)) {
+      header = `${value}\n${header}\n`;
     }
   }
+  let now = ``;
   if (debugMode) {
-    result = /*lua*/ `local now = tonumber(redis.call("GET", "${MOCKTIME_KEY}") or (1000 * tonumber(redis.call("TIME")[1])))\n${result}`;
+    now = /*lua*/ `local now = tonumber(redis.call("GET", "${MOCKTIME_KEY}") or (1000 * tonumber(redis.call("TIME")[1])))\n`;
   } else {
-    result = /*lua*/ `local now = 1000 * tonumber(redis.call("TIME")[1])\n${result}`;
+    now = /*lua*/ `local now = 1000 * tonumber(redis.call("TIME")[1])\n`;
   }
 
-  result = `-- imports\n${result}\n`;
-
+  const result = `${now}\n${header}\n${code}`;
   return result;
 };
 
@@ -360,7 +392,7 @@ const buildScripts = (debugMode: boolean) => {
       params.name,
       JSON.stringify(params.payload),
       params.delay,
-      params.maxRetries,
+      params.maxRetries ?? -1,
       params.onSuccessPolicy,
       params.onFailurePolicy,
     ],
@@ -406,9 +438,9 @@ const buildScripts = (debugMode: boolean) => {
       end
 
       if delay > 0 then
-        addToDelayedList(prefix, id, now + delay)
+        moveToList(prefix, id, "scheduled", now + delay)
       else
-        addToWaitList(prefix, id)
+        moveToList(prefix, id, "wait")
       end
 
       return newTask
@@ -447,6 +479,7 @@ const buildScripts = (debugMode: boolean) => {
 
       syncAll(prefix)
 
+
       if not exists(hash) then
         return redis.error_reply("Task not found")
       end
@@ -471,7 +504,6 @@ const buildScripts = (debugMode: boolean) => {
       elseif successPolicy == "keep" then
         moveToList(prefix, id, nil)
       end
-      unlockTask(prefix, id)
       return task
     `,
         debugMode,
@@ -480,12 +512,13 @@ const buildScripts = (debugMode: boolean) => {
   );
 
   const WriteErrorResultScript = Redis.script(
-    (prefix: string, workerId: string, id: string, error: unknown) => [
-      prefix,
-      workerId,
-      id,
-      JSON.stringify(error),
-    ],
+    (
+      prefix: string,
+      workerId: string,
+      id: string,
+      error: unknown,
+      retryAt: number,
+    ) => [prefix, workerId, id, JSON.stringify(error), retryAt],
     {
       numberOfKeys: 0,
       lua: declare(
@@ -494,8 +527,10 @@ const buildScripts = (debugMode: boolean) => {
       syncAll(prefix)
 			local workerId = ARGV[2]
       local id = ARGV[3]
-      local error = ARGV[4]
+      local error = cjson.decode(ARGV[4])
+      local retryAt = tonumber(ARGV[5]) or -1
       local hash = taskHash(prefix, id)
+
 
 
       if not exists(hash) then
@@ -507,9 +542,8 @@ const buildScripts = (debugMode: boolean) => {
 
 
       local task = getTask(prefix, id)
-			failTask(prefix, id, error)
-			unlockTask(prefix, id)
-			return task
+			failTask(prefix, id, error, retryAt)
+				return task
     `,
         debugMode,
       ),
@@ -563,7 +597,7 @@ const buildScripts = (debugMode: boolean) => {
 	end
 		-- sanity check: tasks on wait list should never be locked, but just in case
 	if isLocked(prefix, taskId) then
-		addToActiveLists(prefix, taskId)
+		moveToList(prefix, taskId, "active")
 		return redis.error_reply("Task is locked by another worker")
 	end
 
@@ -678,9 +712,6 @@ const buildScripts = (debugMode: boolean) => {
 				if not currentSchedule then
 					return { false, nil } 
 				end
-				redis.log(redis.LOG_WARNING,  now)
-				redis.log(redis.LOG_WARNING,  currentSchedule)
-				redis.log(redis.LOG_WARNING,  next)
 
 				-- if the expected current schedule is not equal to the current schedule, 
 				-- we assume the "next" schedule has been calculated relative to the wrong time
@@ -772,21 +803,52 @@ export const make = ({
     const redis = yield* Redis.Redis;
     const scripts = buildScripts(debugMode);
     const withPrefix = (key: string) => `${prefix}:${key}`;
+    const ev = <
+      Config extends {
+        readonly params: ReadonlyArray<unknown>;
+        readonly result: unknown;
+      },
+    >(
+      script: Redis.Script<Config>,
+      message: string,
+    ) => {
+      const fn = redis.eval(script);
+      // the numbered Lua source is a debugging aid; keep it out of production errors
+      const detail = debugMode
+        ? `${message}\n${script.lua
+            .split("\n")
+            .map((line, i) => `[${i}] ${line}`)
+            .join("\n")}`
+        : message;
+      return (...params: Config["params"]) =>
+        fn(...params).pipe(Effect.mapError(TaskEngineError.of(detail)));
+    };
 
-    const createTask = redis.eval(scripts.CreateOrUpdateTaskScript);
-    const writeSuccessResult = redis.eval(scripts.WriteSuccessResultScript);
-    const writeErrorResult = redis.eval(scripts.WriteErrorResultScript);
-    const takeTask = redis.eval(
-      scripts.TakeTaskScript.withReturnType<string[]>(),
+    const createTask = ev(
+      scripts.CreateOrUpdateTaskScript,
+      "Failed to create task",
     );
-    const removeTask = redis.eval(scripts.RemoveTaskScript);
-    const extendLock = redis.eval(scripts.ExtendLockScript);
-    const removeLock = redis.eval(scripts.RemoveLockScript);
-
-    const setSchedule = redis.eval(scripts.SetScheduleScript);
-    const consumeSchedule = redis.eval(scripts.ConsumeScheduleScript);
-
-    const getList = redis.eval(scripts.GetListScript);
+    const writeSuccessResult = ev(
+      scripts.WriteSuccessResultScript,
+      "Failed to write success result",
+    );
+    const writeErrorResult = ev(
+      scripts.WriteErrorResultScript,
+      "Failed to write error result",
+    );
+    const takeTask = ev(
+      scripts.TakeTaskScript.withReturnType<string[]>(),
+      "Failed to take task",
+    );
+    const removeTask = ev(scripts.RemoveTaskScript, "Failed to remove task");
+    const extendLock = ev(scripts.ExtendLockScript, "Failed to extend lock");
+    const removeLock = ev(scripts.RemoveLockScript, "Failed to remove lock");
+    const setSchedule = ev(scripts.SetScheduleScript, "Failed to set schedule");
+    const consumeSchedule = ev(
+      scripts.ConsumeScheduleScript,
+      "Failed to consume schedule",
+    );
+    const getList = ev(scripts.GetListScript, "Failed to get list");
 
     return TaskEngine.of({
       [TypeId]: TypeId,
@@ -798,10 +860,7 @@ export const make = ({
             prefix: withPrefix(task.prefix),
           },
           false,
-        ).pipe(
-          Effect.flatMap(parseTask),
-          Effect.mapError(TaskEngineError.of("Failed to create task")),
-        );
+        ).pipe(Effect.flatMap(parseTask));
       },
 
       getTask: (prefix: string, id: string) =>
@@ -816,28 +875,21 @@ export const make = ({
             ),
             Effect.mapError(TaskEngineError.of("Failed to get task")),
           ),
-      writeSuccess: (prefix: string, id: string, result: string) => {
-        return writeSuccessResult(
-          withPrefix(prefix),
-          workerId,
-          id,
-          result,
-        ).pipe(
-          Effect.mapError(TaskEngineError.of("Failed to write success result")),
-        );
+      writeSuccess: (prefix: string, id: string, result: unknown) => {
+        return writeSuccessResult(withPrefix(prefix), workerId, id, result);
       },
       writeError: Effect.fnUntraced(function* (
         prefix: string,
         id: string,
-        error: string,
+        error: unknown,
+        retryAt?: Duration.Input,
       ) {
         return yield* writeErrorResult(
           withPrefix(prefix),
           workerId,
           id,
           error,
-        ).pipe(
-          Effect.mapError(TaskEngineError.of("Failed to write error result")),
+          retryAt ? Duration.toMillis(retryAt) : -1,
         );
       }),
       getList: (
@@ -845,9 +897,7 @@ export const make = ({
         list: "wait" | "scheduled" | "active" | "failed" | "success",
       ) =>
         Effect.gen(function* () {
-          return yield* getList(withPrefix(prefix), list).pipe(
-            Effect.mapError(TaskEngineError.of("Failed to get list")),
-          );
+          return yield* getList(withPrefix(prefix), list);
         }),
       takeTask: Effect.fnUntraced(function* (
         prefix: string,
@@ -857,30 +907,23 @@ export const make = ({
           withPrefix(prefix),
           workerId,
           lockTimeout,
-        ).pipe(Effect.mapError(TaskEngineError.of("Failed to take task")));
+        );
 
         return result ? yield* parseTask(result) : null;
       }),
       removeTask: (prefix, id) => {
-        return removeTask(withPrefix(prefix), workerId, id).pipe(
-          Effect.mapError(TaskEngineError.of("Failed to remove task")),
-        );
+        return removeTask(withPrefix(prefix), workerId, id);
       },
 
       extendLock: (prefix, id, lockTimeout) => {
-        return extendLock(withPrefix(prefix), workerId, id, lockTimeout).pipe(
-          Effect.mapError(TaskEngineError.of("Failed to extend lock")),
-        );
+        return extendLock(withPrefix(prefix), workerId, id, lockTimeout);
       },
       removeLock: (prefix, id) => {
-        return removeLock(withPrefix(prefix), workerId, id).pipe(
-          Effect.mapError(TaskEngineError.of("Failed to remove lock")),
-        );
+        return removeLock(withPrefix(prefix), workerId, id);
       },
       setSchedule: (name, next) => {
         return setSchedule(prefix, name, String(next.getTime())).pipe(
           Effect.map((next) => new Date(next)),
-          Effect.mapError(TaskEngineError.of("Failed to set schedule")),
         );
       },
       consumeSchedule: (name, toConsume, next) => {
@@ -894,7 +937,6 @@ export const make = ({
             consumed,
             next: next ? new Date(next) : undefined,
           })),
-          Effect.mapError(TaskEngineError.of("Failed to consume schedule")),
         );
       },
 

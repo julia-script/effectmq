@@ -1,8 +1,8 @@
 /**
  * The high-level, typed queue API over {@link TaskEngine}. A `TaskQueue` pairs
  * a queue name with a {@link Task} definition; use {@link offer} to enqueue
- * work, {@link complete} to process a task end-to-end, or the lower-level
- * {@link takeUnsafe}/{@link succeed}/{@link fail} primitives directly.
+ * work and {@link complete} to process a task end-to-end (take, run the handler,
+ * and report the outcome, applying the definition's retry policy on failure).
  *
  * @module
  */
@@ -16,6 +16,7 @@ import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
 import { type CompletionPolicy, decodeTask } from "./Schemas.js";
 import type * as Task from "./Task.js";
 import * as TaskEngine from "./TaskEngine.js";
+import { nextRunAt } from "./utils.js";
 
 const TypeId = "~effectmq/TaskQueue" as const;
 
@@ -24,20 +25,22 @@ export interface TaskQueue<
   Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
+  R = never,
 > {
   readonly [TypeId]: typeof TypeId;
   readonly name: string;
-  readonly task: Task.TaskDefinition<Payload, Success, Error>;
+  readonly task: Task.TaskDefinition<Payload, Success, Error, R>;
 }
 /** Create a {@link TaskQueue} from a queue `name` and a task definition. */
 export const make = <
   Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
+  R = never,
 >(
   name: string,
-  taskDefinition: Task.TaskDefinition<Payload, Success, Error>,
-): TaskQueue<Payload, Success, Error> => {
+  taskDefinition: Task.TaskDefinition<Payload, Success, Error, R>,
+): TaskQueue<Payload, Success, Error, R> => {
   return {
     [TypeId]: TypeId,
     name,
@@ -56,12 +59,13 @@ interface TakeOptions {
  * the lock lifecycle (extend/release) and for reporting success/failure;
  * prefer {@link complete} for the managed path.
  */
-export const takeUnsafe = Effect.fnUntraced(function* <
+const takeUnsafe = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
+  R = never,
 >(
-  queue: TaskQueue<Payload, Success, Error>,
+  queue: TaskQueue<Payload, Success, Error, R>,
   options?: TakeOptions,
 ): Effect.fn.Return<
   Task.Task<Payload, Success, Error>,
@@ -89,8 +93,6 @@ export const takeUnsafe = Effect.fnUntraced(function* <
   return decodedTask;
 });
 
-const encodeToString = <A extends Schema.Top>(schema: A) =>
-  Schema.encodeEffect(Schema.fromJsonString(schema));
 export interface TaskOptions {
   delay?: number;
   maxRetries?: number;
@@ -106,8 +108,9 @@ export const offer = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
+  R = never,
 >(
-  queue: TaskQueue<Payload, Success, Error>,
+  queue: TaskQueue<Payload, Success, Error, R>,
   payload: Payload["Type"],
   options?: TaskOptions,
 ): Effect.fn.Return<
@@ -125,7 +128,7 @@ export const offer = Effect.fnUntraced(function* <
     name: queue.task.name,
     payload: yield* encodePayload(payload),
     delay: options?.delay ?? 0,
-    maxRetries: options?.maxRetries ?? 0,
+    maxRetries: options?.maxRetries ?? -1,
     onSuccessPolicy: options?.onSuccessPolicy ?? "delete",
     onFailurePolicy: options?.onFailurePolicy ?? "delete",
   });
@@ -138,8 +141,9 @@ export const extendLock = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
+  R = never,
 >(
-  queue: TaskQueue<Payload, Success, Error>,
+  queue: TaskQueue<Payload, Success, Error, R>,
   task: Task.Task<Payload, Success, Error>,
   lockTimeout?: Duration.Input,
 ) {
@@ -159,7 +163,8 @@ export const release = Effect.fnUntraced(function* <
   Payload extends AnyStructSchema,
   Success extends Schema.Top,
   Error extends Schema.Top,
->(queue: TaskQueue<Payload, Success, Error>, taskId: string) {
+  R = never,
+>(queue: TaskQueue<Payload, Success, Error, R>, taskId: string) {
   const engine = yield* TaskEngine.TaskEngine;
   return yield* engine.removeLock(queue.name, taskId);
 });
@@ -168,13 +173,16 @@ const succeed = Effect.fnUntraced(function* <
   Payload extends AnyStructSchema,
   Success extends Schema.Top,
   Error extends Schema.Top,
+  R = never,
 >(
-  queue: TaskQueue<Payload, Success, Error>,
+  queue: TaskQueue<Payload, Success, Error, R>,
   task: Task.Task<Payload, Success, Error>,
   success: Success["Type"],
 ) {
   const engine = yield* TaskEngine.TaskEngine;
-  const encode = encodeToString(queue.task.successSchema);
+  // encode to the schema's value (not a JSON string); the engine script
+  // JSON-encodes it once, mirroring how `fail` hands off the raw error value
+  const encode = Schema.encodeEffect(queue.task.successSchema);
   return yield* engine.writeSuccess(
     queue.name,
     task.id,
@@ -183,25 +191,38 @@ const succeed = Effect.fnUntraced(function* <
 });
 
 /** Report a typed failure for a taken task, routing it per the queue's failure policy. */
-export const fail = Effect.fnUntraced(function* <
+const fail = Effect.fnUntraced(function* <
   Payload extends AnyStructSchema,
   Success extends Schema.Top,
   Error extends Schema.Top,
+  R = never,
 >(
-  queue: TaskQueue<Payload, Success, Error>,
+  queue: TaskQueue<Payload, Success, Error, R>,
   task: Task.Task<Payload, Success, Error>,
   failure: Error["Type"],
 ) {
   const engine = yield* TaskEngine.TaskEngine;
-  const encode = encodeToString(queue.task.errorSchema);
-  return yield* engine.writeError(queue.name, task.id, yield* encode(failure));
+
+  // the per-offer maxRetries (-1 when unset) overrides the definition's cap
+  const maxRetries =
+    task.maxRetries !== -1 ? task.maxRetries : queue.task.maxRetries;
+
+  const retryAt =
+    queue.task.retrySchedule && task.errors.length < maxRetries
+      ? yield* nextRunAt(
+          queue.task.retrySchedule,
+          new Date(task.createdAt.getTime() + task.delay),
+          [...task.errors, { timestamp: new Date(), error: failure }],
+        )
+      : undefined;
+  return yield* engine.writeError(queue.name, task.id, failure, retryAt);
 });
 
 export type TaskHandler<
   Payload extends AnyStructSchema,
   Success extends Schema.Top,
   Error extends Schema.Top,
-  R,
+  R = never,
 > = (
   task: Task.Task<Payload, Success, Error>,
 ) => Effect.Effect<Success["Type"], Error["Type"], R>;
@@ -217,32 +238,52 @@ export const complete: {
     Payload extends AnyStructSchema,
     Success extends Schema.Top,
     Error extends Schema.Top,
-    R,
+    TR = never,
+    R = never,
   >(
     handler: TaskHandler<Payload, Success, Error, R>,
   ): (
-    self: TaskQueue<Payload, Success, Error>,
-  ) => Effect.Effect<string, never, R>;
+    self: TaskQueue<Payload, Success, Error, TR>,
+  ) => Effect.Effect<
+    string,
+    TaskEngine.TaskEngineError | Schema.SchemaError,
+    TR | R
+  >;
   <
     Payload extends AnyStructSchema,
     Success extends Schema.Top,
     Error extends Schema.Top,
-    R,
+    TR = never,
+    R = never,
   >(
-    self: TaskQueue<Payload, Success, Error>,
+    self: TaskQueue<Payload, Success, Error, TR>,
     handler: TaskHandler<Payload, Success, Error, R>,
-  ): Effect.Effect<string, never, R>;
+  ): Effect.Effect<
+    string,
+    TaskEngine.TaskEngineError | Schema.SchemaError,
+    TR | R
+  >;
 } = Function.dual(
   2,
   <
     Payload extends AnyStructSchema,
     Success extends Schema.Top,
     Error extends Schema.Top,
-    R,
+    TR = never,
+    R = never,
   >(
-    self: TaskQueue<Payload, Success, Error>,
+    self: TaskQueue<Payload, Success, Error, TR>,
     handler: TaskHandler<Payload, Success, Error, R>,
-  ) => {
+  ): Effect.Effect<
+    string,
+    Schema.SchemaError | TaskEngine.TaskEngineError,
+    | TaskEngine.TaskEngine
+    | TR
+    | R
+    | Payload["DecodingServices"]
+    | Success["EncodingServices"]
+    | Error["EncodingServices"]
+  > => {
     return Effect.gen(function* () {
       const task = yield* takeUnsafe(self);
       const lockTimeout = Duration.seconds(30);

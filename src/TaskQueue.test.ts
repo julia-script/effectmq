@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect";
+import { Effect, Schedule, Schema } from "effect";
 import { describe, expect, test } from "vitest";
 import { Task, TaskQueue } from "./index.js";
 import { getLists, TestRuntime } from "./testing/redisLayer.js";
@@ -8,9 +8,26 @@ const makeQueue = (name: string) => {
   const def = Task.make({
     name,
     payload: { userId: Schema.String, amount: Schema.Number },
-    successSchema: Schema.String,
-    errorSchema: Schema.Struct({ reason: Schema.String }),
+    success: Schema.String,
+    error: Schema.Struct({ reason: Schema.String }),
     idempotencyKey: (p) => p.userId,
+  });
+  return TaskQueue.make(name, def);
+};
+
+// A queue whose task defines a retry schedule; `maxRetries` caps the attempts.
+const makeRetryQueue = (
+  name: string,
+  opts?: { maxRetries?: number | null },
+) => {
+  const def = Task.make({
+    name,
+    payload: { userId: Schema.String },
+    success: Schema.String,
+    error: Schema.Struct({ reason: Schema.String }),
+    idempotencyKey: (p) => p.userId,
+    retry: Schedule.spaced("10 seconds"),
+    ...(opts?.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),
   });
   return TaskQueue.make(name, def);
 };
@@ -64,5 +81,52 @@ describe("TaskQueue", () => {
       expect(done).toBe("u3");
       const lists = yield* getLists(queue.name);
       expect(lists.failed).toEqual(["u3"]);
+    }).pipe(TestRuntime.runPromise));
+
+  test("a failing task with a retry schedule lands on the scheduled list", () =>
+    Effect.gen(function* () {
+      const queue = makeRetryQueue("tq-retry-schedule");
+      yield* TaskQueue.offer(queue, { userId: "s1" });
+
+      yield* TaskQueue.complete(queue, () => Effect.fail({ reason: "boom" }));
+
+      const lists = yield* getLists(queue.name);
+      // Schedule.spaced("10 seconds") → first retry ~10s out, so it is scheduled.
+      expect(lists.scheduled).toEqual(["s1"]);
+      expect(lists.failed).toEqual([]);
+    }).pipe(TestRuntime.runPromise));
+
+  test("maxRetries cap of 0 skips retries even with a schedule", () =>
+    Effect.gen(function* () {
+      // cap at 0 → the first failure can't retry (0 errors is not < 0)
+      const queue = makeRetryQueue("tq-retry-cap", { maxRetries: 0 });
+      yield* TaskQueue.offer(
+        queue,
+        { userId: "c1" },
+        { onFailurePolicy: "mark-as-failure" },
+      );
+
+      yield* TaskQueue.complete(queue, () => Effect.fail({ reason: "boom" }));
+
+      const lists = yield* getLists(queue.name);
+      expect(lists.scheduled).toEqual([]);
+      expect(lists.failed).toEqual(["c1"]);
+    }).pipe(TestRuntime.runPromise));
+
+  test("per-offer maxRetries overrides the definition cap", () =>
+    Effect.gen(function* () {
+      // definition would allow 5 retries, but the offer caps at 0 → no retry
+      const queue = makeRetryQueue("tq-retry-override", { maxRetries: 5 });
+      yield* TaskQueue.offer(
+        queue,
+        { userId: "o1" },
+        { maxRetries: 0, onFailurePolicy: "mark-as-failure" },
+      );
+
+      yield* TaskQueue.complete(queue, () => Effect.fail({ reason: "boom" }));
+
+      const lists = yield* getLists(queue.name);
+      expect(lists.scheduled).toEqual([]);
+      expect(lists.failed).toEqual(["o1"]);
     }).pipe(TestRuntime.runPromise));
 });

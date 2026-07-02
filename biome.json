@@ -22,7 +22,8 @@
         "noUnknownAtRules": "off",
         "noArrayIndexKey": "off",
         "noDocumentCookie": "off",
-        "noShadowRestrictedNames": "off"
+        "noShadowRestrictedNames": "off",
+        "noExplicitAny": "off"
       },
       "correctness": {
         "useYield": "off"

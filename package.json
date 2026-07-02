@@ -8,6 +8,30 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./NodeRedisPool": {
+      "types": "./dist/NodeRedisPool.d.ts",
+      "default": "./dist/NodeRedisPool.js"
+    },
+    "./RedisPool": {
+      "types": "./dist/RedisPool.d.ts",
+      "default": "./dist/RedisPool.js"
+    },
+    "./Scheduler": {
+      "types": "./dist/Scheduler.d.ts",
+      "default": "./dist/Scheduler.js"
+    },
+    "./Task": {
+      "types": "./dist/Task.d.ts",
+      "default": "./dist/Task.js"
+    },
+    "./TaskEngine": {
+      "types": "./dist/TaskEngine.d.ts",
+      "default": "./dist/TaskEngine.js"
+    },
+    "./TaskQueue": {
+      "types": "./dist/TaskQueue.d.ts",
+      "default": "./dist/TaskQueue.js"
     }
   },
   "files": [

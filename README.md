@@ -122,6 +122,30 @@ const program = Effect.gen(function* () {
 
 One `complete` processes one task. To process *many*, set your workers up accordingly.
 
+### Predefine the handler
+
+Handlers are just functions and workers are just Effects, so both are values you can name once and reuse. Type a handler with `TaskHandler` to declare it next to the task definition, before any queue exists; bind it to a queue with `complete` and you have a worker effect you can run, repeat, or fork like any other:
+
+```ts
+import { Effect, Schedule } from "effect";
+import { TaskQueue, type TaskHandler } from "@effectmq/core";
+
+// Declared against the task definition — no queue in sight yet.
+const handleSendEmail: TaskHandler<
+  typeof SendEmail.payloadSchema,
+  typeof SendEmail.successSchema,
+  typeof SendEmail.errorSchema
+> = (task) => sendViaProvider(task.payload);
+
+// Bound to a queue: an Effect that takes one task and runs it to completion.
+const sendEmailWorker = TaskQueue.complete(emails, handleSendEmail);
+
+const program = Effect.gen(function* () {
+  yield* sendEmailWorker; // process one task...
+  yield* sendEmailWorker.pipe(Effect.repeat(Schedule.forever)); // ...or loop forever
+});
+```
+
 ---
 
 ## Streaming & events

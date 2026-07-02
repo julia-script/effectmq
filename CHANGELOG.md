@@ -1,4 +1,4 @@
-# @juliascript/effectmq
+# @effectmq/core
 
 ## 0.1.1
 

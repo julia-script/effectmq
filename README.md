@@ -1,9 +1,9 @@
-# @juliascript/effectmq
+# @effectmq/core
 
 It's a task queue built on [Effect](https://effect.website): typed payloads, typed results, typed errors, all the way down. You describe a unit of work as a schema, hand it to a queue, and process it with a handler that is just an `Effect`. Retries, delays, idempotency, cron schedules: handled. The available engine is backed by Redis, but, like many things in Effect, it can be swapped for a different implementation.
 
 ```bash
-pnpm add @juliascript/effectmq effect@4.0.0-beta.85 @effect/platform-node@4.0.0-beta.85
+pnpm add @effectmq/core effect@4.0.0-beta.85 @effect/platform-node@4.0.0-beta.85
 ```
 
 This library is built on the Effect 4 beta and doesn't work with the current stable Effect release. The examples below use the bundled `NodeRedisPool` layer, a connection-pooled Redis client that ships with the package (`@effect/platform-node` is only needed for `NodeRuntime`). This is beta-era software riding beta-era Effect; pin accordingly.
@@ -17,7 +17,7 @@ Define a task, enqueue work, process it. The whole loop:
 ```ts
 import { Effect, Layer, Schema } from "effect";
 import { NodeRuntime } from "@effect/platform-node";
-import { NodeRedisPool, Task, TaskEngine, TaskQueue } from "@juliascript/effectmq";
+import { NodeRedisPool, Task, TaskEngine, TaskQueue } from "@effectmq/core";
 
 const SendEmail = Task.make({
   name: "send-email",
@@ -52,7 +52,7 @@ That's the shape of it. The rest of this README explains the pieces (typed error
 
 ```ts
 import { Layer } from "effect";
-import { NodeRedisPool, TaskEngine } from "@juliascript/effectmq";
+import { NodeRedisPool, TaskEngine } from "@effectmq/core";
 
 const AppLayer = Layer.provideMerge(
   TaskEngine.layer(),
@@ -74,7 +74,7 @@ A tagged error makes failures pattern-matchable downstream, so reach for `Schema
 
 ```ts
 import { Schedule, Schema } from "effect";
-import { Task, TaskQueue } from "@juliascript/effectmq";
+import { Task, TaskQueue } from "@effectmq/core";
 
 class EmailRejected extends Schema.TaggedErrorClass<EmailRejected>()(
   "EmailRejected",
@@ -204,7 +204,7 @@ For recurring work, `Scheduler.make` runs a handler on a cron expression. If you
 
 ```ts
 import { Cron } from "effect";
-import { Scheduler } from "@juliascript/effectmq";
+import { Scheduler } from "@effectmq/core";
 
 const nightlyReport = Scheduler.make({
   name: "nightly-report",

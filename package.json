@@ -1,5 +1,5 @@
 {
-  "name": "@juliascript/effectmq",
+  "name": "@effectmq/core",
   "version": "0.1.1",
   "description": "Effect-based message queue",
   "type": "module",

@@ -1,5 +1,5 @@
 ---
-"@juliascript/effectmq": minor
+"@effectmq/core": minor
 ---
 
 Move retry configuration to the task definition and drive it with Effect `Schedule`.

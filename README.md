@@ -48,7 +48,7 @@ That's the shape of it. The rest of this README explains the pieces (typed error
 
 ## The setup, once
 
-`TaskEngine.layer()` requires the `Redis` service. `NodeRedisPool` — bundled with the package, a connection pool backed by [node-redis](https://github.com/redis/node-redis) — provides it:
+`TaskEngine.layer()` requires the `RedisPool` service. `NodeRedisPool` — bundled with the package, a connection pool backed by [node-redis](https://github.com/redis/node-redis) — provides it:
 
 ```ts
 import { Layer } from "effect";
@@ -60,7 +60,7 @@ const AppLayer = Layer.provideMerge(
 );
 ```
 
-`NodeRedisPool.layer()` accepts node-redis client options and connects lazily on first command. It's the convenient default, but anything that provides the `Redis` service works: `NodeRedis` from `@effect/platform-node`, an in-memory fake for tests, or a Redis-compatible server (Valkey, Dragonfly, and friends).
+`NodeRedisPool.layer()` accepts node-redis client options and connects lazily on first command. It's the convenient default, but anything that provides the `RedisPool` service works — it's just `send` + `eval`, so you can back it with your own client (ioredis, an in-memory fake for tests) or a Redis-compatible server (Valkey, Dragonfly, and friends).
 
 `TaskEngine` is the machinery underneath: atomic Lua scripts, locks, the lists tasks move between. Provide its layer and forget it; the API you live in is `TaskQueue` and `Scheduler`.
 

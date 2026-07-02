@@ -1,8 +1,8 @@
 import { RedisContainer } from "@testcontainers/redis";
-import { Effect, Layer, ManagedRuntime } from "effect";
+import { Context, Effect, Layer, ManagedRuntime } from "effect";
 import * as Redis from "effect/unstable/persistence/Redis";
 import { Redis as IORedis } from "ioredis";
-import { TaskEngine } from "../index.js";
+import { RedisPool, TaskEngine } from "../index.js";
 
 const redisContainer = (image: string) => {
   const ef = Effect.tryPromise({
@@ -32,14 +32,21 @@ export const redisContainerLayer = ({
       (client) => Effect.succeed(client.disconnect()),
     );
 
-    return yield* Redis.make({
-      send: <A = unknown>(command: string, ...args: ReadonlyArray<string>) =>
-        Effect.tryPromise({
-          try: () => client.call(command, ...args) as Promise<A>,
-          catch: (cause) => new Redis.RedisError({ cause }),
-        }),
-    });
-  }).pipe(Layer.effect(Redis.Redis));
+    const send = <A = unknown>(
+      command: string,
+      ...args: ReadonlyArray<string>
+    ) =>
+      Effect.tryPromise({
+        try: () => client.call(command, ...args) as Promise<A>,
+        catch: (cause) => new Redis.RedisError({ cause }),
+      });
+
+    const redis = yield* Redis.make({ send });
+    return Context.make(
+      RedisPool.RedisPool,
+      RedisPool.RedisPool.of({ send, eval: redis.eval }),
+    ).pipe(Context.add(Redis.Redis, redis));
+  }).pipe(Layer.effectContext);
 const taskEngineLayer = TaskEngine.layer({
   debugMode: true,
 });

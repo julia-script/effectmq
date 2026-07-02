@@ -6,7 +6,7 @@ It's a task queue built on [Effect](https://effect.website): typed payloads, typ
 pnpm add @juliascript/effectmq effect@4.0.0-beta.85 @effect/platform-node@4.0.0-beta.85
 ```
 
-This library is built on the Effect 4 beta and doesn't work with the current stable Effect release. The examples below use the `@effect/platform-node` Redis layer. This is beta-era software riding beta-era Effect; pin accordingly.
+This library is built on the Effect 4 beta and doesn't work with the current stable Effect release. The examples below use the bundled `NodeRedisPool` layer, a connection-pooled Redis client that ships with the package (`@effect/platform-node` is only needed for `NodeRuntime`). This is beta-era software riding beta-era Effect; pin accordingly.
 
 ---
 
@@ -16,8 +16,8 @@ Define a task, enqueue work, process it. The whole loop:
 
 ```ts
 import { Effect, Layer, Schema } from "effect";
-import { NodeRedis, NodeRuntime } from "@effect/platform-node";
-import { Task, TaskEngine, TaskQueue } from "@juliascript/effectmq";
+import { NodeRuntime } from "@effect/platform-node";
+import { NodeRedisPool, Task, TaskEngine, TaskQueue } from "@juliascript/effectmq";
 
 const SendEmail = Task.make({
   name: "send-email",
@@ -37,7 +37,7 @@ const program = Effect.gen(function* () {
 });
 
 // The engine + its Redis layer: the only wiring you need to run the above.
-const AppLayer = Layer.provideMerge(TaskEngine.layer(), NodeRedis.layer());
+const AppLayer = Layer.provideMerge(TaskEngine.layer(), NodeRedisPool.layer());
 
 program.pipe(Effect.provide(AppLayer), NodeRuntime.runMain);
 ```
@@ -48,17 +48,19 @@ That's the shape of it. The rest of this README explains the pieces (typed error
 
 ## The setup, once
 
-`TaskEngine.layer()` requires the `Redis` service. `NodeRedis` provides it:
+`TaskEngine.layer()` requires the `Redis` service. `NodeRedisPool` — bundled with the package, a connection pool backed by [node-redis](https://github.com/redis/node-redis) — provides it:
 
 ```ts
 import { Layer } from "effect";
-import { NodeRedis } from "@effect/platform-node";
-import { TaskEngine } from "@juliascript/effectmq";
+import { NodeRedisPool, TaskEngine } from "@juliascript/effectmq";
 
-const AppLayer = Layer.provideMerge(TaskEngine.layer(), NodeRedis.layer());
+const AppLayer = Layer.provideMerge(
+  TaskEngine.layer(),
+  NodeRedisPool.layer({ url: "redis://localhost:6379" }),
+);
 ```
 
-`NodeRedis` is the convenient default, but anything that provides the `Redis` service works: a pooled connection, an in-memory fake for tests, or a Redis-compatible server (Valkey, Dragonfly, and friends).
+`NodeRedisPool.layer()` accepts node-redis client options and connects lazily on first command. It's the convenient default, but anything that provides the `Redis` service works: `NodeRedis` from `@effect/platform-node`, an in-memory fake for tests, or a Redis-compatible server (Valkey, Dragonfly, and friends).
 
 `TaskEngine` is the machinery underneath: atomic Lua scripts, locks, the lists tasks move between. Provide its layer and forget it; the API you live in is `TaskQueue` and `Scheduler`.
 

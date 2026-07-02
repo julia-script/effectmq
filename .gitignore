@@ -4,5 +4,3 @@ dist/
 .history/
 llms/
 .agents/
-scratchpad/
-scratchpad.ts

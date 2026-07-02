@@ -54,6 +54,9 @@ const taskEngineLayer = TaskEngine.layer({
 
 const layers = taskEngineLayer.pipe(Layer.provideMerge(redisContainerLayer()));
 export const TestRuntime = ManagedRuntime.make(layers);
+// Warm the runtime (container start + layer build) at import time so the
+// first test in a file doesn't pay for it inside its own timeout budget.
+await TestRuntime.runPromise(Effect.void);
 
 export const getLists = (prefix: string) =>
   Effect.gen(function* () {

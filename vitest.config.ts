@@ -6,5 +6,7 @@ export default defineConfig({
   esbuild: { tsconfigRaw: "{}" },
   test: {
     include: ["src/**/*.test.ts"],
+    // testcontainers: first use in a worker may pull + boot a Redis image
+    testTimeout: 30_000,
   },
 });

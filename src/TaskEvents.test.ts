@@ -108,46 +108,38 @@ describe("Task events", () => {
       expect(result).toBe("welcome");
     }).pipe(TestRuntime.runPromise));
 
-  test(
-    "wait fails with the typed error on terminal failure",
-    () =>
-      Effect.gen(function* () {
-        const queue = makeQueue("ev-wait-fail");
-        const task = yield* TaskQueue.offer(
-          queue,
-          { userId: "w2", amount: 5 },
-          { onFailurePolicy: "mark-as-failure" },
-        );
+  test("wait fails with the typed error on terminal failure", () =>
+    Effect.gen(function* () {
+      const queue = makeQueue("ev-wait-fail");
+      const task = yield* TaskQueue.offer(
+        queue,
+        { userId: "w2", amount: 5 },
+        { onFailurePolicy: "mark-as-failure" },
+      );
 
-        yield* TaskQueue.complete(queue, () =>
-          Effect.fail({ reason: "rejected" }),
-        ).pipe(Effect.forkChild);
+      yield* TaskQueue.complete(queue, () =>
+        Effect.fail({ reason: "rejected" }),
+      ).pipe(Effect.forkChild);
 
-        const outcome = yield* TaskQueue.wait(queue, task.id).pipe(Effect.flip);
-        expect(outcome).toEqual({ reason: "rejected" });
-      }).pipe(TestRuntime.runPromise),
-    15_000,
-  );
+      const outcome = yield* TaskQueue.wait(queue, task.id).pipe(Effect.flip);
+      expect(outcome).toEqual({ reason: "rejected" });
+    }).pipe(TestRuntime.runPromise));
 
-  test(
-    "execute offers and resolves with the handler's success value",
-    () =>
-      Effect.gen(function* () {
-        const queue = makeQueue("ev-execute");
+  test("execute offers and resolves with the handler's success value", () =>
+    Effect.gen(function* () {
+      const queue = makeQueue("ev-execute");
 
-        // A worker that keeps pulling — including a fast handler that completes
-        // near-instantly, which execute must not miss.
-        yield* TaskQueue.complete(queue, () => Effect.succeed("sent")).pipe(
-          Effect.repeat(Schedule.forever),
-          Effect.forkChild,
-        );
+      // A worker that keeps pulling — including a fast handler that completes
+      // near-instantly, which execute must not miss.
+      yield* TaskQueue.complete(queue, () => Effect.succeed("sent")).pipe(
+        Effect.repeat(Schedule.forever),
+        Effect.forkChild,
+      );
 
-        const result = yield* TaskQueue.execute(queue, {
-          userId: "e1",
-          amount: 9,
-        });
-        expect(result).toBe("sent");
-      }).pipe(TestRuntime.runPromise),
-    15_000,
-  );
+      const result = yield* TaskQueue.execute(queue, {
+        userId: "e1",
+        amount: 9,
+      });
+      expect(result).toBe("sent");
+    }).pipe(TestRuntime.runPromise));
 });

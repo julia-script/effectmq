@@ -12,7 +12,6 @@ import * as Effect from "effect/Effect";
 import * as Function from "effect/Function";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
-import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
 import { type CompletionPolicy, decodeTask } from "./Schemas.js";
 import type * as Task from "./Task.js";
 import * as TaskEngine from "./TaskEngine.js";
@@ -160,7 +159,7 @@ export const extendLock = Effect.fnUntraced(function* <
 });
 
 export const release = Effect.fnUntraced(function* <
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
@@ -170,7 +169,7 @@ export const release = Effect.fnUntraced(function* <
 });
 
 const succeed = Effect.fnUntraced(function* <
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
@@ -192,7 +191,7 @@ const succeed = Effect.fnUntraced(function* <
 
 /** Report a typed failure for a taken task, routing it per the queue's failure policy. */
 const fail = Effect.fnUntraced(function* <
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
@@ -219,7 +218,7 @@ const fail = Effect.fnUntraced(function* <
 });
 
 export type TaskHandler<
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
@@ -235,7 +234,7 @@ export type TaskHandler<
  */
 export const complete: {
   <
-    Payload extends AnyStructSchema,
+    Payload extends Schema.Top,
     Success extends Schema.Top,
     Error extends Schema.Top,
     TR = never,
@@ -250,7 +249,7 @@ export const complete: {
     TR | R
   >;
   <
-    Payload extends AnyStructSchema,
+    Payload extends Schema.Top,
     Success extends Schema.Top,
     Error extends Schema.Top,
     TR = never,
@@ -266,7 +265,7 @@ export const complete: {
 } = Function.dual(
   2,
   <
-    Payload extends AnyStructSchema,
+    Payload extends Schema.Top,
     Success extends Schema.Top,
     Error extends Schema.Top,
     TR = never,

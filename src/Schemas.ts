@@ -180,7 +180,7 @@ export const encodeTask = <
   Schema.encodeEffect(makeTaskSchema<Payload, Success, Error>(config))(task);
 
 export type TaskSchema<
-  Payload extends AnyStructSchema,
+  Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
 > = ReturnType<typeof makeTaskSchema<Payload, Success, Error>>;

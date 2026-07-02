@@ -798,7 +798,7 @@ export const makePrefix = (...prefixes: string[]) => prefixes.join(":");
  */
 export const make = ({
   debugMode = false,
-  prefix = "@@effectmq",
+  prefix = "~effectmq",
   workerId = `worker/${crypto.randomUUID()}`,
 }: TaskEngineConfig = {}) =>
   Effect.gen(function* () {

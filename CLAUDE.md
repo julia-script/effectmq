@@ -12,15 +12,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pnpm install                      # install (pnpm@10.x, see packageManager)
 pnpm build                        # tsc -> dist/ (tests and src/testing are excluded from the build)
 pnpm exec tsc --noEmit            # typecheck (what CI runs)
-pnpm exec biome check src/        # lint (what CI runs)
+pnpm lint                         # biome check src/ (what CI runs)
 pnpm lint:fix                     # biome check --write --unsafe
 pnpm test                         # vitest run (integration tests, needs Docker — see below)
 pnpm test:watch                   # vitest watch mode
 pnpm vitest run src/TaskQueue.test.ts        # single test file
 pnpm vitest run -t "test name substring"     # single test by name
 ```
-
-Note: the `pnpm lint` script runs `turbo run lint`, but turbo is not a dependency — it's stale. Use `pnpm exec biome check src/` (matches CI).
 
 ### Tests need Docker
 

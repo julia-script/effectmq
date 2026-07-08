@@ -107,7 +107,7 @@ describe("TaskEngine", () => {
         }
       `);
 
-      const taken = yield* taskEngine.takeTask(prefix, 1000);
+      const taken = yield* taskEngine.takeTask(prefix, 30000);
       expect(taken).toMatchInlineSnapshot(`
         {
           "createdAt": 2001-09-09T01:46:40.000Z,
@@ -170,7 +170,7 @@ describe("TaskEngine", () => {
         prefix,
       });
 
-      yield* taskEngine.takeTask(prefix, 1000);
+      yield* taskEngine.takeTask(prefix, 30000);
       yield* taskEngine.writeError(prefix, "r1", stalled(1), now + 5000);
 
       const lists = yield* getLists(prefix);
@@ -199,7 +199,7 @@ describe("TaskEngine", () => {
         prefix,
       });
 
-      yield* taskEngine.takeTask(prefix, 1000);
+      yield* taskEngine.takeTask(prefix, 30000);
       yield* taskEngine.writeError(prefix, "r2", stalled(1), now - 1);
 
       const lists = yield* getLists(prefix);
@@ -224,7 +224,7 @@ describe("TaskEngine", () => {
         prefix,
       });
 
-      yield* taskEngine.takeTask(prefix, 1000);
+      yield* taskEngine.takeTask(prefix, 30000);
       yield* taskEngine.writeError(prefix, "r3", stalled(1));
 
       const lists = yield* getLists(prefix);
@@ -251,12 +251,40 @@ describe("TaskEngine", () => {
         prefix,
       });
 
-      yield* taskEngine.takeTask(prefix, 1000);
+      yield* taskEngine.takeTask(prefix, 30000);
       yield* taskEngine.writeError(prefix, "c1", canceled(1000000000000));
 
       const lists = yield* getLists(prefix);
       expect(lists.wait).toEqual([]);
       expect(lists.failed).toEqual(["c1"]);
+    }).pipe(TestRuntime.runPromise));
+
+  test("Canceled error with a scheduled retry still skips retrying", () =>
+    Effect.gen(function* () {
+      const taskEngine = yield* TaskEngine.TaskEngine;
+      const now = 1000000000000;
+      yield* TaskEngine.setMockTime(now);
+      const prefix = "fail-canceled-retry";
+      yield* taskEngine.createTask({
+        id: "c2",
+        name: "cancel task",
+        payload: "p",
+        delay: 0,
+        maxRetries: 5,
+        onSuccessPolicy: "delete",
+        onFailurePolicy: "mark-as-failure",
+        prefix,
+      });
+
+      yield* taskEngine.takeTask(prefix, 30000);
+      // a retryAt is provided (as TaskQueue.fail would when a retry schedule
+      // exists), but Canceled must short-circuit it
+      yield* taskEngine.writeError(prefix, "c2", canceled(now), now + 5000);
+
+      const lists = yield* getLists(prefix);
+      expect(lists.scheduled).toEqual([]);
+      expect(lists.wait).toEqual([]);
+      expect(lists.failed).toEqual(["c2"]);
     }).pipe(TestRuntime.runPromise));
 
   test("onFailurePolicy: delete removes task entirely", () =>
@@ -275,7 +303,7 @@ describe("TaskEngine", () => {
         prefix,
       });
 
-      yield* taskEngine.takeTask(prefix, 1000);
+      yield* taskEngine.takeTask(prefix, 30000);
       yield* taskEngine.writeError(prefix, "d1", stalled(1));
 
       expect(yield* getLists(prefix)).toMatchInlineSnapshot(`
@@ -306,7 +334,7 @@ describe("TaskEngine", () => {
         prefix,
       });
 
-      yield* taskEngine.takeTask(prefix, 1000);
+      yield* taskEngine.takeTask(prefix, 30000);
       yield* taskEngine.writeError(prefix, "k1", stalled(1));
 
       const lists = yield* getLists(prefix);
@@ -334,7 +362,7 @@ describe("TaskEngine", () => {
         prefix,
       });
 
-      const taken = yield* taskEngine.takeTask(prefix, 1000);
+      const taken = yield* taskEngine.takeTask(prefix, 30000);
       yield* taskEngine.writeSuccess(prefix, taken?.id ?? "", "ok");
 
       const lists = yield* getLists(prefix);
@@ -360,7 +388,7 @@ describe("TaskEngine", () => {
         prefix,
       });
 
-      const taken = yield* taskEngine.takeTask(prefix, 1000);
+      const taken = yield* taskEngine.takeTask(prefix, 30000);
       yield* taskEngine.writeSuccess(prefix, taken?.id ?? "", "ok");
 
       const lists = yield* getLists(prefix);

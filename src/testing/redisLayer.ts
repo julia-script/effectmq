@@ -1,5 +1,9 @@
+import { spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { RedisContainer } from "@testcontainers/redis";
-import { Context, Effect, Layer, ManagedRuntime } from "effect";
+import { Context, Effect, Layer, ManagedRuntime, Schedule } from "effect";
 import * as Redis from "effect/unstable/persistence/Redis";
 import { Redis as IORedis } from "ioredis";
 import { RedisPool, TaskEngine } from "../index.js";
@@ -14,15 +18,11 @@ const redisContainer = (image: string) => {
     Effect.promise(() => container.stop()),
   );
 };
-export const redisContainerLayer = ({
-  image = "redis:7",
-}: {
-  image?: string;
-} = {}) =>
+
+const containerClient = (image: string) =>
   Effect.gen(function* () {
     const container = yield* redisContainer(image);
-
-    const client = yield* Effect.acquireRelease(
+    return yield* Effect.acquireRelease(
       Effect.succeed(
         new IORedis({
           host: container.getHost(),
@@ -31,6 +31,52 @@ export const redisContainerLayer = ({
       ),
       (client) => Effect.succeed(client.disconnect()),
     );
+  });
+
+// A `redis-server` child process on a per-worker unix socket, for environments
+// without Docker (opt in with EFFECTMQ_TEST_REDIS=local).
+const localServerClient = () =>
+  Effect.gen(function* () {
+    const socket = join(
+      mkdtempSync(join(tmpdir(), "effectmq-redis-")),
+      "redis.sock",
+    );
+    yield* Effect.acquireRelease(
+      Effect.try({
+        try: () =>
+          spawn(
+            "redis-server",
+            ["--port", "0", "--unixsocket", socket, "--save", ""],
+            { stdio: "ignore" },
+          ),
+        catch: (cause) => new Redis.RedisError({ cause }),
+      }),
+      (child) => Effect.sync(() => child.kill()),
+    );
+    const client = yield* Effect.acquireRelease(
+      Effect.succeed(new IORedis({ path: socket, lazyConnect: true })),
+      (client) => Effect.succeed(client.disconnect()),
+    );
+    // the server needs a moment to create the socket; retry until it answers
+    yield* Effect.tryPromise({
+      try: () => client.ping(),
+      catch: (cause) => new Redis.RedisError({ cause }),
+    }).pipe(
+      Effect.retry({ schedule: Schedule.spaced("100 millis"), times: 50 }),
+    );
+    return client;
+  });
+
+export const redisContainerLayer = ({
+  image = "redis:7",
+}: {
+  image?: string;
+} = {}) =>
+  Effect.gen(function* () {
+    const client =
+      process.env.EFFECTMQ_TEST_REDIS === "local"
+        ? yield* localServerClient()
+        : yield* containerClient(image);
 
     const send = <A = unknown>(
       command: string,

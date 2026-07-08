@@ -265,9 +265,9 @@ const importMap = {
 	end`,
 
   exists: /*lua*/ `local function exists(key) return redis.call("EXISTS", key) end`,
-  lockTask: /*lua*/ `local function lockTask(prefix, id, workerId, lockTimeout) 
+  lockTask: /*lua*/ `local function lockTask(prefix, id, workerId, lockTimeout)
     moveToList(prefix, id, "active")
-    return redis.call("SET", lockHash(prefix, id), workerId, "EX", lockTimeout) 
+    return redis.call("SET", lockHash(prefix, id), workerId, "PX", lockTimeout)
   end`,
   unlockTask: /*lua*/ `local function unlockTask(prefix, id) return redis.call("DEL", lockHash(prefix, id)) end`,
   isLocked: /*lua*/ `local function isLocked(prefix, id) return redis.call("EXISTS", lockHash(prefix, id)) > 0 end`,
@@ -291,7 +291,7 @@ const importMap = {
 		 appendTaskError(prefix, id, errorObj, retryAt)
 	   local onFailurePolicy = getTaskField(prefix, id, "onFailurePolicy")
 
-		 local errorTag = type(errorObj) == "table" and type(errorObj.error) == "table" and errorObj.error._tag or nil
+		 local errorTag = type(errorObj) == "table" and errorObj._tag or nil
 
      local willRetry = errorTag ~= "~effectmq/Error/Canceled" and retryAt ~= nil
       publishEvent(prefix, id, "task.failed", { 
@@ -324,7 +324,7 @@ const importMap = {
     for i, id in ipairs(activeList) do
       if not isLocked(prefix, id) then
 				failTask(prefix, id, {
-					_tag = "Stalled",
+					_tag = "~effectmq/Error/Stalled",
 					timestamp = now,
 				}, 0)
       end
@@ -708,36 +708,39 @@ const buildScripts = (debugMode: boolean) => {
 				local nextToSet = tonumber(ARGV[4])
 				local hash = scheduleHash(prefix, name)
 
+				-- consumed is reported as 1/0 rather than a boolean: Redis converts a
+				-- Lua false to a null reply, which truncates the returned array
 				local currentSchedule = tonumber(redis.call("HGET", hash, "next"))
 				-- if schedule is not set, we return nil
 				if not currentSchedule then
-					return { false, nil } 
+					return { 0 }
 				end
 
-				-- if the expected current schedule is not equal to the current schedule, 
+				-- if the expected current schedule is not equal to the current schedule,
 				-- we assume the "next" schedule has been calculated relative to the wrong time
 				-- so we discard it and send the acual current schedule so the worker can use it to try again
 				if currentSchedule ~= currentToConsume then
-					return { false, currentSchedule }
+					return { 0, currentSchedule }
 				end
 
 				-- if the current schedule match, but the vent is still in the future, we also discard it
 				if now < currentSchedule then
-			  	return { false, currentSchedule }
+			  	return { 0, currentSchedule }
 				end
 
 				-- if the event is in the past, we can consume it and schedule the next event
 				if currentSchedule < nextToSet then
 					redis.call("HSET", hash, "next", nextToSet)
-					return { true, nextToSet }
+					return { 1, nextToSet }
 				end
 
-				return { false, currentSchedule }
+				return { 0, currentSchedule }
 
 				`,
+        debugMode,
       ),
     },
-  ).withReturnType<[boolean, number | null]>();
+  ).withReturnType<[0 | 1, number | null]>();
 
   const GetListScript = Redis.script(
     (
@@ -936,7 +939,7 @@ export const make = ({
           next.getTime(),
         ).pipe(
           Effect.map(([consumed, next]) => ({
-            consumed,
+            consumed: consumed === 1,
             next: next ? new Date(next) : undefined,
           })),
         );

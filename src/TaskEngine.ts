@@ -396,6 +396,8 @@ const buildScripts = (debugMode: boolean) => {
       params.maxRetries ?? -1,
       params.onSuccessPolicy,
       params.onFailurePolicy,
+      JSON.stringify(params.heldBy ?? []),
+      params.createdBy ? JSON.stringify(params.createdBy) : "",
     ],
     {
       numberOfKeys: 0,
@@ -413,11 +415,32 @@ const buildScripts = (debugMode: boolean) => {
       local maxRetries = tonumber(ARGV[7])
       local onSuccessPolicy = ARGV[8]
       local onFailurePolicy = ARGV[9]
+      -- heldBy/createdBy arrive with fully-qualified prefixes (the service
+      -- layer applies the global prefix, same as ARGV[1]); stored refs keep
+      -- that form so they are directly key-addressable
+      local heldBy = cjson.decode(ARGV[10])
+      local createdBy = ARGV[11]
       local hash = taskHash(prefix, id)
       local existingTask = getTask(prefix, id)
 
       if throwOnExists == true and existingTask ~= nil then
         return redis.error_reply("task already exists")
+      end
+
+      -- refs are acquired only when the task is created; an idempotent
+      -- re-offer (replay) skips acquisition entirely so holders never
+      -- double-pin. Holders must be alive: a dead-but-retained record
+      -- (keep/mark-as-*) has already released and would pin forever.
+      -- Validate every holder before writing anything.
+      if existingTask == nil then
+        for i, holder in ipairs(heldBy) do
+          if exists(taskHash(holder.prefix, holder.id)) == 0 then
+            return redis.error_reply("holder not found: " .. holder.prefix .. ":" .. holder.id)
+          end
+          if getTaskField(holder.prefix, holder.id, "dead") == "true" then
+            return redis.error_reply("holder is dead: " .. holder.prefix .. ":" .. holder.id)
+          end
+        end
       end
 
     setTask(
@@ -427,10 +450,23 @@ const buildScripts = (debugMode: boolean) => {
         "payload", payload, 
         "delay", delay, 
         "maxRetries", maxRetries, 
-        "onSuccessPolicy", onSuccessPolicy, 
-        "onFailurePolicy", onFailurePolicy, 
+        "onSuccessPolicy", onSuccessPolicy,
+        "onFailurePolicy", onFailurePolicy,
         "errors", "[]"
       )
+      -- refs/refCount/createdBy are written only at creation and never reset
+      -- on an idempotent re-offer (refs records pins the task already holds)
+      if existingTask == nil then
+        setTask(prefix, id, "refs", "[]", "refCount", #heldBy)
+        if createdBy ~= "" then
+          setTask(prefix, id, "createdBy", createdBy)
+        end
+        for i, holder in ipairs(heldBy) do
+          local holderRefs = cjson.decode(getTaskField(holder.prefix, holder.id, "refs") or "[]")
+          holderRefs[#holderRefs + 1] = { prefix = prefix, id = id }
+          setTask(holder.prefix, holder.id, "refs", cjson.encode(holderRefs))
+        end
+      end
       local newTask = getTask(prefix, id)
       if existingTask ~= nil then
         publishEvent(prefix, id, "task.updated", { existingTask = existingTask, newTask = newTask})
@@ -861,8 +897,17 @@ export const make = ({
         return createTask(
           {
             ...task,
-
             prefix: withPrefix(task.prefix),
+            // stored TaskRef prefixes are fully qualified, one rule for all
+            // refs in the data: they are directly key-addressable
+            heldBy: task.heldBy?.map((ref) => ({
+              ...ref,
+              prefix: withPrefix(ref.prefix),
+            })),
+            createdBy: task.createdBy && {
+              ...task.createdBy,
+              prefix: withPrefix(task.createdBy.prefix),
+            },
           },
           false,
         ).pipe(Effect.flatMap(parseTask));

@@ -38,6 +38,8 @@ describe("TaskEngine", () => {
           "onFailurePolicy": "delete",
           "onSuccessPolicy": "delete",
           "payload": "task payload",
+          "refCount": 0,
+          "refs": [],
           "updatedAt": 2001-09-09T01:46:40.000Z,
         }
       `);
@@ -119,6 +121,8 @@ describe("TaskEngine", () => {
           "onFailurePolicy": "delete",
           "onSuccessPolicy": "delete",
           "payload": "task payload",
+          "refCount": 0,
+          "refs": [],
           "updatedAt": 2001-09-09T01:46:40.000Z,
         }
       `);

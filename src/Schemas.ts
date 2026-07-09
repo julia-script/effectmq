@@ -21,6 +21,23 @@ const CompletionPolicySchema = Schema.Literals([
   "mark-as-failure",
 ]);
 
+/**
+ * A reference to a task in any queue: its queue `prefix` plus task `id`.
+ * Used by `heldBy` (acquire pins at creation), `refs` (pins a task holds),
+ * and `createdBy` (provenance metadata).
+ */
+export const TaskRefSchema = Schema.Struct({
+  prefix: Schema.String,
+  id: Schema.String,
+});
+/** A cross-queue task reference (`{prefix, id}`). */
+export type TaskRef = typeof TaskRefSchema.Type;
+
+/** Terminal outcome recorded on the task hash once a task is done. */
+const TaskOutcomeSchema = Schema.Literals(["success", "failure"]);
+/** Terminal outcome of a done task (`success` | `failure`). */
+export type TaskOutcome = typeof TaskOutcomeSchema.Type;
+
 export const errorEntrySchema = <Error extends Schema.Top>(error: Error) =>
   Schema.Struct({
     error: error,
@@ -176,8 +193,7 @@ export const encodeTask = <
     errorSchema: Error;
   },
   task: Task<Payload, Success, Error>,
-): Effect.Effect<EngineTask, Schema.SchemaError, Error["EncodingServices"]> =>
-  Schema.encodeEffect(makeTaskSchema<Payload, Success, Error>(config))(task);
+) => Schema.encodeEffect(makeTaskSchema<Payload, Success, Error>(config))(task);
 
 export type TaskSchema<
   Payload extends Schema.Top,
@@ -204,6 +220,13 @@ export const EngineTaskSchema = Schema.Struct({
     error: Schema.Unknown,
     retryAt: Schema.optional(Schema.Number),
   }).pipe(Schema.Array, Schema.fromJsonString),
+  // pinning fields — refs is always written by the create script; the rest
+  // are set conditionally (acquisition, completion, death)
+  refCount: Schema.NumberFromString.pipe(Schema.optional),
+  refs: TaskRefSchema.pipe(Schema.Array, Schema.fromJsonString),
+  createdBy: TaskRefSchema.pipe(Schema.fromJsonString, Schema.optional),
+  outcome: TaskOutcomeSchema.pipe(Schema.optional),
+  dead: Schema.Boolean.pipe(Schema.fromJsonString, Schema.optional),
 });
 
 export type EngineTask = typeof EngineTaskSchema.Type;
@@ -218,6 +241,8 @@ export const EngineTaskInsertSchema = Schema.Struct({
   onSuccessPolicy: CompletionPolicySchema,
 
   onFailurePolicy: CompletionPolicySchema,
+  heldBy: Schema.Array(TaskRefSchema).pipe(Schema.optional),
+  createdBy: TaskRefSchema.pipe(Schema.optional),
 });
 export type EngineTaskInsert = typeof EngineTaskInsertSchema.Type;
 

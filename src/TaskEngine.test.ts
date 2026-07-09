@@ -5,10 +5,14 @@ import { getLists, TestRuntime } from "./testing/redisLayer.js";
 
 // writeError serializes its argument once (JSON.stringify), so pass a tagged
 // error object; the engine stores the decoded object in the task's errors list.
-const stalled = (timestamp: number) =>
-  ({ _tag: "~effectmq/Error/Stalled", timestamp }) as unknown as string;
-const canceled = (timestamp: number) =>
-  ({ _tag: "~effectmq/Error/Canceled", timestamp }) as unknown as string;
+const stalled = (timestamp: number) => ({
+  _tag: "~effectmq/Error/Stalled",
+  timestamp,
+});
+const canceled = (timestamp: number) => ({
+  _tag: "~effectmq/Error/Canceled",
+  timestamp,
+});
 
 describe("TaskEngine", () => {
   test("success happy path with delete on success policy", () =>

@@ -10,9 +10,8 @@ Tasks that depend on other tasks' results have no safe way to read them: the def
 - Refs are acquired only at task creation via a new `heldBy` option: creating task B with `heldBy: [A]` increments B's `refCount` and appends B to A's `refs` list, atomically, in the create script. Holders are always pre-existing (older) tasks, so the ref graph is acyclic by construction. No standalone addRef API. Re-creating an existing task (idempotent re-offer, e.g. a replaying parent) skips ref acquisition entirely.
 - Introduce an alive/dead task lifecycle: a task is **done** when it reaches a terminal success/failure, and **dead** only when it is done *and* `refCount == 0`. Death is when its pins on other tasks release (cascading further deaths) and when its own success/failure policy applies.
 - **BREAKING** (semantics, pinned tasks only): completion policies (`onSuccessPolicy`/`onFailurePolicy`) now apply at *death* rather than at completion. A done-but-pinned task sits in no list — it does not enter the `success`/`failed` lists until its last holder dies. Unpinned tasks (the default; `refCount == 0` at completion) are observably unchanged. Field names are unchanged.
-- `removeTask` on an alive task is a forced death: it releases the task's refs (cascading) before deleting the record.
+- `removeTask` on a pinned task (`refCount > 0`) is illegal and errors — remove the holders first; their deaths release and dispose of it. On an unpinned alive task, `removeTask` is a forced death: it releases the task's refs (cascading) before deleting the record.
 - Add an optional `createdBy` field on tasks: pure provenance metadata (`{prefix, id}` of the creating task) set at creation, never read by lifecycle logic. Exists so future devtools can visualize the spawn graph even after refs release.
-- `TaskQueue.offer` gains `heldBy` and `createdBy` pass-through options.
 
 ## Capabilities
 
@@ -26,6 +25,5 @@ Tasks that depend on other tasks' results have no safe way to read them: the def
 
 - `src/TaskEngine.ts`: create script (acquire refs, `createdBy`), success/terminal-failure paths route through a shared `dieIfDead` Lua helper (policy application + ref release + iterative cascade), `removeTask` forced-death path. New task hash fields: `refCount`, `refs`, `createdBy`.
 - `src/Schemas.ts`: `EngineTask`/`EngineTaskInsert` gain `refCount`, `refs`, `createdBy`; encode/decode for the new fields.
-- `src/TaskQueue.ts`: `TaskOptions` gains `heldBy`/`createdBy`.
 - Tests: new engine-level tests for pinning lifecycle, cascade, idempotent re-offer; existing completion-policy tests unaffected (unpinned behavior unchanged).
-- Not in scope: suspend/requeue ergonomics for replaying parents (deliberate "not ready yet" failures currently consume `maxRetries` and pollute the errors list — follow-up change), holder-set introspection ("who pins X"), a dedicated list for done-but-pinned tasks, retention/trimming policies for `success`/`failed` lists (this design keeps those lists dead-only so future trimming needs no ref awareness).
+- Not in scope: the user-facing `TaskQueue.offer` `heldBy`/`createdBy` options and README/TSDoc updates (separate follow-up change), suspend/requeue ergonomics for replaying parents (deliberate "not ready yet" failures currently consume `maxRetries` and pollute the errors list — follow-up change), holder-set introspection ("who pins X"), a dedicated list for done-but-pinned tasks, retention/trimming policies for `success`/`failed` lists (this design keeps those lists dead-only so future trimming needs no ref awareness).

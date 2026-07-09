@@ -273,6 +273,67 @@ const importMap = {
   isLocked: /*lua*/ `local function isLocked(prefix, id) return redis.call("EXISTS", lockHash(prefix, id)) > 0 end`,
   getLockId: /*lua*/ `local function getLockId(prefix, id) return redis.call("GET", lockHash(prefix, id)) end`,
   isLockedBy: /*lua*/ `local function isLockedBy(prefix, id, workerId) return getLockId(prefix, id) == workerId end`,
+
+  // death: a task dies when it is done (outcome recorded) and refCount == 0.
+  // Dying applies the outcome-keyed policy and releases the task's own refs;
+  // removeTask composes deleteTask + releaseRefs instead (removal deletes,
+  // it never applies a policy). Ref prefixes are stored fully qualified, so
+  // cross-queue targets (and their event streams) resolve directly.
+  applyDeathPolicy: /*lua*/ `local function applyDeathPolicy(prefix, id)
+    local policy
+    if getTaskField(prefix, id, "outcome") == "success" then
+      policy = getTaskField(prefix, id, "onSuccessPolicy")
+    else
+      policy = getTaskField(prefix, id, "onFailurePolicy")
+    end
+    if policy == "delete" then
+      deleteTask(prefix, id)
+    else
+      -- retained dead record: flag it and clear refs — the caller releases
+      -- them now, so a later removeTask must not release them again
+      setTask(prefix, id, "dead", "true", "refs", "[]")
+      if policy == "mark-as-success" then
+        moveToList(prefix, id, "success")
+      elseif policy == "mark-as-failure" then
+        moveToList(prefix, id, "failed")
+      else
+        moveToList(prefix, id, nil)
+      end
+    end
+  end`,
+  releaseRefs: /*lua*/ `local function releaseRefs(refs)
+    -- decrement every target; one that is done and reaches refCount 0 dies
+    -- here too, appending its own refs to the worklist (iterative cascade)
+    local n = 1
+    while n <= #refs do
+      local ref = refs[n]
+      n = n + 1
+      if exists(taskHash(ref.prefix, ref.id)) == 1 then
+        local rc = tonumber(redis.call("HINCRBY", taskHash(ref.prefix, ref.id), "refCount", -1))
+        if rc <= 0 and getTaskField(ref.prefix, ref.id, "outcome") then
+          local childRefs = cjson.decode(getTaskField(ref.prefix, ref.id, "refs") or "[]")
+          applyDeathPolicy(ref.prefix, ref.id)
+          for j, childRef in ipairs(childRefs) do
+            refs[#refs + 1] = childRef
+          end
+        end
+      end
+    end
+  end`,
+  dieTask: /*lua*/ `local function dieTask(prefix, id)
+    local refs = cjson.decode(getTaskField(prefix, id, "refs") or "[]")
+    applyDeathPolicy(prefix, id)
+    releaseRefs(refs)
+  end`,
+  settleDoneTask: /*lua*/ `local function settleDoneTask(prefix, id)
+    -- a task just reached a terminal outcome: it dies now unless pinned, in
+    -- which case it parks in no list and its policy is deferred to release
+    if tonumber(getTaskField(prefix, id, "refCount") or "0") > 0 then
+      moveToList(prefix, id, nil)
+    else
+      dieTask(prefix, id)
+    end
+  end`,
   failTask: /*lua*/ `
   local function failTask(prefix, id, error, retryAt) 
 		-- error arrives as a JSON string (writeError) or a Lua table (syncLocks); normalize to a table
@@ -309,13 +370,8 @@ const importMap = {
           end
 			  return
 			end
-      if onFailurePolicy == "delete" then
-        deleteTask(prefix, id)
-      elseif onFailurePolicy == "mark-as-failure" then
-        moveToList(prefix, id, "failed")
-      elseif onFailurePolicy == "keep" then
-        moveToList(prefix, id, nil)
-      end
+      setTask(prefix, id, "outcome", "failure")
+      settleDoneTask(prefix, id)
 	end`,
   syncLocks: /*lua*/ `local function syncLocks(prefix)
     -- clear expired locks. Locks will be removed automatically when the lock expires,
@@ -523,7 +579,7 @@ const buildScripts = (debugMode: boolean) => {
 			if not isLockedBy(prefix, id, workerId) then
 				return redis.error_reply("Task is locked by another worker")
 			end
-      setTask(prefix, id, "success", result)
+      setTask(prefix, id, "success", result, "outcome", "success")
       local task = getTask(prefix, id)
       local successPolicy = getTaskField(prefix, id, "onSuccessPolicy")
 
@@ -532,15 +588,7 @@ const buildScripts = (debugMode: boolean) => {
         policy = successPolicy
       })
 
-
-    
-      if successPolicy == "delete" then
-        deleteTask(prefix, id)
-      elseif successPolicy == "mark-as-success" then
-        moveToList(prefix, id, "success")
-      elseif successPolicy == "keep" then
-        moveToList(prefix, id, nil)
-      end
+      settleDoneTask(prefix, id)
       return task
     `,
         debugMode,
@@ -603,7 +651,18 @@ const buildScripts = (debugMode: boolean) => {
 			if lock and lock ~= workerId then
 				return redis.error_reply("Task is locked by another worker")
 			end
+      -- deleting a pinned task is illegal: its holders may still read it.
+      -- Remove the holders first — their deaths release (and dispose of)
+      -- this task via the normal cascade.
+      if tonumber(getTaskField(prefix, id, "refCount") or "0") > 0 then
+        return redis.error_reply("task is pinned: remove the tasks holding it first")
+      end
+      -- removal deletes the record regardless of outcome/policy, but its
+      -- refs still release (cascading), or a removed holder would leak its
+      -- children
+      local refs = cjson.decode(getTaskField(prefix, id, "refs") or "[]")
       deleteTask(prefix, id)
+      releaseRefs(refs)
       return
       `,
         debugMode,

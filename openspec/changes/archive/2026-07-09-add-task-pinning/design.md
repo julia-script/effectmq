@@ -72,15 +72,20 @@ No reverse index (who pins X) — a count suffices for correctness; a holder set
 
 Coordinate system: every TaskRef prefix in storage (`refs`, `createdBy`) is **fully qualified** (`{prefix: "~effectmq:my-queue", id}`) — the service layer applies the engine's global prefix to `heldBy`/`createdBy` inputs exactly as it does to `task.prefix`, so the Lua boundary uniformly speaks fully-qualified prefixes and stored refs are directly key-addressable (the death cascade dereferences them with no extra context). Engine *inputs* stay queue-level; the qualified form appears on read-back (`getTask`, events). The engine level is explicit/physical; friendlier coordinates belong to the layer above. (Considered queue-level storage with a `globalPrefix` ARGV composed in Lua — rejected: it made the create script the only script receiving unqualified coordinates, and no current reader needs to strip prefixes.)
 
-### D5: `dieIfDead` — single choke function, multiple call sites
+### D5: death decomposed into `applyDeathPolicy` + `releaseRefs`, no mode flags
 
-One Lua helper checks `done ∧ refCount == 0`; if met it runs death: apply the outcome policy (delete → `DEL` hash; `keep` → no list, hash stays; `mark-as-*` → success/failed list), then release own refs by decrementing each entry in `refs` and re-checking `dieIfDead` on each target. Cascade is an iterative worklist, not Lua recursion.
+Three small Lua helpers compose the death behavior (no force/boolean parameters — removal and death are different verbs sharing the release cascade):
+
+- `applyDeathPolicy(prefix, id)` — the outcome-keyed disposal: `delete` → `DEL` hash; retained policies → set the `dead` flag, clear `refs` (they are released by the caller, so a later `removeTask` cannot double-release), move to the target list (or none for `keep`).
+- `releaseRefs(refs)` — decrement every target; a target that is done and reaches `refCount` 0 dies right there (`applyDeathPolicy` + its refs appended to the worklist). Iterative worklist, not Lua recursion.
+- `dieTask(prefix, id)` = read refs → `applyDeathPolicy` → `releaseRefs`.
+- `settleDoneTask(prefix, id)` — the done-moment branch: pinned → park in no list (policy deferred); unpinned → `dieTask`.
 
 Call sites:
-1. `writeSuccess` — task becomes done.
-2. `failTask` terminal branch (retries exhausted or `Canceled`) — task becomes done.
-3. The decrement loop inside a death cascade — `refCount` reaches 0 on an already-done task.
-4. `removeTask` — **forced death**: skips the `done` check but runs the same death body (release refs, cascade) before deleting the record. Without this, force-removing a parent leaks its children.
+1. `writeSuccess` — records `outcome: success`, publishes `task.completed`, then `settleDoneTask`.
+2. `failTask` terminal branch (retries exhausted or `Canceled`) — records `outcome: failure`, then `settleDoneTask`.
+3. The cascade inside `releaseRefs` — `refCount` reaches 0 on an already-done task.
+4. `removeTask` — rejects pinned tasks (`refCount > 0` → error; holders may still read it, so deletion pressure flows top-down: remove holders first). On an unpinned task it composes `deleteTask` + `releaseRefs` directly: removal always deletes the record (never applies a policy), but still releases, or a removed holder would leak its children.
 
 This replaces `deleteTask` as the choke point, one level up. A done-but-pinned task is removed from all lists (limbo, like `keep`) with its outcome recorded on the hash; events for completion still fire at completion time.
 

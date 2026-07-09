@@ -1,6 +1,10 @@
 # task-pinning
 
-## ADDED Requirements
+## Purpose
+
+Defines refCount-based task lifetime: a task can be pinned by other tasks (`heldBy` at creation) so its record and result survive until every holder is gone. Covers ref acquisition, the alive/done/dead lifecycle (death = done ∧ `refCount` 0, when the disposal policy applies and the task's own refs release, cascading), `removeTask` rules, and the `createdBy` provenance field. Enables durable-workflow-style replay reads across queues without a parent/child hierarchy.
+
+## Requirements
 
 ### Requirement: Ref acquisition at child creation
 
@@ -74,12 +78,16 @@ At death, after applying the outcome policy, the engine SHALL decrement the `ref
 - **WHEN** a task dies with `keep` policy while holding no refs, and its record is later removed via `removeTask`
 - **THEN** the removal is a plain record deletion with no ref decrements
 
-### Requirement: removeTask forces death
+### Requirement: removeTask rejects pinned tasks and forces death of unpinned ones
 
-`removeTask` on an alive task SHALL run the death behavior (release held refs with cascade) before deleting the record, regardless of whether the task is done.
+`removeTask` on a task with `refCount > 0` SHALL fail with an error and change nothing — a pinned task's holders may still read it; the holders must be removed first. `removeTask` on an unpinned alive task SHALL run the death behavior (release held refs with cascade) before deleting the record, regardless of whether the task is done.
+
+#### Scenario: Removing a pinned task is illegal
+- **WHEN** task B has `refCount > 0` and `removeTask(B)` is called
+- **THEN** the call fails and B's record is unchanged
 
 #### Scenario: Force-removing a holder releases its children
-- **WHEN** alive task A pins done task B (`delete` policy) and `removeTask(A)` is called
+- **WHEN** unpinned alive task A pins done task B (`delete` policy) and `removeTask(A)` is called
 - **THEN** A's record is deleted and B dies (its `refCount` reached 0)
 
 ### Requirement: createdBy provenance field

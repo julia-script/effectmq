@@ -55,7 +55,7 @@
     "effect": ">=4.0.0-beta.85"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.1",
+    "@biomejs/biome": "2.5.1",
     "@changesets/cli": "^2.31.0",
     "@effect/platform-node": "4.0.0-beta.85",
     "@testcontainers/redis": "^12.0.3",
@@ -64,7 +64,7 @@
     "ioredis": "^5.11.1",
     "testcontainers": "^12.0.3",
     "tsx": "^4.22.4",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "vitest": "^4.1.9"
   },
   "dependencies": {

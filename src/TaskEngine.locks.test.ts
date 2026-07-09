@@ -76,7 +76,7 @@ describe("TaskEngine locking", () => {
       yield* createTask(engine, prefix, "e1");
       yield* engine.takeTask(prefix, 30_000);
 
-      const lockKey = `@@effectmq:${prefix}:lock:e1`;
+      const lockKey = `~effectmq:${prefix}:lock:e1`;
       const initialTtl = yield* redis.send<number>("PTTL", lockKey);
       expect(initialTtl).toBeGreaterThan(0);
       expect(initialTtl).toBeLessThanOrEqual(30_000);

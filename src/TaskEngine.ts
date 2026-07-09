@@ -7,7 +7,6 @@
  *
  * @module
  */
-import { Schedule } from "effect";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
@@ -1063,12 +1062,14 @@ export const make = ({
         const streamKey = `${withPrefix(name)}:events`;
         return Stream.paginate(cursor, (cursor) =>
           Effect.gen(function* () {
+            // BLOCK makes the server hold the read until an event arrives
+            // (or 2s pass), so the repeat below re-issues immediately on an
+            // empty reply without a client-side polling schedule.
             const reply = yield* redis
-              .send("XREAD", "STREAMS", streamKey, cursor)
+              .send("XREAD", "BLOCK", "2000", "STREAMS", streamKey, cursor)
               .pipe(
                 Effect.mapError(TaskEngineError.of("Failed to poll stream")),
                 Effect.repeat({
-                  schedule: Schedule.spaced(pollInterval),
                   until: (value) => !!value,
                 }),
               );
@@ -1076,7 +1077,13 @@ export const make = ({
               yield* Effect.sleep(pollInterval);
             }
 
-            const entries = yield* decode(reply).pipe(
+            // ioredis replies with [stream, entries] tuples; node-redis
+            // replies with an object keyed by stream name. Normalize to the
+            // tuple shape before decoding.
+            const normalized = Array.isArray(reply)
+              ? reply
+              : Object.entries(reply as object);
+            const entries = yield* decode(normalized).pipe(
               Effect.tapError((error) => Effect.log(error.toString())),
             );
             const events = entries[0][1];

@@ -7,7 +7,6 @@
  */
 import { type Effect, SchemaGetter } from "effect";
 import * as Schema from "effect/Schema";
-import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
 
 /**
  * Policy applied to a task once it completes (on success or failure):

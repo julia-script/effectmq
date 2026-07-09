@@ -1,6 +1,7 @@
 import { Effect, Schedule, Schema } from "effect";
 import { describe, expect, test } from "vitest";
-import { Task, TaskQueue } from "./index.js";
+import { Task, TaskEngine, TaskQueue } from "./index.js";
+import type { EngineTask } from "./Schemas.js";
 import { getLists, TestRuntime } from "./testing/redisLayer.js";
 
 // A typed queue with a deterministic id so wait-list assertions are exact.
@@ -128,5 +129,97 @@ describe("TaskQueue", () => {
       const lists = yield* getLists(queue.name);
       expect(lists.scheduled).toEqual([]);
       expect(lists.failed).toEqual(["o1"]);
+    }).pipe(TestRuntime.runPromise));
+});
+
+// offer() inside a complete() handler picks up the running task from
+// TaskContext: the inner task is pinned by (heldBy) and attributed to
+// (createdBy) the outer one. Engine-level pinning mechanics are covered in
+// TaskEngine.pinning.test.ts; these tests cover the context plumbing.
+describe("TaskQueue parent task context", () => {
+  test("a task offered inside a handler is pinned by and attributed to the outer task", () =>
+    Effect.gen(function* () {
+      const engine = yield* TaskEngine.TaskEngine;
+      const parent = makeQueue("tq-ctx-parent");
+      const child = makeQueue("tq-ctx-child");
+      yield* TaskQueue.offer(parent, { userId: "p1", amount: 1 });
+
+      // capture engine state while the parent handler is still running,
+      // before the parent's death releases the child
+      let during:
+        | { child: EngineTask | null; parent: EngineTask | null }
+        | undefined;
+      yield* TaskQueue.complete(parent, () =>
+        Effect.gen(function* () {
+          yield* TaskQueue.offer(child, { userId: "c1", amount: 2 });
+          during = {
+            child: yield* engine.getTask(child.name, "c1"),
+            parent: yield* engine.getTask(parent.name, "p1"),
+          };
+          return "ok";
+        }).pipe(Effect.orDie),
+      );
+
+      expect(during?.child?.refCount).toBe(1);
+      expect(during?.child?.createdBy).toEqual({
+        prefix: "~effectmq:tq-ctx-parent",
+        id: "p1",
+      });
+      expect(during?.parent?.refs).toEqual([
+        { prefix: "~effectmq:tq-ctx-child", id: "c1" },
+      ]);
+
+      // the parent's death (delete policy) released the child: it is
+      // unpinned, still queued, and dies normally once completed
+      const released = yield* engine.getTask(child.name, "c1");
+      expect(released?.refCount).toBe(0);
+      expect((yield* getLists(child.name)).wait).toContain("c1");
+
+      yield* TaskQueue.complete(child, () => Effect.succeed("ok"));
+      expect(yield* engine.getTask(child.name, "c1")).toBeNull();
+    }).pipe(TestRuntime.runPromise));
+
+  test("detached: true skips pinning but keeps createdBy attribution", () =>
+    Effect.gen(function* () {
+      const engine = yield* TaskEngine.TaskEngine;
+      const parent = makeQueue("tq-ctx-det-parent");
+      const child = makeQueue("tq-ctx-det-child");
+      yield* TaskQueue.offer(parent, { userId: "p1", amount: 1 });
+
+      let during:
+        | { child: EngineTask | null; parent: EngineTask | null }
+        | undefined;
+      yield* TaskQueue.complete(parent, () =>
+        Effect.gen(function* () {
+          yield* TaskQueue.offer(
+            child,
+            { userId: "c1", amount: 2 },
+            { detached: true },
+          );
+          during = {
+            child: yield* engine.getTask(child.name, "c1"),
+            parent: yield* engine.getTask(parent.name, "p1"),
+          };
+          return "ok";
+        }).pipe(Effect.orDie),
+      );
+
+      expect(during?.child?.refCount).toBe(0);
+      expect(during?.child?.createdBy).toEqual({
+        prefix: "~effectmq:tq-ctx-det-parent",
+        id: "p1",
+      });
+      expect(during?.parent?.refs).toEqual([]);
+    }).pipe(TestRuntime.runPromise));
+
+  test("offering outside a handler records no holder or creator", () =>
+    Effect.gen(function* () {
+      const engine = yield* TaskEngine.TaskEngine;
+      const queue = makeQueue("tq-ctx-none");
+      yield* TaskQueue.offer(queue, { userId: "u1", amount: 1 });
+
+      const task = yield* engine.getTask(queue.name, "u1");
+      expect(task?.refCount).toBe(0);
+      expect(task?.createdBy).toBeUndefined();
     }).pipe(TestRuntime.runPromise));
 });

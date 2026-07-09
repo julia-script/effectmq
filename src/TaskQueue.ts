@@ -14,6 +14,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import { type CompletionPolicy, decodeTask } from "./Schemas.js";
 import type * as Task from "./Task.js";
+import * as TaskContext from "./TaskContext.js";
 import * as TaskEngine from "./TaskEngine.js";
 import { nextRunAt } from "./utils.js";
 
@@ -97,11 +98,22 @@ export interface TaskOptions {
   maxRetries?: number;
   onSuccessPolicy?: CompletionPolicy;
   onFailurePolicy?: CompletionPolicy;
+  /**
+   * When offering from inside a handler, skip pinning the new task to the
+   * running task (it is still attributed via `createdBy`). No effect outside
+   * a handler.
+   */
+  detached?: boolean;
 }
 /**
  * Enqueue `payload` onto the queue. The payload is encoded via the task's
  * payload schema and the task id is derived from the definition's
  * idempotency key. Honors `delay` and the success/failure policy options.
+ *
+ * When called from inside a {@link complete} handler, the new task records the
+ * running task as its creator (`createdBy`) and — unless `detached` is set —
+ * is pinned by it (`heldBy`), deferring its completion policy until the outer
+ * task dies.
  */
 export const offer = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
@@ -120,8 +132,11 @@ export const offer = Effect.fnUntraced(function* <
   const encodePayload = Schema.encodeEffect(queue.task.payloadSchema);
   const id = queue.task.idempotencyKey(payload);
   const engine = yield* TaskEngine.TaskEngine;
+  const parentTask = yield* TaskContext.parentTask;
 
   const task = yield* engine.createTask({
+    heldBy: parentTask && !options?.detached ? [parentTask] : [],
+    createdBy: parentTask,
     prefix: queue.name,
     id,
     name: queue.task.name,
@@ -148,7 +163,7 @@ export const extendLock = Effect.fnUntraced(function* <
 ) {
   const engine = yield* TaskEngine.TaskEngine;
 
-  yield* Effect.log(
+  yield* Effect.logDebug(
     `extending lock for task ${task.id} with timeout ${lockTimeout}`,
   );
   return yield* engine.extendLock(
@@ -292,7 +307,12 @@ export const complete: {
         .pipe(Effect.repeat(policy))
         .pipe(Effect.forkChild);
 
-      const result = yield* handler(task).pipe(Effect.result);
+      const result = yield* handler(task).pipe(
+        Effect.provide(
+          TaskContext.layer({ parentTask: { prefix: self.name, id: task.id } }),
+        ),
+        Effect.result,
+      );
       yield* Fiber.interrupt(heartBeat);
       if (Result.isSuccess(result)) {
         yield* succeed(self, task, result.success);

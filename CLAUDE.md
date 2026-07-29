@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`@effectmq/core` — a Redis-backed task queue built on **Effect 4 beta** (pinned to `effect@4.0.0-beta.85`; it does not work with stable Effect 3.x). Typed payloads/results/errors via schemas, with retries, delays, idempotency, and cron schedules. Single package, pnpm, ESM (`"type": "module"`, `nodenext` resolution — internal imports use `.js` extensions).
+`@effectmq/core` — a Redis-backed task queue built on **Effect 4 beta** (pinned to `effect@4.0.0-beta.102`; it does not work with stable Effect 3.x). Typed payloads/results/errors via schemas, with retries, delays, idempotency, and cron schedules. Single package, pnpm, ESM (`"type": "module"`, `nodenext` resolution — internal imports use `.js` extensions).
 
 ## Commands
 
@@ -50,7 +50,7 @@ The library deliberately has **no built-in concurrency/rate limiting** — one `
 
 - **Effect 4 beta idioms**: `Context.Service` classes for services, `Schema.TaggedErrorClass` for errors, `Effect.fnUntraced` for functions, `Data.TaggedError` for engine errors, imports from `effect/unstable/*` where needed (e.g. `effect/unstable/persistence/Redis`). Match these when adding code.
 - Type IDs are string constants like `"~effectmq/TaskEngine"`; built-in error tags use the `~effectmq/Error/...` namespace.
-- `effect` is a **peerDependency** (`>=4.0.0-beta.85`) and devDependency, never a hard dependency. The only runtime dependency is `redis`.
+- `effect` is a **peerDependency** (`>=4.0.0-beta.102`) and devDependency, never a hard dependency. The only runtime dependency is `redis`.
 - Public API (everything re-exported from `src/index.ts` as namespace exports) carries TSDoc, including `@module` headers per file. Keep new exports documented.
 - Formatting/linting is Biome (2-space indent); config in `biome.json`.
 

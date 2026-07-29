@@ -3,7 +3,7 @@
 It's a task queue built on [Effect](https://effect.website): typed payloads, typed results, typed errors, all the way down. You describe a unit of work as a schema, hand it to a queue, and process it with a handler that is just an `Effect`. Retries, delays, idempotency, cron schedules: handled. The available engine is backed by Redis, but, like many things in Effect, it can be swapped for a different implementation.
 
 ```bash
-pnpm add @effectmq/core effect@4.0.0-beta.85 @effect/platform-node@4.0.0-beta.85
+pnpm add @effectmq/core effect@4.0.0-beta.102 @effect/platform-node@4.0.0-beta.102
 ```
 
 This library is built on the Effect 4 beta and doesn't work with the current stable Effect release. The examples below use the bundled `NodeRedisPool` layer, a connection-pooled Redis client that ships with the package (`@effect/platform-node` is only needed for `NodeRuntime`). This is beta-era software riding beta-era Effect; pin accordingly.

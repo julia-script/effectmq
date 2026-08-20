@@ -27,6 +27,10 @@
       "types": "./dist/NodeRedisPool.d.ts",
       "default": "./dist/NodeRedisPool.js"
     },
+    "./Observability": {
+      "types": "./dist/Observability.d.ts",
+      "default": "./dist/Observability.js"
+    },
     "./RedisPool": {
       "types": "./dist/RedisPool.d.ts",
       "default": "./dist/RedisPool.js"
@@ -47,9 +51,17 @@
       "types": "./dist/TaskEngine.d.ts",
       "default": "./dist/TaskEngine.js"
     },
+    "./TaskEvent": {
+      "types": "./dist/TaskEvent.d.ts",
+      "default": "./dist/TaskEvent.js"
+    },
     "./TaskQueue": {
       "types": "./dist/TaskQueue.d.ts",
       "default": "./dist/TaskQueue.js"
+    },
+    "./TaskRecord": {
+      "types": "./dist/TaskRecord.d.ts",
+      "default": "./dist/TaskRecord.js"
     },
     "./Worker": {
       "types": "./dist/Worker.d.ts",
@@ -68,15 +80,19 @@
     "build": "pnpm clean && pnpm gen:lua && tsc -p tsconfig.json",
     "clean": "rm -rf dist",
     "test": "pnpm gen:lua && vitest run",
+    "test:lifecycle": "vitest run src/testing/redisLayer.test.ts --reporter=default --reporter=hanging-process",
     "test:fault": "EFFECTMQ_TEST_REDIS=local EFFECTMQ_TEST_SENTINEL=local vitest run src/testing/FaultInjection.test.ts src/RedisRestart.test.ts src/RedisSentinel.test.ts",
     "test:watch": "pnpm gen:lua && vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "pnpm typecheck:src && pnpm typecheck:test",
+    "typecheck:src": "tsc --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "format:check": "biome format .",
     "lint": "biome lint .",
     "check:lua": "tsx scripts/check-lua.ts",
     "check:docs": "tsx scripts/check-docs.ts",
     "check:release": "tsx scripts/check-release.ts",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm check:lua && pnpm check:docs && pnpm check:release",
+    "check:architecture": "tsx scripts/check-architecture.ts",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm check:architecture && pnpm check:lua && pnpm check:docs && pnpm check:release",
     "lint:fix": "pnpm biome check --write --unsafe",
     "changeset": "changeset",
     "version:packages": "changeset version",
@@ -97,7 +113,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.1",
     "@changesets/cli": "^2.31.0",
-    "@effect/platform-node": "4.0.0-beta.107",
+    "@effect/vitest": "4.0.0-beta.107",
     "@testcontainers/redis": "^12.0.3",
     "@types/node": "^22.0.0",
     "effect": "4.0.0-beta.107",
@@ -108,6 +124,7 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
+    "@effect/platform-node": "4.0.0-beta.107",
     "msgpackr": "^2.0.4",
     "redis": "^6.1.0"
   }

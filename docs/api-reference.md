@@ -6,7 +6,7 @@ page describes the intended entry points and their contracts.
 
 ## `Task`
 
-- `Task.make(config)` defines payload, success, and typed-failure schemas,
+- `Task.make(config)` effectfully validates and defines payload, success, and typed-failure schemas,
   stable `schemaId`, idempotency key, retry schedule/cap, storage limits, and
   retention.
 - `defaultRetentionPolicy` is 7 days for task records and terminal indexes,
@@ -39,7 +39,7 @@ duration, heartbeat interval, and bounded heartbeat transport retry.
 
 ## `Scheduler`
 
-- `make(config)` creates a long-running durable materializer Effect.
+- `make(config)` validates configuration in a typed error channel and creates a long-running durable materializer Effect.
 - `materializeDue(config, now?)` performs one deterministic bounded observation,
   useful for tests and externally driven scheduler loops.
 - Missed policy is `skip`, `coalesce`, or bounded `backfill`.
@@ -64,6 +64,20 @@ coordination, ordinary removal, and administrative force removal. Prefer
 `TaskQueue`, `Worker`, and `Scheduler` unless building tooling or an alternate
 runtime.
 
+- `TaskEngine.layer(config?)` is the zero-requirement Node live graph and retains
+  Redis operational services in its output.
+- `TaskEngine.layerNoDeps(config?)` requires an ambient `RedisPool` for custom
+  client compositions.
+- Invalid configuration and Redis reply shapes use structured typed errors;
+  diagnostic strings are retained only as causes.
+
+## `TaskRecord` and `TaskEvent`
+
+`TaskRecord` owns public durable task identity/state schemas and typed record
+codecs. `TaskEvent` owns public versioned lifecycle event schemas. MessagePack,
+raw engine-record, and retry-schedule modules are internal and unsupported as
+package subpaths.
+
 ## `StorageProtocol` and `Observability`
 
 `StorageProtocol` owns the versioned opaque-value codec and typed corruption,
@@ -71,5 +85,6 @@ version, schema, value, size, and count errors. `Observability` exports Effect
 metrics for depth/age/backlogs, Redis errors/reconnects/script reloads,
 ownership loss, and retention failure.
 
-Stable subpaths are `./NodeRedisPool`, `./RedisPool`, `./Scheduler`,
-`./StorageProtocol`, `./Task`, `./TaskEngine`, `./TaskQueue`, and `./Worker`.
+Stable subpaths are `./NodeRedisPool`, `./Observability`, `./RedisPool`,
+`./Scheduler`, `./StorageProtocol`, `./Task`, `./TaskEngine`, `./TaskEvent`,
+`./TaskQueue`, `./TaskRecord`, and `./Worker`.

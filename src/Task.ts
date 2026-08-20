@@ -4,10 +4,14 @@
  *
  * @module
  */
-import { type Effect, Schedule, Schema } from "effect";
+import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
+import * as Effect from "effect/Effect";
+import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
+import { buildFromOptions } from "./RetrySchedule.js";
 import { defaultStorageLimits, type StorageLimits } from "./StorageProtocol.js";
-import { buildFromOptions } from "./utils.js";
 
 const TypeId = "~effectmq/Task" as const;
 
@@ -50,28 +54,42 @@ export const defaultRetentionPolicy: RetentionPolicy = {
 
 const resolveRetention = (
   retention: Partial<RetentionPolicy> | undefined,
-): RetentionPolicy => {
-  const resolved = { ...defaultRetentionPolicy, ...retention };
-  for (const [name, value] of Object.entries(resolved)) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new RangeError(`${name} must be a non-negative safe integer`);
-    }
-  }
-  return resolved;
-};
+): RetentionPolicy => ({ ...defaultRetentionPolicy, ...retention });
 
 const resolveStorageLimits = (
   limits: Partial<StorageLimits> | undefined,
-): StorageLimits => {
-  const resolved = { ...defaultStorageLimits, ...limits };
-  for (const [name, value] of Object.entries(resolved)) {
-    const minimum = name === "maxEventEntries" ? 1 : 0;
-    if (!Number.isSafeInteger(value) || value < minimum) {
-      throw new RangeError(`${name} must be a non-negative safe integer`);
+): StorageLimits => ({ ...defaultStorageLimits, ...limits });
+
+/** Predictable validation failure for a task definition. */
+export class TaskConfigurationError extends Data.TaggedError(
+  "TaskConfigurationError",
+)<{
+  readonly field: string;
+  readonly constraint: string;
+  readonly actual: unknown;
+}> {}
+
+/** Failure while deriving a task identity from a callback or Crypto service. */
+export class TaskIdentityGenerationError extends Data.TaggedError(
+  "TaskIdentityGenerationError",
+)<{ readonly taskName: string; readonly cause: unknown }> {}
+
+const validateIntegerFields = (
+  values: object,
+  minimumFor: (field: string) => number,
+): Effect.Effect<void, TaskConfigurationError> =>
+  Effect.gen(function* () {
+    for (const [field, actual] of Object.entries(values)) {
+      const minimum = minimumFor(field);
+      if (!Number.isSafeInteger(actual) || actual < minimum) {
+        return yield* new TaskConfigurationError({
+          field,
+          constraint: `a safe integer greater than or equal to ${minimum}`,
+          actual,
+        });
+      }
     }
-  }
-  return resolved;
-};
+  });
 
 /**
  * A decoded task generation as seen by a handler.
@@ -82,7 +100,7 @@ const resolveStorageLimits = (
  * @category Models
  * @since 0.1.0
  */
-export type { Task } from "./Schemas.js";
+export type { Task } from "./TaskRecord.js";
 
 /**
  * The schema-bearing definition of one task family.
@@ -99,6 +117,7 @@ export interface TaskDefinition<
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
   R = never,
+  IdentityR = Crypto.Crypto,
 > {
   readonly [TypeId]: typeof TypeId;
 
@@ -118,7 +137,9 @@ export interface TaskDefinition<
   readonly storageLimits: StorageLimits;
   readonly retention: RetentionPolicy;
 
-  readonly idempotencyKey: (payload: Payload["Type"]) => string;
+  readonly idempotencyKey: (
+    payload: Payload["Type"],
+  ) => Effect.Effect<string, TaskIdentityGenerationError, IdentityR>;
 }
 /**
  * Resolves either a struct schema or bare struct fields to a struct schema.
@@ -130,6 +151,8 @@ export type ResolvePayload<T extends AnyStructSchema | Schema.Struct.Fields> =
   T extends AnyStructSchema
     ? T
     : Schema.Struct<T extends Schema.Struct.Fields ? T : never>;
+
+export type IdempotencyKey<Payload> = (payload: Payload) => string;
 
 /**
  * Normalizes a task payload declaration to a struct schema.
@@ -155,6 +178,7 @@ const makeInternal = <
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
   R = never,
+  IdentityR = Crypto.Crypto,
 >(config: {
   name: string;
   schemaId?: string;
@@ -164,34 +188,63 @@ const makeInternal = <
   maxRetries?: number | null;
   storageLimits?: Partial<StorageLimits>;
   retention?: Partial<RetentionPolicy>;
-  idempotencyKey?: (payload: ResolvePayload<Payload>["Type"]) => string;
+  idempotencyKey: (
+    payload: ResolvePayload<Payload>["Type"],
+  ) => Effect.Effect<string, TaskIdentityGenerationError, IdentityR>;
   retrySchedule?: Schedule.Schedule<any, NoInfer<Error["Type"]>, any, R>;
-}): TaskDefinition<ResolvePayload<Payload>, Success, Error, R> => {
-  const payloadSchema = resolvePayloadSchema(config.payload);
-  const successSchema = (config.success ?? Schema.Void) as Success;
-  const errorSchema = (config.error ?? Schema.Never) as Error;
+}): Effect.Effect<
+  TaskDefinition<ResolvePayload<Payload>, Success, Error, R, IdentityR>,
+  TaskConfigurationError
+> =>
+  Effect.gen(function* () {
+    const payloadSchema = resolvePayloadSchema(config.payload);
+    const successSchema = (config.success ?? Schema.Void) as Success;
+    const errorSchema = (config.error ?? Schema.Never) as Error;
 
-  const self: TaskDefinition<ResolvePayload<Payload>, Success, Error, R> = {
-    [TypeId]: TypeId,
-    name: config.name,
-    schemaId: config.schemaId ?? config.name,
-    payloadSchema: payloadSchema,
-    successSchema: successSchema,
-    errorSchema: errorSchema,
-    retrySchedule: config.retrySchedule,
-    // unset → default cap of 5; null → unbounded; a number → that number
-    maxRetries:
+    const maxRetries =
       config.maxRetries === undefined
         ? DEFAULT_MAX_RETRIES
-        : (config.maxRetries ?? Infinity),
-    storageLimits: resolveStorageLimits(config.storageLimits),
-    retention: resolveRetention(config.retention),
-    idempotencyKey:
-      config.idempotencyKey ?? (() => `${config.name}/${crypto.randomUUID()}`),
-  };
+        : (config.maxRetries ?? Infinity);
+    if (
+      maxRetries !== Infinity &&
+      (!Number.isSafeInteger(maxRetries) || maxRetries < 0)
+    ) {
+      return yield* new TaskConfigurationError({
+        field: "maxRetries",
+        constraint: "a non-negative safe integer or null",
+        actual: config.maxRetries,
+      });
+    }
+    const storageLimits = resolveStorageLimits(config.storageLimits);
+    yield* validateIntegerFields(storageLimits, (field) =>
+      field === "maxEventEntries" ? 1 : 0,
+    );
+    const retention = resolveRetention(config.retention);
+    yield* validateIntegerFields(retention, () => 0);
 
-  return self;
-};
+    const self: TaskDefinition<
+      ResolvePayload<Payload>,
+      Success,
+      Error,
+      R,
+      IdentityR
+    > = {
+      [TypeId]: TypeId,
+      name: config.name,
+      schemaId: config.schemaId ?? config.name,
+      payloadSchema: payloadSchema,
+      successSchema: successSchema,
+      errorSchema: errorSchema,
+      retrySchedule: config.retrySchedule,
+      // unset → default cap of 5; null → unbounded; a number → that number
+      maxRetries,
+      storageLimits,
+      retention,
+      idempotencyKey: config.idempotencyKey,
+    };
+
+    return self;
+  });
 
 /**
  * Defines a typed task family.
@@ -211,17 +264,19 @@ const makeInternal = <
  * **Example: Define an idempotent task with bounded retries**
  *
  * ```ts
- * import { Schema } from "effect"
+ * import { Effect, Schema } from "effect"
  * import { Task } from "@effectmq/core"
  *
- * const sendInvoice = Task.make({
- *   name: "send-invoice",
- *   schemaId: "send-invoice/v1",
- *   payload: { invoiceId: Schema.String },
- *   success: Schema.Void,
- *   error: Schema.Struct({ reason: Schema.String }),
- *   idempotencyKey: ({ invoiceId }) => invoiceId,
- *   maxRetries: 3
+ * const sendInvoice = Effect.gen(function* () {
+ *   return yield* Task.make({
+ *     name: "send-invoice",
+ *     schemaId: "send-invoice/v1",
+ *     payload: { invoiceId: Schema.String },
+ *     success: Schema.Void,
+ *     error: Schema.Struct({ reason: Schema.String }),
+ *     idempotencyKey: ({ invoiceId }) => invoiceId,
+ *     maxRetries: 3
+ *   })
  * })
  * ```
  *
@@ -245,7 +300,7 @@ export const make: {
     maxRetries?: number | null;
     storageLimits?: Partial<StorageLimits>;
     retention?: Partial<RetentionPolicy>;
-    idempotencyKey?: (payload: ResolvePayload<Payload>["Type"]) => string;
+    idempotencyKey: IdempotencyKey<ResolvePayload<Payload>["Type"]>;
     retry?: {
       while?:
         | ((
@@ -262,7 +317,60 @@ export const make: {
         | Schedule.Schedule<unknown, NoInfer<Error["Type"]>, unknown, R3>
         | undefined;
     };
-  }): TaskDefinition<ResolvePayload<Payload>, Success, Error, R1 | R2 | R3>;
+  }): Effect.Effect<
+    TaskDefinition<
+      ResolvePayload<Payload>,
+      Success,
+      Error,
+      R1 | R2 | R3,
+      never
+    >,
+    TaskConfigurationError
+  >;
+
+  <
+    Payload extends AnyStructSchema | Schema.Struct.Fields,
+    Success extends Schema.Top = Schema.Void,
+    Error extends Schema.Top = Schema.Never,
+    R1 = never,
+    R2 = never,
+    R3 = never,
+  >(config: {
+    name: string;
+    schemaId?: string;
+    success: Success;
+    error: Error;
+    payload: Payload;
+    maxRetries?: number | null;
+    storageLimits?: Partial<StorageLimits>;
+    retention?: Partial<RetentionPolicy>;
+    idempotencyKey?: undefined;
+    retry?: {
+      while?:
+        | ((
+            error: NoInfer<Error["Type"]>,
+          ) => boolean | Effect.Effect<boolean, NoInfer<Error["Type"]>, R1>)
+        | undefined;
+      until?:
+        | ((
+            error: NoInfer<Error["Type"]>,
+          ) => boolean | Effect.Effect<boolean, NoInfer<Error["Type"]>, R2>)
+        | undefined;
+      times?: number | undefined;
+      schedule?:
+        | Schedule.Schedule<unknown, NoInfer<Error["Type"]>, unknown, R3>
+        | undefined;
+    };
+  }): Effect.Effect<
+    TaskDefinition<
+      ResolvePayload<Payload>,
+      Success,
+      Error,
+      R1 | R2 | R3,
+      Crypto.Crypto
+    >,
+    TaskConfigurationError
+  >;
 
   <
     Payload extends AnyStructSchema | Schema.Struct.Fields,
@@ -278,14 +386,43 @@ export const make: {
     maxRetries?: number | null;
     storageLimits?: Partial<StorageLimits>;
     retention?: Partial<RetentionPolicy>;
-    idempotencyKey?: (payload: ResolvePayload<Payload>["Type"]) => string;
+    idempotencyKey: IdempotencyKey<ResolvePayload<Payload>["Type"]>;
     retry: Schedule.Schedule<
       any,
       NoInfer<Error["Type"]>,
       NoInfer<Error["Type"]>,
       Env
     >;
-  }): TaskDefinition<ResolvePayload<Payload>, Success, Error, Env>;
+  }): Effect.Effect<
+    TaskDefinition<ResolvePayload<Payload>, Success, Error, Env, never>,
+    TaskConfigurationError
+  >;
+
+  <
+    Payload extends AnyStructSchema | Schema.Struct.Fields,
+    Success extends Schema.Top = Schema.Void,
+    Error extends Schema.Top = Schema.Never,
+    Env = never,
+  >(config: {
+    name: string;
+    schemaId?: string;
+    payload: Payload;
+    success: Success;
+    error: Error;
+    maxRetries?: number | null;
+    storageLimits?: Partial<StorageLimits>;
+    retention?: Partial<RetentionPolicy>;
+    idempotencyKey?: undefined;
+    retry: Schedule.Schedule<
+      any,
+      NoInfer<Error["Type"]>,
+      NoInfer<Error["Type"]>,
+      Env
+    >;
+  }): Effect.Effect<
+    TaskDefinition<ResolvePayload<Payload>, Success, Error, Env, Crypto.Crypto>,
+    TaskConfigurationError
+  >;
 } = (({
   name,
   schemaId,
@@ -318,6 +455,24 @@ export const make: {
       ? retry
       : buildFromOptions(retry)
     : undefined;
+  const identity = idempotencyKey
+    ? (payload: unknown) =>
+        Effect.try({
+          try: () => idempotencyKey(payload),
+          catch: (cause) =>
+            new TaskIdentityGenerationError({ taskName: name, cause }),
+        })
+    : () =>
+        Effect.gen(function* () {
+          const crypto = yield* Crypto.Crypto;
+          return yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              (cause) =>
+                new TaskIdentityGenerationError({ taskName: name, cause }),
+            ),
+            Effect.map((uuid) => `${name}/${uuid}`),
+          );
+        });
   return makeInternal({
     name,
     schemaId,
@@ -327,7 +482,7 @@ export const make: {
     maxRetries,
     storageLimits,
     retention,
-    idempotencyKey,
+    idempotencyKey: identity,
     retrySchedule: schedule,
   });
 }) as never;

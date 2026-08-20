@@ -1,5 +1,6 @@
 /** Versioned storage envelopes for opaque user values. @module */
-import { Data, Effect } from "effect";
+import * as Data from "effect/Data";
+import * as Effect from "effect/Effect";
 import { Packr } from "msgpackr";
 
 /**
@@ -121,6 +122,24 @@ export class CorruptStorageValue extends Data.TaggedError(
   "CorruptStorageValue",
 )<{ readonly message: string; readonly cause?: unknown }> {}
 
+/** A supported value could not be serialized for durable storage. */
+export class StorageEncodingError extends Data.TaggedError(
+  "StorageEncodingError",
+)<{
+  readonly stage: "messagepack" | "base64";
+  readonly path: string;
+  readonly cause: unknown;
+}> {}
+
+/** External bytes could not be converted or deserialized safely. */
+export class StorageDecodingError extends Data.TaggedError(
+  "StorageDecodingError",
+)<{
+  readonly stage: "bytes" | "base64" | "messagepack";
+  readonly path: string;
+  readonly cause: unknown;
+}> {}
+
 /**
  * Indicates that an envelope uses a protocol version this release cannot read.
  *
@@ -152,6 +171,8 @@ export type StorageProtocolError =
   | StorageLimitExceeded
   | StorageCountLimitExceeded
   | CorruptStorageValue
+  | StorageEncodingError
+  | StorageDecodingError
   | UnsupportedProtocolVersion
   | SchemaIdentityMismatch;
 
@@ -257,11 +278,30 @@ export const encodeValue = (
   kind: ValueKind,
   value: unknown,
   limits: Partial<StorageLimits> = defaultStorageLimits,
-): Effect.Effect<string, UnsupportedStorageValue | StorageLimitExceeded> =>
+): Effect.Effect<
+  string,
+  UnsupportedStorageValue | StorageLimitExceeded | StorageEncodingError
+> =>
   Effect.gen(function* () {
-    const unsupported = validate(value, "$", new Set());
+    const unsupported = yield* Effect.try({
+      try: () => validate(value, "$", new Set()),
+      catch: (cause) =>
+        new StorageEncodingError({
+          stage: "messagepack",
+          path: "$",
+          cause,
+        }),
+    });
     if (unsupported) return yield* unsupported;
-    const bytes = packr.pack([protocolVersion, schemaId, kind, value]);
+    const bytes = yield* Effect.try({
+      try: () => packr.pack([protocolVersion, schemaId, kind, value]),
+      catch: (cause) =>
+        new StorageEncodingError({
+          stage: "messagepack",
+          path: "$",
+          cause,
+        }),
+    });
     const maxValueBytes =
       limits.maxValueBytes ?? defaultStorageLimits.maxValueBytes;
     if (bytes.byteLength > maxValueBytes) {
@@ -289,7 +329,10 @@ export const decodeValue = (
   expectedKind: ValueKind,
 ): Effect.Effect<
   unknown,
-  CorruptStorageValue | UnsupportedProtocolVersion | SchemaIdentityMismatch
+  | CorruptStorageValue
+  | StorageDecodingError
+  | UnsupportedProtocolVersion
+  | SchemaIdentityMismatch
 > =>
   Effect.gen(function* () {
     if (typeof encoded !== "string" || !encoded.startsWith(prefix)) {
@@ -297,12 +340,27 @@ export const decodeValue = (
         message: "Stored value is not an effectmq v1 envelope",
       });
     }
+    const base64 = encoded.slice(prefix.length);
+    if (
+      base64.length === 0 ||
+      base64.length % 4 !== 0 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+        base64,
+      )
+    ) {
+      return yield* new StorageDecodingError({
+        stage: "base64",
+        path: "$",
+        cause: new TypeError("Storage envelope contains invalid base64"),
+      });
+    }
+    const bytes = Buffer.from(base64, "base64");
     const envelope = yield* Effect.try({
-      try: () =>
-        packr.unpack(Buffer.from(encoded.slice(prefix.length), "base64")),
+      try: () => packr.unpack(bytes),
       catch: (cause) =>
-        new CorruptStorageValue({
-          message: "Invalid MessagePack envelope",
+        new StorageDecodingError({
+          stage: "messagepack",
+          path: "$",
           cause,
         }),
     });

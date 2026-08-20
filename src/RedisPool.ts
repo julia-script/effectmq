@@ -5,7 +5,10 @@
  *
  * @module
  */
-import { Context, Effect, Metric, Ref } from "effect";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Metric from "effect/Metric";
+import * as Ref from "effect/Ref";
 import type * as Redis from "effect/unstable/persistence/Redis";
 import * as Observability from "./Observability.js";
 
@@ -81,7 +84,7 @@ export interface RedisPoolService {
  * @since 0.2.0
  */
 export class RedisPool extends Context.Service<RedisPool, RedisPoolService>()(
-  "effectmq/RedisPool",
+  "@effectmq/core/RedisPool",
 ) {}
 
 /**
@@ -108,7 +111,7 @@ export interface RedisConnectionRolesService {
 export class RedisConnectionRoles extends Context.Service<
   RedisConnectionRoles,
   RedisConnectionRolesService
->()("effectmq/RedisConnectionRoles") {}
+>()("@effectmq/core/RedisConnectionRoles") {}
 
 /**
  * Creates role routing from three independently managed Redis services.

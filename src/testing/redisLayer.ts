@@ -1,47 +1,160 @@
-import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { type ChildProcess, spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RedisContainer } from "@testcontainers/redis";
-import { Context, Effect, Layer, ManagedRuntime, Schedule } from "effect";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as Context from "effect/Context";
+import * as Data from "effect/Data";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schedule from "effect/Schedule";
 import * as Redis from "effect/unstable/persistence/Redis";
 import { Redis as IORedis } from "ioredis";
 import { RedisPool, TaskEngine } from "../index.js";
 
-const redisContainer = (image: string) => {
-  const ef = Effect.tryPromise({
-    try: () => new RedisContainer(image).start(),
-    catch: (cause) => new Redis.RedisError({ cause }),
-  });
+export type TestInfrastructureOperation =
+  | "container-start"
+  | "container-stop"
+  | "client-create"
+  | "client-disconnect"
+  | "directory-create"
+  | "directory-remove"
+  | "redis-server-start"
+  | "redis-server-stop"
+  | "redis-ready"
+  | "sentinel-setup"
+  | "sentinel-teardown";
 
-  return Effect.acquireRelease(ef, (container) =>
-    Effect.promise(() => container.stop()),
-  );
+export class TestInfrastructureError extends Data.TaggedError(
+  "TestInfrastructureError",
+)<{
+  readonly operation: TestInfrastructureOperation;
+  readonly cause: unknown;
+}> {}
+
+export type TestRedisAddressValue =
+  | { readonly url: string }
+  | { readonly socket: { readonly path: string; readonly tls: false } };
+
+export class TestRedisAddress extends Context.Service<
+  TestRedisAddress,
+  TestRedisAddressValue
+>()("effectmq/testing/TestRedisAddress") {}
+
+export interface TestResourceRegistry {
+  readonly active: Set<string>;
+  nextId: number;
+}
+
+export const makeTestResourceRegistry = (): TestResourceRegistry => ({
+  active: new Set(),
+  nextId: 0,
+});
+
+export const acquireTracked = <A, E, R, E2, R2>(
+  registry: TestResourceRegistry,
+  label: string,
+  acquire: Effect.Effect<A, E, R>,
+  release: (resource: A) => Effect.Effect<unknown, E2, R2>,
+) => {
+  return Effect.acquireRelease(
+    acquire.pipe(
+      Effect.map((resource) => {
+        registry.nextId += 1;
+        const resourceId = `${label}#${registry.nextId}`;
+        registry.active.add(resourceId);
+        return { resource, resourceId } as const;
+      }),
+    ),
+    ({ resource, resourceId }) =>
+      release(resource).pipe(
+        Effect.orDie,
+        Effect.ensuring(
+          Effect.sync(() => {
+            registry.active.delete(resourceId);
+          }),
+        ),
+      ),
+  ).pipe(Effect.map(({ resource }) => resource));
 };
 
-const containerClient = (image: string) =>
-  Effect.gen(function* () {
-    const container = yield* redisContainer(image);
-    return yield* Effect.acquireRelease(
-      Effect.succeed(
-        new IORedis({
-          host: container.getHost(),
-          port: container.getMappedPort(6379),
-        }),
-      ),
-      (client) => Effect.succeed(client.disconnect()),
-    );
+const infrastructureError =
+  (operation: TestInfrastructureOperation) => (cause: unknown) =>
+    new TestInfrastructureError({ cause, operation });
+
+const stopChild = (child: ChildProcess) =>
+  Effect.tryPromise({
+    try: async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit");
+      child.kill("SIGTERM");
+      await exited;
+    },
+    catch: infrastructureError("redis-server-stop"),
   });
 
-// A `redis-server` child process on a per-worker unix socket, for environments
-// without Docker (opt in with EFFECTMQ_TEST_REDIS=local).
-const localServerClient = () =>
+const redisContainer = (registry: TestResourceRegistry, image: string) =>
+  acquireTracked(
+    registry,
+    "redis-container",
+    Effect.tryPromise({
+      try: () => new RedisContainer(image).start(),
+      catch: infrastructureError("container-start"),
+    }),
+    (container) =>
+      Effect.tryPromise({
+        try: () => container.stop(),
+        catch: infrastructureError("container-stop"),
+      }),
+  );
+
+const containerClient = (registry: TestResourceRegistry, image: string) =>
   Effect.gen(function* () {
-    const socket = join(
-      mkdtempSync(join(tmpdir(), "effectmq-redis-")),
-      "redis.sock",
+    const container = yield* redisContainer(registry, image);
+    const client = yield* acquireTracked(
+      registry,
+      "ioredis-client",
+      Effect.try({
+        try: () =>
+          new IORedis({
+            host: container.getHost(),
+            port: container.getMappedPort(6379),
+          }),
+        catch: infrastructureError("client-create"),
+      }),
+      (client) =>
+        Effect.try({
+          try: () => client.disconnect(),
+          catch: infrastructureError("client-disconnect"),
+        }),
     );
-    yield* Effect.acquireRelease(
+    return {
+      address: { url: container.getConnectionUrl() } as const,
+      client,
+    };
+  });
+
+const localServerClient = (registry: TestResourceRegistry) =>
+  Effect.gen(function* () {
+    const directory = yield* acquireTracked(
+      registry,
+      "redis-directory",
+      Effect.try({
+        try: () => mkdtempSync(join(tmpdir(), "effectmq-redis-")),
+        catch: infrastructureError("directory-create"),
+      }),
+      (path) =>
+        Effect.try({
+          try: () => rmSync(path, { force: true, recursive: true }),
+          catch: infrastructureError("directory-remove"),
+        }),
+    );
+    const socket = join(directory, "redis.sock");
+    yield* acquireTracked(
+      registry,
+      "redis-server",
       Effect.try({
         try: () =>
           spawn(
@@ -49,79 +162,104 @@ const localServerClient = () =>
             ["--port", "0", "--unixsocket", socket, "--save", ""],
             { stdio: "ignore" },
           ),
-        catch: (cause) => new Redis.RedisError({ cause }),
+        catch: infrastructureError("redis-server-start"),
       }),
-      (child) => Effect.sync(() => child.kill()),
+      stopChild,
     );
-    const client = yield* Effect.acquireRelease(
-      Effect.succeed(new IORedis({ path: socket, lazyConnect: true })),
-      (client) => Effect.succeed(client.disconnect()),
+    const client = yield* acquireTracked(
+      registry,
+      "ioredis-client",
+      Effect.try({
+        try: () => new IORedis({ path: socket, lazyConnect: true }),
+        catch: infrastructureError("client-create"),
+      }),
+      (client) =>
+        Effect.try({
+          try: () => client.disconnect(),
+          catch: infrastructureError("client-disconnect"),
+        }),
     );
-    // the server needs a moment to create the socket; retry until it answers
     yield* Effect.tryPromise({
       try: () => client.ping(),
-      catch: (cause) => new Redis.RedisError({ cause }),
+      catch: infrastructureError("redis-ready"),
     }).pipe(
       Effect.retry({ schedule: Schedule.spaced("100 millis"), times: 50 }),
     );
-    return client;
+    return {
+      address: { socket: { path: socket, tls: false } } as const,
+      client,
+    };
   });
 
 export const redisContainerLayer = ({
   image = "redis:7",
 }: {
-  image?: string;
+  readonly image?: string;
 } = {}) =>
-  Effect.gen(function* () {
-    const client =
-      process.env.EFFECTMQ_TEST_REDIS === "local"
-        ? yield* localServerClient()
-        : yield* containerClient(image);
+  Layer.effectContext(
+    Effect.gen(function* () {
+      const registry = makeTestResourceRegistry();
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (registry.active.size > 0) {
+            throw new Error(
+              `Leaked test resources: ${Array.from(registry.active).join(", ")}`,
+            );
+          }
+        }),
+      );
 
-    const toArg = (arg: string | Uint8Array) =>
-      typeof arg === "string" || Buffer.isBuffer(arg) ? arg : Buffer.from(arg);
+      const connection =
+        process.env.EFFECTMQ_TEST_REDIS === "local"
+          ? yield* localServerClient(registry)
+          : yield* containerClient(registry, image);
+      const { client } = connection;
 
-    const send = <A = unknown>(
-      command: string,
-      ...args: ReadonlyArray<string | Uint8Array>
-    ) =>
-      Effect.tryPromise({
-        try: () => client.call(command, ...args.map(toArg)) as Promise<A>,
-        catch: (cause) => new Redis.RedisError({ cause }),
-      });
+      const toArg = (arg: string | Uint8Array) =>
+        typeof arg === "string" || Buffer.isBuffer(arg)
+          ? arg
+          : Buffer.from(arg);
 
-    // callBuffer returns bulk strings as Buffers, keeping msgpack bytes intact
-    const sendBinary = <A = unknown>(
-      command: string,
-      ...args: ReadonlyArray<string | Uint8Array>
-    ) =>
-      Effect.tryPromise({
-        try: () => client.callBuffer(command, ...args.map(toArg)) as Promise<A>,
-        catch: (cause) => new Redis.RedisError({ cause }),
-      });
+      const send = <A = unknown>(
+        command: string,
+        ...args: ReadonlyArray<string | Uint8Array>
+      ) =>
+        Effect.tryPromise({
+          try: () => client.call(command, ...args.map(toArg)) as Promise<A>,
+          catch: (cause) => new Redis.RedisError({ cause }),
+        });
 
-    const redisPool = yield* RedisPool.make(send, sendBinary);
-    const roles = RedisPool.makeConnectionRoles(
-      redisPool,
-      redisPool,
-      redisPool,
-    );
-    const redis = yield* Redis.make({ send });
-    return Context.make(RedisPool.RedisPool, redisPool).pipe(
-      Context.add(RedisPool.RedisConnectionRoles, roles),
-      Context.add(Redis.Redis, redis),
-    );
-  }).pipe(Layer.effectContext);
-const taskEngineLayer = TaskEngine.layer({
-  debugMode: true,
-});
-// const
+      const sendBinary = <A = unknown>(
+        command: string,
+        ...args: ReadonlyArray<string | Uint8Array>
+      ) =>
+        Effect.tryPromise({
+          try: () =>
+            client.callBuffer(command, ...args.map(toArg)) as Promise<A>,
+          catch: (cause) => new Redis.RedisError({ cause }),
+        });
 
-const layers = taskEngineLayer.pipe(Layer.provideMerge(redisContainerLayer()));
-export const TestRuntime = ManagedRuntime.make(layers);
-// Warm the runtime (container start + layer build) at import time so the
-// first test in a file doesn't pay for it inside its own timeout budget.
-await TestRuntime.runPromise(Effect.void);
+      const redisPool = yield* RedisPool.make(send, sendBinary);
+      const roles = RedisPool.makeConnectionRoles(
+        redisPool,
+        redisPool,
+        redisPool,
+      );
+      const redis = yield* Redis.make({ send });
+      return Context.make(RedisPool.RedisPool, redisPool).pipe(
+        Context.add(RedisPool.RedisConnectionRoles, roles),
+        Context.add(Redis.Redis, redis),
+        Context.add(TestRedisAddress, connection.address),
+      );
+    }),
+  );
+
+const taskEngineLayer = TaskEngine.layerNoDeps({ debugMode: true });
+
+export const TestLayer = Layer.merge(
+  taskEngineLayer.pipe(Layer.provideMerge(redisContainerLayer())),
+  NodeCrypto.layer,
+);
 
 export const getLists = (prefix: string) =>
   Effect.gen(function* () {
@@ -141,36 +279,3 @@ export const getLists = (prefix: string) =>
       })).items,
     };
   });
-
-// // );
-// export const startRedis = async () => {
-//   const container = await new RedisContainer("redis:7").start();
-//   const client = new IORedis({
-//     host: container.getHost(),
-//     port: container.getMappedPort(6379),
-//   });
-
-//   const redisService = Redis.make({
-//     send: <A = unknown>(command: string, ...args: ReadonlyArray<string>) =>
-//       Effect.tryPromise({
-//         try: () => client.call(command, ...args) as Promise<A>,
-//         catch: (cause) => new Redis.RedisError({ cause }),
-//       }),
-//   });
-
-//   const layer = Layer.effect(Redis.Redis, redisService);
-
-//   const stop = async () => {
-//     client.disconnect();
-//     await container.stop();
-//   };
-
-//   return { container, client, layer, stop };
-// };
-
-// export type StartedRedis = {
-//   container: StartedRedisContainer;
-//   client: IORedis;
-//   layer: Layer.Layer<Redis.Redis>;
-//   stop: () => Promise<void>;
-// };

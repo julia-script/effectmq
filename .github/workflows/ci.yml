@@ -23,6 +23,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Format, lint, typecheck, Lua drift, docs
         run: pnpm check
+      - name: Effect test lifecycle gate
+        run: pnpm test:lifecycle
       - name: Build declarations and ESM
         run: pnpm build
       - name: Unit and Docker integration suite
@@ -42,6 +44,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Install Redis server and Sentinel binary
         run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Strictly compile test sources
+        run: pnpm typecheck:test
       - run: pnpm test:fault
 
   redis-compatibility:
@@ -65,7 +69,7 @@ jobs:
         env:
           EFFECTMQ_COMPAT_REDIS_IMAGE: redis:${{ matrix.redis }}-alpine
           EFFECTMQ_COMPAT_RESP: ${{ matrix.resp }}
-        run: pnpm exec vitest run src/RedisCompatibility.test.ts
+        run: pnpm typecheck:test && pnpm exec vitest run src/RedisCompatibility.test.ts
 
   packed-consumer:
     name: Packed ESM consumer / Node ${{ matrix.node }}

@@ -22,6 +22,10 @@ export * as NodeRedisPool from "./NodeRedisPool.js";
  * @since 0.3.0
  */
 export * as Observability from "./Observability.js";
+/** Public schemas and codecs for typed task records. */
+export * as TaskRecord from "./TaskRecord.js";
+/** Public schemas for queue lifecycle events. */
+export * as TaskEvent from "./TaskEvent.js";
 /**
  * Minimal Redis command, script-cache, and workload-role services.
  *

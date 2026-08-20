@@ -1,5 +1,5 @@
 /** Deterministic, occurrence-counted failures for production-boundary tests. */
-import { Data, Effect, Ref } from "effect";
+import { Context, Data, Effect, Layer, Ref } from "effect";
 
 export type FaultPoint =
   | "offer"
@@ -29,6 +29,11 @@ export interface FaultInjector {
   ) => Effect.Effect<A, E | InjectedFault, R>;
 }
 
+export class FaultInjection extends Context.Service<
+  FaultInjection,
+  FaultInjector
+>()("effectmq/testing/FaultInjection") {}
+
 /**
  * Fail on the configured hit number for each point. A value of `1` fails the
  * first hit, `2` the second, and an omitted point never fails.
@@ -53,3 +58,6 @@ export const make = (plan: Partial<Record<FaultPoint, number>> = {}) =>
       after: (point, effect) => effect.pipe(Effect.tap(() => hit(point))),
     } satisfies FaultInjector;
   });
+
+export const layer = (plan: Partial<Record<FaultPoint, number>> = {}) =>
+  Layer.effect(FaultInjection, make(plan));

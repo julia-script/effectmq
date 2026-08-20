@@ -148,6 +148,12 @@ counters, and timestamps only; it never includes URLs, ACL users, secrets, or
 raw connection errors. A degraded role should remove the instance from ready
 traffic while liveness remains healthy long enough for reconnect.
 
+Readiness converts only expected Redis command failures to `false`; defects and
+interruption remain observable. Each scoped client removes its event listeners
+before shutdown, awaits graceful close, and falls back to forced destroy when
+close rejects. If acquisition of a later workload role fails, already-acquired
+roles are released by the same scope.
+
 On deployment shutdown, first stop accepting new offers, then stop scheduler
 materialization, drain workers within a bounded grace period, and close the
 application Effect scope. If the grace period expires, interrupt the process;

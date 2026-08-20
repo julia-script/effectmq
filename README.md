@@ -17,20 +17,19 @@ Node.js 22.19 or newer is required; the release matrix verifies Node.js 22 and 2
 Define a task, enqueue work, process it. The whole loop:
 
 ```ts
-import { Effect, Layer, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { NodeRuntime } from "@effect/platform-node";
-import { NodeRedisPool, Task, TaskEngine, TaskQueue } from "@effectmq/core";
-
-const SendEmail = Task.make({
-  name: "send-email",
-  payload: { to: Schema.String, subject: Schema.String },
-  success: Schema.String,
-  error: Schema.Never,
-});
-
-const emails = TaskQueue.make("emails", SendEmail);
+import { Task, TaskEngine, TaskQueue } from "@effectmq/core";
 
 const program = Effect.gen(function* () {
+  const SendEmail = yield* Task.make({
+    name: "send-email",
+    payload: { to: Schema.String, subject: Schema.String },
+    success: Schema.String,
+    error: Schema.Never,
+  });
+  const emails = TaskQueue.make("emails", SendEmail);
+
   yield* TaskQueue.offer(emails, { to: "ada@example.com", subject: "Welcome" });
 
   yield* TaskQueue.complete(emails, (task) =>
@@ -39,7 +38,9 @@ const program = Effect.gen(function* () {
 });
 
 // The engine + its Redis layer: the only wiring you need to run the above.
-const AppLayer = Layer.provideMerge(TaskEngine.layer(), NodeRedisPool.layer());
+const AppLayer = TaskEngine.layer({
+  redis: { url: "redis://localhost:6379" },
+});
 
 program.pipe(Effect.provide(AppLayer), NodeRuntime.runMain);
 ```
@@ -50,19 +51,25 @@ That's the shape of it. The rest of this README explains the pieces (typed error
 
 ## The setup, once
 
-`TaskEngine.layer()` requires the `RedisPool` service. `NodeRedisPool` — bundled with the package, a connection pool backed by [node-redis](https://github.com/redis/node-redis) — provides it:
+`TaskEngine.layer()` is the complete Node live graph: it provides the engine,
+cryptographic identity generation, and the retained Redis pool, role, and
+health services:
 
 ```ts
-import { Layer } from "effect";
-import { NodeRedisPool, TaskEngine } from "@effectmq/core";
+import { TaskEngine } from "@effectmq/core";
 
-const AppLayer = Layer.provideMerge(
-  TaskEngine.layer(),
-  NodeRedisPool.layer({ url: "redis://localhost:6379" }),
-);
+const AppLayer = TaskEngine.layer({
+  redis: { url: "redis://localhost:6379" },
+});
 ```
 
-`NodeRedisPool.layer()` accepts node-redis client options and establishes separate producer, worker, and maintenance pools when the Layer starts. It supports standalone Redis and Sentinel; Redis Cluster fails startup because queue transitions use multi-key atomic scripts. See the [operations runbook](./docs/operations.md) for TLS, ACL, bounded-pool, persistence, failover, health, and shutdown guidance. Anything that provides the `RedisPool` service can still be used as a custom integration.
+Use `TaskEngine.layerNoDeps()` when composing a custom `RedisPool`
+implementation. `NodeRedisPool.layer()` remains available independently and
+accepts node-redis client options. It establishes separate producer, worker,
+and maintenance pools when the Layer starts. It supports standalone Redis and
+Sentinel; Redis Cluster fails startup because queue transitions use multi-key
+atomic scripts. See the [operations runbook](./docs/operations.md) for TLS,
+ACL, bounded-pool, persistence, failover, health, and shutdown guidance.
 
 The tested platform matrix is in the [support policy](./docs/support-policy.md), and reproducible throughput/tail-latency results are published as [performance evidence](./docs/performance.md).
 
@@ -77,7 +84,7 @@ A task is a *schema*, not a function. You declare what goes in (`payload`), what
 A tagged error makes failures pattern-matchable downstream, so reach for `Schema.TaggedErrorClass` rather than a bare struct.
 
 ```ts
-import { Schedule, Schema } from "effect";
+import { Effect, Schedule, Schema } from "effect";
 import { Task, TaskQueue } from "@effectmq/core";
 
 class EmailRejected extends Schema.TaggedErrorClass<EmailRejected>()(
@@ -85,18 +92,17 @@ class EmailRejected extends Schema.TaggedErrorClass<EmailRejected>()(
   { reason: Schema.String },
 ) {}
 
-const SendEmail = Task.make({
-  name: "send-email",
-  payload: { to: Schema.String, subject: Schema.String },
-  success: Schema.String, // e.g. a provider message id
-  error: EmailRejected,
-  // optional, but it's how you ensure the same job isn't enqueued twice
-  idempotencyKey: (p) => `email:${p.to}:${p.subject}`,
-  // retry with exponential backoff; maxRetries caps it (default 5)
-  retry: Schedule.exponential("1 second"),
+const queues = Effect.gen(function* () {
+  const SendEmail = yield* Task.make({
+    name: "send-email",
+    payload: { to: Schema.String, subject: Schema.String },
+    success: Schema.String,
+    error: EmailRejected,
+    idempotencyKey: (p) => `email:${p.to}:${p.subject}`,
+    retry: Schedule.exponential("1 second"),
+  });
+  return TaskQueue.make("emails", SendEmail);
 });
-
-const emails = TaskQueue.make("emails", SendEmail);
 ```
 
 ## Offer work, then do it
@@ -107,6 +113,7 @@ const emails = TaskQueue.make("emails", SendEmail);
 import { Effect } from "effect";
 
 const program = Effect.gen(function* () {
+  const emails = yield* queues;
   yield* TaskQueue.offer(emails, {
     to: "ada@example.com",
     subject: "Welcome",
@@ -238,23 +245,26 @@ retries, and **at-least-once** delivery semantics.
 import { Cron, Schema } from "effect";
 import { Scheduler, Task, TaskQueue, Worker } from "@effectmq/core";
 
-const reportTask = Task.make({
-  name: "nightly-report-task",
-  payload: { scheduledAt: Schema.String },
-  success: Schema.Void,
-  error: Schema.String,
+const scheduledReports = Effect.gen(function* () {
+  const reportTask = yield* Task.make({
+    name: "nightly-report-task",
+    payload: { scheduledAt: Schema.String },
+    success: Schema.Void,
+    error: Schema.String,
+  });
+  const reportQueue = TaskQueue.make("nightly-reports", reportTask);
+  const schedule = yield* Scheduler.make({
+    name: "nightly-report",
+    cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
+    queue: reportQueue,
+    payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
+    missed: { _tag: "coalesce" },
+  });
+  return {
+    schedule,
+    worker: Worker.make(reportQueue, () => buildAndSendReport()),
+  };
 });
-const reportQueue = TaskQueue.make("nightly-reports", reportTask);
-
-const nightlyReportSchedule = Scheduler.make({
-  name: "nightly-report",
-  cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
-  queue: reportQueue,
-  payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
-  missed: { _tag: "coalesce" },
-});
-
-const nightlyReportWorker = Worker.make(reportQueue, () => buildAndSendReport());
 ```
 
 ---
@@ -269,6 +279,8 @@ const nightlyReportWorker = Worker.make(reportQueue, () => buildAndSendReport())
 
 ## Production guides
 
+- [Architecture](./docs/architecture.md)
+- [Runtime boundaries](./docs/runtime-boundaries.md)
 - [API reference](./docs/api-reference.md)
 - [Delivery guarantees](./docs/delivery-guarantees.md)
 - [Idempotent offers](./docs/idempotent-offers.md)

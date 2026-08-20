@@ -25,16 +25,38 @@ import {
   RedisPool,
 } from "./RedisPool.js";
 
+/**
+ * node-redis connection options accepted by a standalone EffectMQ pool.
+ *
+ * Both RESP2 and RESP3 are covered by the compatibility suite.
+ *
+ * @category Configuration
+ * @since 0.2.0
+ */
 export type RedisPoolOptions = Omit<
   RedisClientOptions,
   "clientSideCache" | "RESP"
 > & {
-  /** RESP2 and RESP3 are both covered by the compatibility suite. */
   readonly RESP?: 2 | 3;
 };
+/**
+ * The workload assigned to one isolated Redis connection service.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export type RedisRole = "producer" | "worker" | "maintenance";
 
-/** Explicitly bounded node-redis pool settings. */
+/**
+ * Bounds a standalone node-redis connection pool.
+ *
+ * Defaults are one minimum connection, 100 maximum connections, and 3-second
+ * acquire and cleanup delays. Invalid or unbounded settings fail when the
+ * layer is built.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface BoundedPoolOptions {
   readonly minimum?: number;
   readonly maximum?: number;
@@ -42,28 +64,58 @@ export interface BoundedPoolOptions {
   readonly cleanupDelay?: number;
 }
 
-/** Standalone configuration. Legacy node-redis options remain source-compatible. */
+/**
+ * Configures standalone Redis while retaining node-redis option compatibility.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export type StandaloneRedisConfig = RedisPoolOptions & {
   readonly topology?: "standalone";
   readonly pool?: BoundedPoolOptions;
 };
 
-/** Sentinel discovers and reconnects to the current writable primary. */
+/**
+ * Configures Sentinel discovery of the current writable Redis primary.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface SentinelRedisConfig {
   readonly topology: "sentinel";
   readonly sentinel: RedisSentinelOptions;
 }
 
-/** Accepted only so unsupported production configuration fails as typed data. */
+/**
+ * Represents Redis Cluster so it can be rejected as a typed configuration error.
+ *
+ * EffectMQ scripts operate atomically across multiple keys, which Redis
+ * Cluster cannot guarantee unless every key shares a hash slot.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface ClusterRedisConfig {
   readonly topology: "cluster";
 }
 
+/**
+ * Redis topology configuration accepted by {@link layer}.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export type RedisConfig =
   | StandaloneRedisConfig
   | SentinelRedisConfig
   | ClusterRedisConfig;
 
+/**
+ * Indicates that Redis Cluster was configured or detected.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class UnsupportedRedisTopology extends Data.TaggedError(
   "UnsupportedRedisTopology",
 )<{
@@ -71,10 +123,22 @@ export class UnsupportedRedisTopology extends Data.TaggedError(
   readonly reason: string;
 }> {}
 
+/**
+ * Indicates that bounded pool settings are inconsistent or outside safe limits.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class InvalidRedisConfiguration extends Data.TaggedError(
   "InvalidRedisConfiguration",
 )<{ readonly reason: string }> {}
 
+/**
+ * Passive connection and command health recorded for one Redis role.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface RedisRoleHealth {
   readonly state: "disconnected" | "connecting" | "ready" | "degraded";
   readonly commandErrors: number;
@@ -82,18 +146,38 @@ export interface RedisRoleHealth {
   readonly lastChangeAt: number;
 }
 
+/**
+ * A secret-free snapshot of all EffectMQ Redis connection roles.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface RedisHealthSnapshot {
   readonly topology: "standalone" | "sentinel";
   readonly ready: boolean;
   readonly roles: Readonly<Record<RedisRole, RedisRoleHealth>>;
 }
 
+/**
+ * Exposes passive connection state and an active readiness probe.
+ *
+ * `snapshot` reads locally recorded state. `readiness` sends `PING` through all
+ * three role services and succeeds with `false` when any probe fails.
+ *
+ * @category Services
+ * @since 0.3.0
+ */
 export interface RedisConnectionHealthService {
   readonly snapshot: Effect.Effect<RedisHealthSnapshot>;
   readonly readiness: Effect.Effect<boolean>;
 }
 
-/** Secret-free passive readiness and command-health state. */
+/**
+ * Effect service tag for Redis connection health and readiness.
+ *
+ * @category Services
+ * @since 0.3.0
+ */
 export class RedisConnectionHealth extends Context.Service<
   RedisConnectionHealth,
   RedisConnectionHealthService
@@ -370,6 +454,31 @@ const make = Effect.fnUntraced(function* (config: RedisConfig = {}) {
   );
 });
 
+/**
+ * Creates scoped Redis services for EffectMQ.
+ *
+ * The layer establishes independent producer, worker, and maintenance
+ * connections before exposing any service. All connections close with the
+ * layer scope. Standalone Redis and Sentinel are supported; Cluster fails with
+ * {@link UnsupportedRedisTopology}.
+ *
+ * **Example: Provide a standalone Redis connection**
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { NodeRedisPool, RedisPool } from "@effectmq/core"
+ *
+ * const program = Effect.gen(function* () {
+ *   const redis = yield* RedisPool.RedisPool
+ *   return yield* redis.send<string>("PING")
+ * }).pipe(
+ *   Effect.provide(NodeRedisPool.layer({ url: "redis://127.0.0.1:6379" }))
+ * )
+ * ```
+ *
+ * @category Layers
+ * @since 0.2.0
+ */
 export const layer = (
   config: RedisConfig = {},
 ): Layer.Layer<

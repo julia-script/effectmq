@@ -7,7 +7,16 @@ import * as TaskQueue from "./TaskQueue.js";
 
 const TypeId = "~effectmq/Scheduler" as const;
 
-/** The nominal interval represented by one durable scheduled task. */
+/**
+ * The nominal cron interval represented by one durable scheduled task.
+ *
+ * For a coalesced tick, `missedFrom` and `missedTo` describe the interval that
+ * one task represents. For ordinary and backfilled ticks, both equal
+ * `scheduledAt`.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface Tick {
   readonly scheduleName: string;
   readonly scheduledAt: Date;
@@ -15,11 +24,29 @@ export interface Tick {
   readonly missedTo: Date;
 }
 
+/**
+ * Selects what a scheduler materializes after downtime.
+ *
+ * `skip` discards missed ticks, `coalesce` creates one task for the most recent
+ * missed tick, and `backfill` creates up to `maxBackfill` recent tasks.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export type MissedTickPolicy =
   | { readonly _tag: "skip" }
   | { readonly _tag: "coalesce" }
   | { readonly _tag: "backfill"; readonly maxBackfill: number };
 
+/**
+ * Configures durable cron tick materialization into a task queue.
+ *
+ * `name` identifies the durable schedule cursor and should remain stable.
+ * Generated task identifiers combine that name with the nominal tick time.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface SchedulerConfig<
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -48,8 +75,19 @@ type SchedulerFailure =
   | Schema.SchemaError;
 
 /**
- * A scheduler only materializes deterministic queue tasks. Execution belongs
- * to a normal managed worker and therefore has at-least-once semantics.
+ * A long-running Effect that materializes deterministic cron tasks.
+ *
+ * A scheduler persists its cursor in Redis and offers each selected tick before
+ * advancing it. Competing schedulers and crash recovery can therefore re-offer
+ * the same deterministic task identity without creating duplicate generations.
+ *
+ * **Gotchas**
+ *
+ * The scheduler does not execute tasks. A managed worker processes them with
+ * normal queue leases, retries, and at-least-once delivery.
+ *
+ * @category Models
+ * @since 0.1.0
  */
 export interface Scheduler<Payload extends Schema.Top>
   extends Effect.Effect<
@@ -83,7 +121,17 @@ const recentBackfill = (
   return ticks.reverse();
 };
 
-/** Materialize all work selected by one bounded scheduler observation. */
+/**
+ * Materializes the work selected by one bounded scheduler observation.
+ *
+ * This operation is useful for deterministic tests and custom scheduler loops.
+ * It initializes or reads the durable schedule cursor, applies the missed-tick
+ * policy, offers deterministic tasks, and advances the cursor only after every
+ * selected offer succeeds.
+ *
+ * @category Operations
+ * @since 0.3.0
+ */
 export const materializeDue = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -149,7 +197,39 @@ export const materializeDue = Effect.fnUntraced(function* <
   return consumed.next ?? nextFuture;
 });
 
-/** Create a long-running durable tick materializer. */
+/**
+ * Creates a long-running durable tick materializer.
+ *
+ * Run the returned value as an Effect alongside a `Worker.Worker`. It
+ * sleeps until the next cron tick, with a minimum polling delay of 100 ms, and
+ * repeats indefinitely.
+ *
+ * **Example: Materialize a coalesced daily task**
+ *
+ * ```ts
+ * import { Cron, Schema } from "effect"
+ * import { Scheduler, Task, TaskQueue } from "@effectmq/core"
+ *
+ * const report = Task.make({
+ *   name: "report",
+ *   payload: { scheduledAt: Schema.String },
+ *   success: Schema.Void,
+ *   error: Schema.String
+ * })
+ * const reports = TaskQueue.make("reports", report)
+ *
+ * const daily = Scheduler.make({
+ *   name: "daily-report",
+ *   cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
+ *   queue: reports,
+ *   payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
+ *   missed: { _tag: "coalesce" }
+ * })
+ * ```
+ *
+ * @category Constructors
+ * @since 0.1.0
+ */
 export const make = <
   Payload extends Schema.Top,
   Success extends Schema.Top,

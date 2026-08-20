@@ -103,8 +103,8 @@ beforeAll(async () => {
         "protected-mode no",
         `dir ${sentinelDir}`,
         `sentinel monitor effectmq 127.0.0.1 ${masterPort} 2`,
-        "sentinel down-after-milliseconds effectmq 500",
-        "sentinel failover-timeout effectmq 2000",
+        "sentinel down-after-milliseconds effectmq 2000",
+        "sentinel failover-timeout effectmq 10000",
         "sentinel parallel-syncs effectmq 1",
       ].join("\n"),
     );
@@ -116,23 +116,52 @@ beforeAll(async () => {
     lazyConnect: true,
     maxRetriesPerRequest: 0,
   });
-  const sentinelClient = new IORedis(sentinelPorts[0], "127.0.0.1", {
+  const replicaClient = new IORedis(replicaPort, "127.0.0.1", {
     lazyConnect: true,
     maxRetriesPerRequest: 0,
   });
+  const sentinelClients = sentinelPorts.map(
+    (port) =>
+      new IORedis(port, "127.0.0.1", {
+        lazyConnect: true,
+        maxRetriesPerRequest: 0,
+      }),
+  );
   try {
     await waitFor(async () => (await masterClient.ping()) === "PONG");
     await waitFor(async () => {
-      const address = (await sentinelClient.call(
-        "SENTINEL",
-        "get-master-addr-by-name",
-        "effectmq",
-      )) as [string, string] | null;
-      return address?.[1] === String(masterPort);
+      const replication = await replicaClient.info("replication");
+      return (
+        replication.includes("role:slave") &&
+        replication.includes("master_link_status:up")
+      );
     });
+    for (const client of sentinelClients) {
+      await waitFor(async () => {
+        const address = (await client.call(
+          "SENTINEL",
+          "get-master-addr-by-name",
+          "effectmq",
+        )) as [string, string] | null;
+        const peers = (await client.call(
+          "SENTINEL",
+          "sentinels",
+          "effectmq",
+        )) as ReadonlyArray<unknown>;
+        const quorum = String(
+          await client.call("SENTINEL", "ckquorum", "effectmq"),
+        );
+        return (
+          address?.[1] === String(masterPort) &&
+          peers.length >= 2 &&
+          quorum.startsWith("OK")
+        );
+      });
+    }
   } finally {
     masterClient.disconnect();
-    sentinelClient.disconnect();
+    replicaClient.disconnect();
+    for (const client of sentinelClients) client.disconnect();
   }
 }, 30_000);
 
@@ -152,6 +181,10 @@ sentinelTest(
       expect(yield* redis.evalScript<string>(script, {}, "before")).toBe(
         "before",
       );
+      // Let all three role pools finish their initial Sentinel discovery before
+      // inducing the outage; otherwise pool startup and failover discovery race
+      // and can make a healthy promoted replica look unavailable.
+      yield* Effect.sleep("1 second");
 
       const failoverFault = yield* fault
         .after(

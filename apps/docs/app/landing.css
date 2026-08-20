@@ -222,6 +222,7 @@
 .lp a.lp-ghost-btn {
   display: flex;
   align-items: center;
+  white-space: nowrap;
   color: #ededf2;
   border: 1px solid #2a2a33;
   border-radius: 10px;
@@ -234,6 +235,15 @@
 .lp a.lp-ghost-btn:hover {
   border-color: #3d3d49;
   text-decoration: none;
+}
+
+.lp a.lp-ghost-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.lp a.lp-ghost-btn:active {
+  border-color: var(--accent);
 }
 
 /* ---- sections ---- */
@@ -399,9 +409,13 @@
   padding-top: 96px;
   padding-bottom: 96px;
   display: grid;
-  grid-template-columns: minmax(320px, 5fr) 6fr;
+  grid-template-columns: minmax(320px, 5fr) minmax(0, 6fr);
   gap: 56px;
   align-items: center;
+}
+
+.lp-conc-grid > * {
+  min-width: 0;
 }
 
 .lp-conc-body {
@@ -708,7 +722,7 @@
 
 @media (max-width: 960px) {
   .lp-conc-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 36px;
   }
   .lp-stats,

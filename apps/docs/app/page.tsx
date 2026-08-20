@@ -10,10 +10,11 @@ import "./landing.css";
 export const metadata: Metadata = {
   title: "effectmq — typed task queue built on Effect",
   description:
-    "A task queue built on Effect. Describe work as a schema, process it with a handler that is just an Effect. Retries, delays, idempotency, cron schedules: handled. Redis keeps unfinished work recoverable.",
+    "A typed, Redis-backed task queue for Effect 4 with schema-checked payloads, results and failures, fenced attempts, retries, delays and durable cron.",
 };
 
 const GITHUB_URL = "https://github.com/julia-script/effectmq";
+const NPM_URL = "https://www.npmjs.com/package/@effectmq/core";
 
 const FEATURES = [
   {
@@ -43,8 +44,8 @@ const FEATURES = [
     code: "lease: unique token per attempt",
   },
   {
-    title: "Swappable engine",
-    body: "The Redis engine is a Layer built on atomic Lua scripts. Provide it and forget it — or swap it for a different implementation, like anything in Effect.",
+    title: "One runtime layer",
+    body: "TaskEngine.layer wires the Redis pools, health services, cryptographic identity and Lua-backed engine. Provide it once; work through TaskQueue, Worker and Scheduler.",
     code: "TaskEngine.layer({ redis })",
   },
 ];
@@ -73,7 +74,7 @@ export default function HomePage() {
         <div className="lp-hero-glow" />
         <div className="lp-container lp-hero-inner">
           <div className="lp-chips">
-            <span className="lp-chip lp-chip-accent">BUILT ON EFFECT 4</span>
+            <span className="lp-chip lp-chip-accent">EFFECT 4 BETA</span>
             <span className="lp-chip">REDIS-BACKED</span>
             <span className="lp-chip">MIT</span>
           </div>
@@ -85,16 +86,18 @@ export default function HomePage() {
             Typed errors<span className="lp-accent">.</span> All the way down.
           </h1>
           <p className="lp-hero-sub">
-            A task queue built on <a href="https://effect.website">Effect</a>.
-            Describe work as a schema, process it with a handler that is just an
-            Effect. Retries, delays, idempotency, cron schedules: handled. Redis
-            keeps unfinished work recoverable.
+            Define background work with schemas and process it with handlers
+            that are ordinary Effects. Redis keeps unfinished attempts
+            recoverable; payloads, results and failures stay typed end to end.
           </p>
           <div className="lp-cta-row">
             <InstallCommand />
             <Link href="/docs" className="lp-ghost-btn">
               Read the docs →
             </Link>
+            <a href={NPM_URL} className="lp-ghost-btn">
+              View on npm ↗
+            </a>
           </div>
         </div>
       </section>
@@ -103,13 +106,12 @@ export default function HomePage() {
         className="lp-container"
         style={{ paddingTop: 96, paddingBottom: 84 }}
       >
-        <p className="lp-eyebrow">01 — Lifecycle</p>
-        <h2 className="lp-h2">How a task lives.</h2>
+        <h2 className="lp-h2">Durable work, explicit states.</h2>
         <p className="lp-lede">
-          The state machine every task moves through: offered, queued, leased
-          under a unique fence token, and acknowledged — or routed back through
-          its retry Schedule. Unfinished work survives worker loss. (An
-          illustration of the engine's internals, not a product dashboard.)
+          A task is offered, queued, leased under a unique fence token, then
+          acknowledged or rescheduled by its retry policy. If a worker
+          disappears, maintenance recovers the unfinished attempt. This diagram
+          shows the engine's state transitions.
         </p>
         <div className="lp-panel lp-canvas-panel">
           <LifecycleCanvas />
@@ -138,12 +140,11 @@ export default function HomePage() {
         className="lp-container"
         style={{ paddingTop: 12, paddingBottom: 96 }}
       >
-        <p className="lp-eyebrow">02 — The API</p>
         <h2 className="lp-h2">The whole loop, in thirty seconds.</h2>
         <p className="lp-lede" style={{ marginBottom: 30 }}>
           A task is a schema, not a function. Your handler receives a fully
-          decoded payload — the real object, not a JSON string — and its
-          failures are pattern-matchable typed errors.
+          decoded payload—not a JSON string—and typed failures remain
+          pattern-matchable downstream.
         </p>
         <ApiTabs />
       </section>
@@ -158,12 +159,11 @@ export default function HomePage() {
         className="lp-container"
         style={{ paddingTop: 96, paddingBottom: 96 }}
       >
-        <p className="lp-eyebrow">04 — Receipts</p>
-        <h2 className="lp-h2">Numbers, not vibes.</h2>
+        <h2 className="lp-h2">A baseline you can reproduce.</h2>
         <p className="lp-lede" style={{ marginBottom: 40, maxWidth: 640 }}>
-          Every release ships reproducible performance evidence: full end-to-end
-          task lifecycles — atomic create, fenced acquire, acknowledge —
-          measured per payload size and concurrency.
+          The release baseline measures full task lifecycles—atomic create,
+          fenced acquire and acknowledge—by payload size and concurrency. Use it
+          to detect regressions, not to size production infrastructure.
         </p>
         <div className="lp-stats">
           <div className="lp-stat-card">
@@ -207,9 +207,8 @@ export default function HomePage() {
           className="lp-container"
           style={{ paddingTop: 96, paddingBottom: 96 }}
         >
-          <p className="lp-eyebrow">05 — Batteries</p>
           <h2 className="lp-h2" style={{ marginBottom: 44 }}>
-            Handled, so you don't.
+            What the queue handles.
           </h2>
           <div className="lp-cards">
             {FEATURES.map((f) => (
@@ -227,9 +226,10 @@ export default function HomePage() {
         <div className="lp-cta-glow" />
         <div className="lp-container lp-cta-inner">
           <h2>
-            Put work in. Take attempts.
+            Define the work. Run the worker.
             <br />
-            Redis keeps the rest recoverable<span className="lp-accent">.</span>
+            Redis keeps unfinished attempts recoverable
+            <span className="lp-accent">.</span>
           </h2>
           <InstallCommand />
           <a href={GITHUB_URL} className="lp-star-link">
@@ -250,10 +250,7 @@ export default function HomePage() {
             <a href={GITHUB_URL} className="lp-footer-link">
               GitHub
             </a>
-            <a
-              href="https://www.npmjs.com/package/@effectmq/core"
-              className="lp-footer-link"
-            >
+            <a href={NPM_URL} className="lp-footer-link">
               npm
             </a>
           </div>

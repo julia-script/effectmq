@@ -12,27 +12,38 @@ Provide the standard live graph with explicit timeouts and pool bounds:
 
 ```ts
 import { TaskEngine } from "@effectmq/core"
+import { Config, Effect, Layer, Redacted } from "effect"
 
-const AppLive = TaskEngine.layer({
-  engine: {
-    prefix: "my-service:effectmq:v1",
-    maintenanceBatchSize: 100
-  },
-  redis: {
-    topology: "standalone",
-    url: process.env.REDIS_URL,
-    username: process.env.REDIS_USERNAME,
-    password: process.env.REDIS_PASSWORD,
-    socket: { connectTimeout: 5_000 },
-    commandOptions: { timeout: 2_000 },
-    pool: {
-      minimum: 1,
-      maximum: 16,
-      acquireTimeout: 2_000,
-      cleanupDelay: 5_000
-    }
-  }
-})
+const AppLive = Layer.unwrap(
+  Config.all({
+    url: Config.string("REDIS_URL"),
+    username: Config.string("REDIS_USERNAME"),
+    password: Config.redacted("REDIS_PASSWORD")
+  }).pipe(
+    Effect.map(({ password, url, username }) =>
+      TaskEngine.layer({
+        engine: {
+          prefix: "my-service:effectmq:v1",
+          maintenanceBatchSize: 100
+        },
+        redis: {
+          topology: "standalone",
+          url,
+          username,
+          password: Redacted.value(password),
+          socket: { connectTimeout: 5_000 },
+          commandOptions: { timeout: 2_000 },
+          pool: {
+            minimum: 1,
+            maximum: 16,
+            acquireTimeout: 2_000,
+            cleanupDelay: 5_000
+          }
+        }
+      })
+    )
+  )
+)
 ```
 
 Use `rediss://` or node-redis TLS socket options for encrypted connections.

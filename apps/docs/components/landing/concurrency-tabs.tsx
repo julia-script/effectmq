@@ -10,20 +10,20 @@ export function ConcurrencyTabs() {
   return (
     <>
       <div>
-        <p className="lp-eyebrow">03 — Concurrency</p>
         <h2
           className="lp-h2"
           style={{
             font: "700 clamp(30px,3.4vw,42px)/1.1 'Space Grotesk', sans-serif",
           }}
         >
-          Bring your own concurrency.
+          Built in locally. Explicit globally.
         </h2>
         <p className="lp-conc-body">
-          No builtin concurrency knobs, rate limiting or backpressure — it
-          doesn't need them. <span className="lp-inline-code">complete</span>{" "}
-          does exactly one task; Semaphore, Schedule and fibers decide how many
-          run at once. None of it is our invention. All of it composes.
+          <span className="lp-inline-code">Worker</span> runs a bounded pool of
+          local task slots with lease supervision, maintenance and graceful
+          draining. Run more processes to fan out. Cross-process concurrency and
+          rate limits need shared coordination; a local semaphore cannot enforce
+          them.
         </p>
         <div className="lp-tabs lp-conc-tabs">
           {semTabLabels.map((label, i) => (

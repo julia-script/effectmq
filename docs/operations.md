@@ -15,24 +15,35 @@ Every pool drains in-flight commands and closes when its Effect scope closes.
 
 ```ts
 import { NodeRedisPool } from "@effectmq/core"
+import { Config, Effect, Layer, Redacted } from "effect"
 
-const RedisLive = NodeRedisPool.layer({
-  topology: "standalone",
-  url: process.env.REDIS_URL,
-  username: process.env.REDIS_USERNAME,
-  password: process.env.REDIS_PASSWORD,
-  socket: {
-    connectTimeout: 5_000,
-    reconnectStrategy: (attempt) => Math.min(50 * 2 ** attempt, 2_000)
-  },
-  commandOptions: { timeout: 2_000 },
-  pool: {
-    minimum: 1,
-    maximum: 16,
-    acquireTimeout: 2_000,
-    cleanupDelay: 5_000
-  }
-})
+const RedisLive = Layer.unwrap(
+  Config.all({
+    url: Config.string("REDIS_URL"),
+    username: Config.string("REDIS_USERNAME"),
+    password: Config.redacted("REDIS_PASSWORD")
+  }).pipe(
+    Effect.map(({ password, url, username }) =>
+      NodeRedisPool.layer({
+        topology: "standalone",
+        url,
+        username,
+        password: Redacted.value(password),
+        socket: {
+          connectTimeout: 5_000,
+          reconnectStrategy: (attempt) => Math.min(50 * 2 ** attempt, 2_000)
+        },
+        commandOptions: { timeout: 2_000 },
+        pool: {
+          minimum: 1,
+          maximum: 16,
+          acquireTimeout: 2_000,
+          cleanupDelay: 5_000
+        }
+      })
+    )
+  )
+)
 ```
 
 For TLS, use a `rediss://` URL or node-redis socket TLS options. Supply CA and
@@ -42,32 +53,50 @@ logs. For Sentinel, TLS and ACL settings for Redis nodes belong in
 
 ```ts
 import { NodeRedisPool } from "@effectmq/core"
+import { Config, Effect, Layer, Redacted } from "effect"
 
-const SentinelRedisLive = NodeRedisPool.layer({
-  topology: "sentinel",
-  sentinel: {
-    name: "effectmq-primary",
-    sentinelRootNodes: [
-      { host: "sentinel-a.internal", port: 26379 },
-      { host: "sentinel-b.internal", port: 26379 },
-      { host: "sentinel-c.internal", port: 26379 }
-    ],
-    masterPoolSize: 16,
-    maxCommandRediscovers: 20,
-    scanInterval: 1_000,
-    commandOptions: { timeout: 2_000 },
-    nodeClientOptions: {
-      username: process.env.REDIS_USERNAME,
-      password: process.env.REDIS_PASSWORD,
-      socket: { connectTimeout: 5_000 }
-    },
-    sentinelClientOptions: {
-      username: process.env.SENTINEL_USERNAME,
-      password: process.env.SENTINEL_PASSWORD,
-      socket: { connectTimeout: 5_000 }
-    }
-  }
-})
+const SentinelRedisLive = Layer.unwrap(
+  Config.all({
+    redisUsername: Config.string("REDIS_USERNAME"),
+    redisPassword: Config.redacted("REDIS_PASSWORD"),
+    sentinelUsername: Config.string("SENTINEL_USERNAME"),
+    sentinelPassword: Config.redacted("SENTINEL_PASSWORD")
+  }).pipe(
+    Effect.map(
+      ({
+        redisPassword,
+        redisUsername,
+        sentinelPassword,
+        sentinelUsername
+      }) =>
+        NodeRedisPool.layer({
+          topology: "sentinel",
+          sentinel: {
+            name: "effectmq-primary",
+            sentinelRootNodes: [
+              { host: "sentinel-a.internal", port: 26379 },
+              { host: "sentinel-b.internal", port: 26379 },
+              { host: "sentinel-c.internal", port: 26379 }
+            ],
+            masterPoolSize: 16,
+            maxCommandRediscovers: 20,
+            scanInterval: 1_000,
+            commandOptions: { timeout: 2_000 },
+            nodeClientOptions: {
+              username: redisUsername,
+              password: Redacted.value(redisPassword),
+              socket: { connectTimeout: 5_000 }
+            },
+            sentinelClientOptions: {
+              username: sentinelUsername,
+              password: Redacted.value(sentinelPassword),
+              socket: { connectTimeout: 5_000 }
+            }
+          }
+        })
+    )
+  )
+)
 ```
 
 Use three Sentinel processes across independent failure domains and a quorum

@@ -8,6 +8,8 @@ pnpm add @effectmq/core effect@4.0.0-beta.107 @effect/platform-node@4.0.0-beta.1
 
 This library is built on the Effect 4 beta and doesn't work with the current stable Effect release. The examples below use the bundled `NodeRedisPool` layer, a connection-pooled Redis client that ships with the package (`@effect/platform-node` is only needed for `NodeRuntime`). This is beta-era software riding beta-era Effect; pin accordingly.
 
+Node.js 22.19 or newer is required; the release matrix verifies Node.js 22 and 24.
+
 ---
 
 ## In thirty seconds

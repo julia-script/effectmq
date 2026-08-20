@@ -13,7 +13,7 @@ Dependency baseline: `effect@4.0.0-beta.107` and
 - Package: `@effectmq/core@0.3.0-rc.0`
 - Tarball: `effectmq-core-0.3.0-rc.0.tgz`
 - Entries: 64
-- SHA-256: `0af8683d073f151922d6f612efa8b176643d079d1330a8d3d5f62849018374b7`
+- SHA-256: `ac7d6437deac3056151e11612aa9a37508dbfb79144d8476540e9d6b2657128a`
 - Local artifact: `/tmp/effectmq-0.3.0-rc.0/effectmq-core-0.3.0-rc.0.tgz`
 
 The package gate installed this tarball into clean JavaScript and TypeScript ESM
@@ -30,7 +30,7 @@ research, or editor file was present.
 | Redis 7.2/7.4/8.0, RESP2/RESP3 | Passed locally |
 | Standalone and three-Sentinel failover | Passed |
 | Generated model sequences | 32 deterministic lifecycles passed |
-| Package consumer | 64 intended entries; JS load and TS check passed |
+| Package consumer | 64 intended entries; Node 22/24 JS load and TS check passed |
 | Performance | [Published matrix](./performance.md) |
 | Soak | [233,106 accepted/completed over five minutes, zero command errors](./soak.md) |
 | Rollback | Pre-upgrade snapshot restored; 9 candidate keys removed; 0 remained |

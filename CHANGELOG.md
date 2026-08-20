@@ -32,6 +32,8 @@
   benchmark, soak, documentation, and provenance-bearing release gates.
 - Refresh `effect` and direct `@effect/*` development dependencies to
   `4.0.0-beta.107`, the npm `beta` baseline used to verify this candidate.
+- Require Node.js 22.19 or newer, matching the verified Effect beta platform
+  stack; the ESM consumer matrix covers Node.js 22 and 24.
 
 ### Patch Changes
 

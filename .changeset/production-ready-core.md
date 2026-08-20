@@ -30,3 +30,5 @@ must be drained before upgrading; the package includes a read-only inspector.
   benchmark, soak, documentation, and provenance-bearing release gates.
 - Refresh `effect` and direct `@effect/*` development dependencies to the npm
   `beta` baseline resolved for the candidate (`4.0.0-beta.107`).
+- Require Node.js 22.19 or newer, matching the runtime floor of the verified
+  Effect beta platform stack; Node.js 20 is not part of the support contract.

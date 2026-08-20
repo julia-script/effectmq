@@ -6,7 +6,7 @@ security fixes, and is eligible for production incident reports.
 
 | Component | Supported | Notes |
 | --- | --- | --- |
-| Node.js | 20.19+, 22, 24 | Active or maintenance LTS lines tested as ESM |
+| Node.js | 22.19+, 24 | Supported LTS lines tested as ESM |
 | Redis | 7.2, 7.4, 8.0 | Official Redis server; persistence and `noeviction` required in production |
 | Topology | standalone, Sentinel | Three-Sentinel quorum/failover test is required |
 | Redis Cluster | unsupported | Fails startup with `UnsupportedRedisTopology` |
@@ -27,7 +27,7 @@ Required pull-request gates run:
 
 - formatting, linting, typechecking, generated Lua drift, package, docs, and
   the unit/integration/fault suite on Node 22;
-- the ESM package consumer on Node 20, 22, and 24;
+- the ESM package consumer on Node 22 and 24;
 - Redis 7.2, 7.4, and 8.0 with RESP2 and RESP3;
 - standalone restart and a primary/replica/three-Sentinel failover, including
   post-promotion `NOSCRIPT` reload.

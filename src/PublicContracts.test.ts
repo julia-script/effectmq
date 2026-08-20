@@ -1,8 +1,9 @@
-import { expect, it } from "vitest";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import type * as Stream from "effect/Stream";
+import { expect, it } from "vitest";
 import type * as RedisPool from "./RedisPool.js";
 import * as TaskEngine from "./TaskEngine.js";
 import * as TaskQueue from "./TaskQueue.js";
@@ -71,7 +72,7 @@ const compilePublicContracts = () => {
     Equal<Effect.Success<typeof completeOne>, boolean>
   >;
   type CompleteOneError = Expect<
-    Equal<Effect.Error<typeof completeOne>, TaskQueue.CompleteError>
+    Equal<Effect.Error<typeof completeOne>, TaskQueue.CompleteOneError>
   >;
   type CompleteOneServices = Expect<
     Equal<Effect.Services<typeof completeOne>, Effect.Services<typeof complete>>
@@ -135,6 +136,18 @@ const compilePublicContracts = () => {
   >;
   type RejectAnyServices = ExpectFalse<IsAny<Effect.Services<typeof complete>>>;
 
+  const events = TaskQueue.stream(queue);
+  type FailedEvent = Extract<
+    Stream.Success<typeof events>,
+    { readonly _tag: "task.failed" }
+  >;
+  type FailedEventError = Expect<
+    Equal<
+      FailedEvent["payload"]["error"],
+      boolean | TaskRecord.StalledErrorSchema | TaskRecord.CanceledErrorSchema
+    >
+  >;
+
   const layerNoDeps = TaskEngine.layerNoDeps();
   const liveLayer = TaskEngine.layer();
   type LayerNoDepsRequirement = Expect<
@@ -164,6 +177,7 @@ const compilePublicContracts = () => {
     | RejectUnknownError
     | RejectErasedServices
     | RejectAnyServices
+    | FailedEventError
     | LayerNoDepsRequirement
     | LiveLayerRequirement;
 };

@@ -48,8 +48,14 @@ describe("StorageProtocol v1", () => {
         BigInt(1),
         Number.POSITIVE_INFINITY,
         Number.MAX_SAFE_INTEGER + 1,
+        -0,
         new Date(),
         cyclic,
+        { visible: true, [Symbol("hidden")]: false },
+        Object.defineProperty({}, "hidden", { value: true }),
+        Object.defineProperty({}, "computed", { get: () => true }),
+        Object.assign([1], { extra: true }),
+        Object.assign([1], { [Symbol("hidden")]: true }),
       ]) {
         const error = yield* StorageProtocol.encodeValue(
           "schema",
@@ -57,6 +63,77 @@ describe("StorageProtocol v1", () => {
           unsupported,
         ).pipe(Effect.flip);
         expect(error._tag).toBe("UnsupportedStorageValue");
+      }
+    }),
+  );
+
+  it.effect("supports top-level undefined only for Schema.Void successes", () =>
+    Effect.gen(function* () {
+      const encoded = yield* StorageProtocol.encodeValue(
+        "schema",
+        "success",
+        undefined,
+      );
+      expect(
+        yield* StorageProtocol.decodeValue(encoded, "schema", "success"),
+      ).toBeUndefined();
+
+      const error = yield* StorageProtocol.encodeValue(
+        "schema",
+        "payload",
+        undefined,
+      ).pipe(Effect.flip);
+      expect(error._tag).toBe("UnsupportedStorageValue");
+    }),
+  );
+
+  it.effect("preserves prototype-sensitive keys as ordinary data", () =>
+    Effect.gen(function* () {
+      const value: Record<string, unknown> = {
+        constructor: "constructor-value",
+        prototype: "prototype-value",
+      };
+      Object.defineProperty(value, "__proto__", {
+        enumerable: true,
+        value: "proto-value",
+      });
+
+      const encoded = yield* StorageProtocol.encodeValue(
+        "schema",
+        "payload",
+        value,
+      );
+      const decoded = yield* StorageProtocol.decodeValue(
+        encoded,
+        "schema",
+        "payload",
+      );
+      expect(decoded).toEqual(value);
+      expect(Object.getPrototypeOf(decoded)).toBe(Object.prototype);
+      expect(Object.getOwnPropertyDescriptor(decoded, "__proto__")?.value).toBe(
+        "proto-value",
+      );
+    }),
+  );
+
+  it.effect("rejects decoded values outside the lossless storage domain", () =>
+    Effect.gen(function* () {
+      const external = new Packr({ useRecords: false });
+      for (const unsupported of [
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+        new Date("2026-01-01T00:00:00.000Z"),
+      ]) {
+        const encoded = `effectmq:v1:${Buffer.from(
+          external.pack([1, "schema", "payload", unsupported]),
+        ).toString("base64")}`;
+        const error = yield* StorageProtocol.decodeValue(
+          encoded,
+          "schema",
+          "payload",
+        ).pipe(Effect.flip);
+        expect(error._tag).toBe("CorruptStorageValue");
       }
     }),
   );

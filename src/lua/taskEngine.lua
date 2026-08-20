@@ -14,6 +14,7 @@ local maintenanceRemaining = 100
 
 -- set once per script invocation; helpers close over it
 local now = 0
+local debugMode = false
 
 local function redisNow()
   local time = redis.call("TIME")
@@ -25,6 +26,11 @@ local function getNow(debug)
     return tonumber(redis.call("GET", MOCKTIME_KEY) or redisNow())
   end
   return redisNow()
+end
+
+local function isPositiveSafeInteger(value)
+  return value and value == value and value > 0
+    and value <= 9007199254740991 and math.floor(value) == value
 end
 
 -- key helpers ---------------------------------------------------------------
@@ -62,7 +68,9 @@ local function maintenanceCursorKey(prefix) return prefix .. ":maintenance:curso
 
 local function removeFromFailedList(prefix, id) return redis.call("ZREM", failedList(prefix), id) end
 local function removeFromSuccessList(prefix, id) return redis.call("ZREM", successList(prefix), id) end
-local function removeFromWaitList(prefix, id) return redis.call("LREM", waitList(prefix), 0, id) end
+local function removeFromWaitList(prefix, id, count)
+  return redis.call("LREM", waitList(prefix), count, id)
+end
 local function removeFromDelayedList(prefix, id) return redis.call("ZREM", delayedList(prefix), id) end
 local function removeFromActiveLists(prefix, id) return redis.call("ZREM", activeList(prefix), id) end
 
@@ -114,21 +122,48 @@ local function eventCursors(prefix)
 end
 
 local function removeFromCurrentLists(prefix, id)
+  local storedList = redis.call("HGET", taskHash(prefix, id), "currentList")
   local currentList = nil
-  if removeFromWaitList(prefix, id) > 0 then
-    currentList = currentList or "wait"
+  local storedRemoval = 0
+  if storedList == "wait" then
+    storedRemoval = removeFromWaitList(prefix, id, 1)
+    currentList = "wait"
+  elseif storedList == "scheduled" then
+    storedRemoval = removeFromDelayedList(prefix, id)
+    currentList = "scheduled"
+  elseif storedList == "active" then
+    storedRemoval = removeFromActiveLists(prefix, id)
+    currentList = "active"
+  elseif storedList == "failed" then
+    storedRemoval = removeFromFailedList(prefix, id)
+    currentList = "failed"
+  elseif storedList == "success" then
+    storedRemoval = removeFromSuccessList(prefix, id)
+    currentList = "success"
   end
-  if removeFromDelayedList(prefix, id) > 0 then
-    currentList = currentList or "scheduled"
-  end
-  if removeFromActiveLists(prefix, id) > 0 then
-    currentList = currentList or "active"
-  end
-  if removeFromFailedList(prefix, id) > 0 then
-    currentList = currentList or "failed"
-  end
-  if removeFromSuccessList(prefix, id) > 0 then
-    currentList = currentList or "success"
+
+  -- Records created before currentList was introduced take one migration scan.
+  -- A stale marker from an older rolling-deployment writer also falls back.
+  -- Debug mode repairs deliberately injected cross-index corruption.
+  if storedList == false
+    or (storedList ~= "none" and storedRemoval == 0)
+    or debugMode then
+    if storedRemoval == 0 then currentList = nil end
+    if removeFromDelayedList(prefix, id) > 0 then
+      currentList = currentList or "scheduled"
+    end
+    if removeFromActiveLists(prefix, id) > 0 then
+      currentList = currentList or "active"
+    end
+    if removeFromFailedList(prefix, id) > 0 then
+      currentList = currentList or "failed"
+    end
+    if removeFromSuccessList(prefix, id) > 0 then
+      currentList = currentList or "success"
+    end
+    if removeFromWaitList(prefix, id, 0) > 0 then
+      currentList = currentList or "wait"
+    end
   end
   return currentList
 end
@@ -167,8 +202,9 @@ end
 
 -- the add* helpers do not clear other lists; moveToList is the single entry
 -- point that removes from the current list, adds to the target, and emits task.moved
-local function moveToList(prefix, id, list, readyAt)
-  local currentList = removeFromCurrentLists(prefix, id)
+local function moveToList(prefix, id, list, readyAt, sourceKnownEmpty)
+  local currentList = nil
+  if not sourceKnownEmpty then currentList = removeFromCurrentLists(prefix, id) end
   if list == "wait" then
     addToWaitList(prefix, id)
   elseif list == "scheduled" then
@@ -179,6 +215,11 @@ local function moveToList(prefix, id, list, readyAt)
     addToFailedList(prefix, id)
   elseif list == "success" then
     addToSuccessList(prefix, id)
+  end
+  if list then
+    redis.call("HSET", taskHash(prefix, id), "currentList", list)
+  else
+    redis.call("HSET", taskHash(prefix, id), "currentList", "none")
   end
 
   -- Removing first repairs duplicate or cross-state membership. Re-add the
@@ -215,9 +256,9 @@ local function moveToList(prefix, id, list, readyAt)
   publishEvent(prefix, id, "task.moved", fields)
 end
 
-local function deleteTask(prefix, id)
+local function deleteTask(prefix, id, sourceKnownEmpty)
   local generation = redis.call("HGET", taskHash(prefix, id), "generation")
-  moveToList(prefix, id, nil)
+  moveToList(prefix, id, nil, nil, sourceKnownEmpty)
   if generation then
     local member = cmsgpack.pack({ prefix, id, tonumber(generation) })
     redis.call("ZREM", taskExpiryIndex(prefix), member)
@@ -323,7 +364,7 @@ local function scheduleExpiry(index, member, retentionMs)
   redis.call("ZADD", index, now + tonumber(retentionMs), member)
 end
 
-local function persistTerminalResult(prefix, id)
+local function persistTerminalResult(prefix, id, terminalFailure)
   local generation = currentGeneration(prefix, id)
   local member = identityMember(prefix, id, generation)
   local outcome = getTaskField(prefix, id, "outcome")
@@ -341,7 +382,10 @@ local function persistTerminalResult(prefix, id)
     redis.call("HSET", hash, "success", getTaskField(prefix, id, "success"))
   else
     local errors = getTaskErrors(prefix, id)
-    local failure = errors[#errors] and errors[#errors].error or nil
+    local failure = terminalFailure
+    if failure == nil then
+      failure = errors[#errors] and errors[#errors].error or nil
+    end
     if failure ~= nil then redis.call("HSET", hash, "failure", cmsgpack.pack(failure)) end
     redis.call("ZADD", deadLetterList(prefix), now, member)
     scheduleExpiry(
@@ -443,7 +487,7 @@ local function applyCompletionPolicy(prefix, id)
   end
 
   if policy == "delete" and not hasRetentionHolds(prefix, id, generation) then
-    deleteTask(prefix, id)
+    deleteTask(prefix, id, true)
   end
 end
 
@@ -481,9 +525,9 @@ local function releaseOwnedHolds(holderPrefix, holderId, holderGeneration)
   end
 end
 
-local function settleTask(prefix, id)
+local function settleTask(prefix, id, terminalFailure)
   local generation = currentGeneration(prefix, id)
-  persistTerminalResult(prefix, id)
+  persistTerminalResult(prefix, id, terminalFailure)
   scheduleTerminalRetention(prefix, id)
   applyCompletionPolicy(prefix, id)
   releaseOwnedHolds(prefix, id, generation)
@@ -528,7 +572,7 @@ local function failTask(prefix, id, error, retryAt, failureKind)
     return
   end
   setTask(prefix, id, "outcome", "failure")
-  settleTask(prefix, id)
+  settleTask(prefix, id, error)
 end
 
 -- sync -----------------------------------------------------------------------
@@ -632,8 +676,11 @@ local function syncTerminalExpiry(prefix)
     if exists(taskHash(prefix, task.id)) == 1
       and currentGeneration(prefix, task.id) == task.generation
     then
-      removeFromSuccessList(prefix, task.id)
-      removeFromFailedList(prefix, task.id)
+      local removed = removeFromSuccessList(prefix, task.id)
+        + removeFromFailedList(prefix, task.id)
+      if removed > 0 then
+        redis.call("HSET", taskHash(prefix, task.id), "currentList", "none")
+      end
     end
     redis.call("ZREM", index, member)
   end
@@ -717,7 +764,6 @@ end
 
 register("effectmq_createTask", function(args)
   local prefix = args[2]
-  syncAll(prefix)
   local throwOnExists = args[3] == "1"
 
   local id = args[4]
@@ -731,15 +777,39 @@ register("effectmq_createTask", function(args)
   local retentionHolder = args[11] ~= "" and cmsgpack.unpack(args[11]) or nil
   local creator = args[12]
   local onDuplicate = args[13] or "return-existing"
-  local maxStalledCount = tonumber(args[14]) or 1
-  local maxErrorEntries = tonumber(args[16]) or 100
-  local maxRelationships = tonumber(args[17]) or 1000
-  local maxEventEntries = tonumber(args[18]) or 10000
-  local taskRecordRetentionMs = tonumber(args[19]) or 604800000
-  local resultRetentionMs = tonumber(args[20]) or 86400000
-  local terminalIndexRetentionMs = tonumber(args[21]) or 604800000
-  local deadLetterRetentionMs = tonumber(args[22]) or 2592000000
-  local eventRetentionMs = tonumber(args[23]) or 604800000
+  local maxStalledCount = tonumber(args[14])
+  local maxErrorEntries = tonumber(args[16])
+  local maxRelationships = tonumber(args[17])
+  local maxEventEntries = tonumber(args[18])
+  local taskRecordRetentionMs = tonumber(args[19])
+  local resultRetentionMs = tonumber(args[20])
+  local terminalIndexRetentionMs = tonumber(args[21])
+  local deadLetterRetentionMs = tonumber(args[22])
+  local eventRetentionMs = tonumber(args[23])
+  local maxSafeInteger = 9007199254740991
+  if not delay or delay ~= delay or delay < 0 or math.abs(delay) > maxSafeInteger then
+    return redis.error_reply("invalid delay")
+  end
+  local integerFields = {
+    { "maxRetries", maxRetries, -1 },
+    { "maxStalledCount", maxStalledCount, 0 },
+    { "maxErrorEntries", maxErrorEntries, 0 },
+    { "maxRelationships", maxRelationships, 0 },
+    { "maxEventEntries", maxEventEntries, 1 },
+    { "taskRecordRetentionMs", taskRecordRetentionMs, 0 },
+    { "resultRetentionMs", resultRetentionMs, 0 },
+    { "terminalIndexRetentionMs", terminalIndexRetentionMs, 0 },
+    { "deadLetterRetentionMs", deadLetterRetentionMs, 0 },
+    { "eventRetentionMs", eventRetentionMs, 0 },
+  }
+  for _, field in ipairs(integerFields) do
+    local value = field[2]
+    if not value or value ~= value or value < field[3]
+      or value > maxSafeInteger or math.floor(value) ~= value then
+      return redis.error_reply("invalid " .. field[1])
+    end
+  end
+  syncAll(prefix)
   local existingTask = getTask(prefix, id)
   local replacedTask = nil
 
@@ -829,9 +899,9 @@ register("effectmq_createTask", function(args)
   publishEvent(prefix, id, replacedTask and "task.updated" or "task.created", fields)
 
   if delay > 0 then
-    moveToList(prefix, id, "scheduled", now + delay)
+    moveToList(prefix, id, "scheduled", now + delay, true)
   else
-    moveToList(prefix, id, "wait")
+    moveToList(prefix, id, "wait", nil, true)
   end
 
   return { "created", latestEventCursor(prefix), getTask(prefix, id) }
@@ -888,12 +958,16 @@ end)
 
 register("effectmq_writeError", function(args)
   local prefix = args[2]
-  syncAll(prefix)
   local leaseToken = args[3]
   local id = args[4]
+  local retryAt = tonumber(args[6])
+  if not retryAt or retryAt ~= retryAt or retryAt < -1
+    or math.abs(retryAt) > 9007199254740991 then
+    return redis.error_reply("invalid retryAt")
+  end
   local error = cmsgpack.unpack(args[5])
-  local retryAt = tonumber(args[6]) or -1
   local hash = taskHash(prefix, id)
+  syncAll(prefix)
 
   if exists(hash) == 0 then
     return redis.error_reply("Task not found")
@@ -952,9 +1026,12 @@ end)
 
 register("effectmq_takeTask", function(args)
   local prefix = args[2]
-  syncAll(prefix)
   local leaseToken = args[3]
   local lockTimeout = tonumber(args[4])
+  if not isPositiveSafeInteger(lockTimeout) then
+    return redis.error_reply("invalid lockTimeout")
+  end
+  syncAll(prefix)
 
   local taskId = popWaitList(prefix)
 
@@ -980,6 +1057,9 @@ register("effectmq_extendLock", function(args)
   local leaseToken = args[3]
   local id = args[4]
   local lockTimeout = tonumber(args[5])
+  if not isPositiveSafeInteger(lockTimeout) then
+    return redis.error_reply("invalid lockTimeout")
+  end
   local lock = getLockId(prefix, id)
   if not lock or lock ~= leaseToken then
     return redis.error_reply("LEASE_LOST")
@@ -1096,6 +1176,7 @@ end
 -- MessagePack empty-array representation and must fail if read as another type.
 EMPTY_LIST = string.char(0x90)
 now = getNow(args[1])
+debugMode = args[1] == "1"
 maintenanceBatchSize = tonumber(ARGV[3]) or 100
 maintenanceRemaining = maintenanceBatchSize
 return fn(args)

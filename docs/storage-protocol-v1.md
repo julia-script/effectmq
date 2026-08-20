@@ -43,13 +43,16 @@ reading their values, and fails when the old namespace has not been drained.
 After a task's Effect Schema has encoded it, v1 accepts:
 
 - `null`, strings, booleans, and `Uint8Array`
-- finite numbers whose magnitude is at most `Number.MAX_SAFE_INTEGER`
+- finite numbers whose magnitude is at most `Number.MAX_SAFE_INTEGER`, except
+  negative zero
 - arrays containing supported values
 - plain string-keyed objects containing supported values
 
 Empty arrays and objects, nested nulls, Unicode, binary bytes, and fractional
-safe numbers round-trip losslessly. `undefined`, `bigint`, non-finite and unsafe
-numbers, class instances, symbols, functions, and cyclic objects are rejected.
+safe numbers round-trip losslessly. A top-level `undefined` success is accepted
+for `Schema.Void`; `undefined` payloads, failures, and nested values remain
+invalid. Negative zero, `bigint`, non-finite and unsafe numbers, class
+instances, symbols, functions, and cyclic objects are rejected.
 Encoded user values are limited to 1 MiB by default. A task definition can
 override `storageLimits.maxValueBytes`; the same bound applies independently to
 payload, success, and typed-failure envelopes.

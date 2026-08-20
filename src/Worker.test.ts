@@ -55,6 +55,63 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       }),
     );
 
+    it.effect("rejects non-finite and out-of-range concurrency", () =>
+      Effect.gen(function* () {
+        const queue = makeQueue("worker-invalid-concurrency");
+        for (const concurrency of [
+          Number.NaN,
+          Number.POSITIVE_INFINITY,
+          0,
+          1.5,
+        ]) {
+          const error = yield* Worker.run(
+            Worker.make(queue, () => Effect.succeed("unused"), {
+              concurrency,
+            }),
+          ).pipe(Effect.flip);
+          expect(error).toMatchObject({
+            _tag: "WorkerConfigurationError",
+            field: "concurrency",
+            actual: concurrency,
+          });
+        }
+      }),
+    );
+
+    it.effect("rejects unsafe timing and processing options", () =>
+      Effect.gen(function* () {
+        const queue = makeQueue("worker-invalid-timing");
+        const cases: ReadonlyArray<readonly [Worker.WorkerOptions, string]> = [
+          [{ pollInterval: 0 }, "pollInterval"],
+          [{ maintenanceInterval: 0 }, "maintenanceInterval"],
+          [{ drainTimeout: -1 }, "drainTimeout"],
+          [{ processing: { lockTimeout: 0 } }, "processing.lockTimeout"],
+          [{ processing: { lockTimeout: 0.5 } }, "processing.lockTimeout"],
+          [
+            { processing: { lockTimeout: 100, lockRefresh: 100 } },
+            "processing.lockRefresh",
+          ],
+          [
+            { processing: { heartbeatRetryDelay: 0 } },
+            "processing.heartbeatRetryDelay",
+          ],
+          [
+            { processing: { heartbeatRetryCount: 1.5 } },
+            "processing.heartbeatRetryCount",
+          ],
+        ];
+        for (const [options, field] of cases) {
+          const error = yield* Worker.run(
+            Worker.make(queue, () => Effect.succeed("unused"), options),
+          ).pipe(Effect.flip);
+          expect(error).toMatchObject({
+            _tag: "WorkerConfigurationError",
+            field,
+          });
+        }
+      }),
+    );
+
     it.effect("uses isolated worker and maintenance Redis roles", () =>
       Effect.gen(function* () {
         const engine = yield* TaskEngine.TaskEngine;

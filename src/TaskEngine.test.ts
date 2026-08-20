@@ -1,6 +1,6 @@
-import { Effect, Metric } from "effect";
-import { Packr } from "msgpackr";
 import { expect, layer } from "@effect/vitest";
+import { Duration, Effect, Metric } from "effect";
+import { Packr } from "msgpackr";
 import { Observability, RedisPool, TaskEngine } from "./index.js";
 import { getLists, TestLayer } from "./testing/redisLayer.js";
 import {
@@ -36,6 +36,64 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
             field: "maintenanceBatchSize",
             actual: 1_001,
           });
+        }),
+    );
+
+    it.effect(
+      "rejects unsafe low-level numeric inputs before Redis mutation",
+      () =>
+        Effect.gen(function* () {
+          const engine = yield* TaskEngine.TaskEngine;
+          const prefix = "invalid-low-level-numbers";
+          const error = yield* engine
+            .createTask({
+              id: "invalid",
+              name: "invalid",
+              payload: null,
+              delay: Number.NaN,
+              maxRetries: 0,
+              onSuccessPolicy: "keep",
+              onFailurePolicy: "keep",
+              prefix,
+            })
+            .pipe(Effect.flip);
+          expect(error.reason).toMatchObject({
+            _tag: "InvalidInput",
+            field: "delay",
+          });
+          expect(yield* engine.getGeneration(prefix, "invalid")).toBe(0);
+
+          const lockError = yield* engine
+            .takeTask(prefix, 1.5)
+            .pipe(Effect.flip);
+          expect(lockError.reason).toMatchObject({
+            _tag: "InvalidInput",
+            field: "lockTimeout",
+          });
+
+          yield* engine.createTask({
+            id: "retry-at",
+            name: "retry-at",
+            payload: null,
+            delay: 0,
+            maxRetries: 1,
+            onSuccessPolicy: "keep",
+            onFailurePolicy: "keep",
+            prefix,
+          });
+          yield* takeTask(engine, prefix, 1_000);
+          const retryError = yield* writeError(
+            engine,
+            prefix,
+            "retry-at",
+            "failure",
+            Duration.infinity,
+          ).pipe(Effect.flip);
+          expect(retryError).toMatchObject({
+            _tag: "TaskEngineError",
+            reason: { _tag: "InvalidInput", field: "retryAt" },
+          });
+          expect((yield* getLists(prefix)).active).toEqual(["retry-at"]);
         }),
     );
 
@@ -421,6 +479,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       Effect.gen(function* () {
         const taskEngine = yield* TaskEngine.TaskEngine;
         const redis = yield* RedisPool.RedisPool;
+        const productionEngine = yield* TaskEngine.makeWithRedis(redis);
         const prefix = "same-state-active";
         yield* taskEngine.createTask({
           id: "active-1",
@@ -432,11 +491,12 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
           onFailurePolicy: "keep",
           prefix,
         });
-        yield* takeTask(taskEngine, prefix, 30_000);
+        yield* takeTask(productionEngine, prefix, 30_000);
 
         // Simulate a partially corrupted pre-fix record. Any transition must
         // repair cross-state membership rather than preserving extra indexes.
         const keyPrefix = `~effectmq:v1:${prefix}`;
+        yield* redis.send("HDEL", `${keyPrefix}:task:active-1`, "currentList");
         yield* redis.send("RPUSH", `${keyPrefix}:wait`, "active-1");
         yield* redis.send(
           "ZADD",
@@ -447,10 +507,47 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         yield* redis.send("ZADD", `${keyPrefix}:failed`, "1", "active-1");
         yield* redis.send("ZADD", `${keyPrefix}:success`, "1", "active-1");
 
-        yield* extendLock(taskEngine, prefix, "active-1", 30_000);
+        yield* extendLock(productionEngine, prefix, "active-1", 30_000);
 
         expect(yield* getLists(prefix)).toEqual({
           active: ["active-1"],
+          failed: [],
+          scheduled: [],
+          success: [],
+          wait: [],
+        });
+      }),
+    );
+
+    it.effect("stale rolling-deployment list markers fall back to repair", () =>
+      Effect.gen(function* () {
+        const redis = yield* RedisPool.RedisPool;
+        const engine = yield* TaskEngine.makeWithRedis(redis);
+        const prefix = "stale-current-list";
+        const keyPrefix = `~effectmq:v1:${prefix}`;
+        yield* engine.createTask({
+          id: "stale",
+          name: "stale",
+          payload: null,
+          delay: 0,
+          maxRetries: 0,
+          onSuccessPolicy: "mark-as-success",
+          onFailurePolicy: "mark-as-failure",
+          prefix,
+        });
+        yield* takeTask(engine, prefix, 30_000);
+        yield* writeSuccess(engine, prefix, "stale", "ok");
+        yield* redis.send(
+          "HSET",
+          `${keyPrefix}:task:stale`,
+          "currentList",
+          "wait",
+        );
+
+        yield* engine.removeTask(prefix, "stale");
+
+        expect(yield* getLists(prefix)).toEqual({
+          active: [],
           failed: [],
           scheduled: [],
           success: [],
@@ -686,6 +783,57 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         expect(lists.wait).toEqual(["r2"]);
         expect(lists.scheduled).toEqual([]);
         expect(lists.failed).toEqual([]);
+      }),
+    );
+
+    it.effect("writeError treats zero as an immediate retry time", () =>
+      Effect.gen(function* () {
+        const taskEngine = yield* TaskEngine.TaskEngine;
+        yield* TaskEngine.setMockTime(1000000000000);
+        const prefix = "retry-zero";
+        yield* taskEngine.createTask({
+          id: "r0",
+          name: "t",
+          payload: "p",
+          delay: 0,
+          maxRetries: 5,
+          onSuccessPolicy: "delete",
+          onFailurePolicy: "mark-as-failure",
+          prefix,
+        });
+
+        yield* takeTask(taskEngine, prefix, 30000);
+        yield* writeError(taskEngine, prefix, "r0", stalled(1), 0);
+
+        const lists = yield* getLists(prefix);
+        expect(lists.wait).toEqual(["r0"]);
+        expect(lists.failed).toEqual([]);
+      }),
+    );
+
+    it.effect("retains a false terminal failure with zero error history", () =>
+      Effect.gen(function* () {
+        const taskEngine = yield* TaskEngine.TaskEngine;
+        const prefix = "false-terminal-failure";
+        yield* taskEngine.createTask({
+          id: "false",
+          name: "t",
+          payload: "p",
+          delay: 0,
+          maxRetries: 0,
+          maxErrorEntries: 0,
+          onSuccessPolicy: "delete",
+          onFailurePolicy: "keep",
+          prefix,
+        });
+
+        yield* takeTask(taskEngine, prefix, 30000);
+        yield* writeError(taskEngine, prefix, "false", false);
+
+        expect(yield* taskEngine.getResult(prefix, "false", 1)).toMatchObject({
+          outcome: "failure",
+          failure: false,
+        });
       }),
     );
 

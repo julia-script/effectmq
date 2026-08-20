@@ -1,5 +1,5 @@
 import { describe, expect, layer } from "@effect/vitest";
-import { Deferred, Effect, Schedule, Schema } from "effect";
+import { Deferred, Duration, Effect, Fiber, Schedule, Schema } from "effect";
 import * as PersistenceRedis from "effect/unstable/persistence/Redis";
 import type { EngineTask } from "./EngineRecord.js";
 import { RedisPool, Task, TaskEngine, TaskQueue } from "./index.js";
@@ -85,6 +85,42 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         }),
       );
 
+      it.effect("offer validates numeric options before mutating Redis", () =>
+        Effect.gen(function* () {
+          const engine = yield* TaskEngine.TaskEngine;
+          const queue = makeQueue("tq-invalid-offer-options");
+          for (const [options, field] of [
+            [{ delay: Number.NaN }, "delay"],
+            [{ delay: Number.POSITIVE_INFINITY }, "delay"],
+            [{ delay: -1 }, "delay"],
+            [{ maxRetries: 1.5 }, "maxRetries"],
+            [{ maxStalledCount: -1 }, "maxStalledCount"],
+          ] as const) {
+            const error = yield* TaskQueue.offer(
+              queue,
+              { userId: "invalid", amount: 1 },
+              options,
+            ).pipe(Effect.flip);
+            expect(error).toMatchObject({ _tag: "TaskOptionsError", field });
+            expect(yield* engine.getGeneration(queue.name, "invalid")).toBe(0);
+          }
+        }),
+      );
+
+      it.effect(
+        "fractional delays round-trip through Redis exponent form",
+        () =>
+          Effect.gen(function* () {
+            const queue = makeQueue("tq-fractional-delay");
+            const offered = yield* TaskQueue.offer(
+              queue,
+              { userId: "fractional", amount: 1 },
+              { delay: 1e-7 },
+            );
+            expect(offered.task.delay).toBe(1e-7);
+          }),
+      );
+
       it.effect(
         "a task's configured byte limit is enforced while offering",
         () =>
@@ -107,6 +143,24 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
               maxBytes: 8,
             });
           }),
+      );
+
+      it.effect("Schema.Void successes complete and remain waitable", () =>
+        Effect.gen(function* () {
+          const definition = Task.make({
+            name: "tq-void-success",
+            payload: { id: Schema.String },
+            success: Schema.Void,
+            error: Schema.Never,
+            idempotencyKey: ({ id }) => id,
+          });
+          const queue = TaskQueue.make(definition.name, definition);
+          const offered = yield* TaskQueue.offer(queue, { id: "void" });
+
+          yield* TaskQueue.complete(queue, () => Effect.void);
+
+          expect(yield* TaskQueue.wait(queue, offered.handle)).toBeUndefined();
+        }),
       );
 
       it.effect("outcome byte limits fail before writing terminal state", () =>
@@ -598,6 +652,31 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       );
 
       it.effect(
+        "completeOne rejects invalid processing options before taking a task",
+        () =>
+          Effect.gen(function* () {
+            const queue = makeQueue("tq-invalid-processing");
+            yield* TaskQueue.offer(queue, { userId: "waiting", amount: 1 });
+
+            for (const lockTimeout of [0, 0.5]) {
+              const error = yield* TaskQueue.completeOne(
+                queue,
+                () => Effect.succeed("unused"),
+                { lockTimeout },
+              ).pipe(Effect.flip);
+
+              expect(error).toMatchObject({
+                _tag: "ProcessingConfigurationError",
+                field: "lockTimeout",
+              });
+            }
+            const lists = yield* getLists(queue.name);
+            expect(lists.wait).toEqual(["waiting"]);
+            expect(lists.active).toEqual([]);
+          }),
+      );
+
+      it.effect(
         "a failing task with a retry schedule lands on the scheduled list",
         () =>
           Effect.gen(function* () {
@@ -613,6 +692,309 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
             expect(lists.scheduled).toEqual(["s1"]);
             expect(lists.failed).toEqual([]);
           }),
+      );
+
+      it.effect("an infinite retry delay settles terminally", () =>
+        Effect.gen(function* () {
+          const definition = Task.make({
+            name: "tq-infinite-retry-delay",
+            payload: { id: Schema.String },
+            success: Schema.String,
+            error: Schema.Struct({ reason: Schema.String }),
+            idempotencyKey: ({ id }) => id,
+            retry: Schedule.spaced(Duration.infinity),
+            maxRetries: 1,
+          });
+          const queue = TaskQueue.make(definition.name, definition);
+          yield* TaskQueue.offer(
+            queue,
+            { id: "infinite" },
+            { onFailurePolicy: "mark-as-failure" },
+          );
+
+          yield* TaskQueue.complete(queue, () =>
+            Effect.fail({ reason: "terminal" }),
+          );
+
+          expect((yield* getLists(queue.name)).failed).toEqual(["infinite"]);
+        }),
+      );
+
+      it.effect(
+        "wait ignores retryable failures and observes final success",
+        () =>
+          Effect.gen(function* () {
+            const definition = Task.make({
+              name: "tq-wait-through-retry",
+              payload: { id: Schema.String },
+              success: Schema.String,
+              error: Schema.Struct({ reason: Schema.String }),
+              idempotencyKey: ({ id }) => id,
+              retry: Schedule.spaced("5 millis"),
+              maxRetries: 1,
+            });
+            const queue = TaskQueue.make(definition.name, definition);
+            const offered = yield* TaskQueue.offer(queue, { id: "retry" });
+            const waiter = yield* TaskQueue.wait(queue, offered.handle).pipe(
+              Effect.forkChild,
+            );
+
+            yield* Effect.yieldNow;
+            yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "transient" }),
+            );
+            yield* Effect.sleep("10 millis");
+            yield* TaskQueue.complete(queue, () => Effect.succeed("recovered"));
+
+            expect(yield* Fiber.join(waiter)).toBe("recovered");
+          }),
+      );
+
+      it.effect(
+        "retry-policy failures settle the attempt and remain typed",
+        () =>
+          Effect.gen(function* () {
+            const definition = Task.make({
+              name: "tq-retry-policy-failure",
+              payload: { id: Schema.String },
+              success: Schema.String,
+              error: Schema.Struct({ reason: Schema.String }),
+              idempotencyKey: ({ id }) => id,
+              retry: {
+                while: () => Effect.fail({ reason: "schedule-broken" }),
+              },
+            });
+            const queue = TaskQueue.make(definition.name, definition);
+            yield* TaskQueue.offer(
+              queue,
+              { id: "policy" },
+              { onFailurePolicy: "mark-as-failure" },
+            );
+
+            const error = yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "handler-failed" }),
+            ).pipe(Effect.flip);
+
+            expect(error).toMatchObject({
+              _tag: "RetryPolicyError",
+              queue: queue.name,
+              taskId: "policy",
+              cause: { reason: "schedule-broken" },
+            });
+            expect((yield* getLists(queue.name)).failed).toEqual(["policy"]);
+          }),
+      );
+
+      it.effect(
+        "retry-policy defects settle the attempt and remain typed",
+        () =>
+          Effect.gen(function* () {
+            const definition = Task.make({
+              name: "tq-retry-policy-defect",
+              payload: { id: Schema.String },
+              success: Schema.String,
+              error: Schema.Struct({ reason: Schema.String }),
+              idempotencyKey: ({ id }) => id,
+              retry: {
+                while: () => {
+                  throw new Error("schedule-defect");
+                },
+              },
+            });
+            const queue = TaskQueue.make(definition.name, definition);
+            yield* TaskQueue.offer(
+              queue,
+              { id: "policy" },
+              { onFailurePolicy: "mark-as-failure" },
+            );
+
+            const error = yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "handler-failed" }),
+            ).pipe(Effect.flip);
+
+            expect(error).toMatchObject({
+              _tag: "RetryPolicyError",
+              queue: queue.name,
+              taskId: "policy",
+              cause: new Error("schedule-defect"),
+            });
+            expect((yield* getLists(queue.name)).failed).toEqual(["policy"]);
+          }),
+      );
+
+      it.effect(
+        "interrupting retry-policy evaluation leaves the attempt recoverable",
+        () =>
+          Effect.gen(function* () {
+            const engine = yield* TaskEngine.TaskEngine;
+            const entered = yield* Deferred.make<void>();
+            const definition = Task.make({
+              name: "tq-retry-policy-interrupt",
+              payload: { id: Schema.String },
+              success: Schema.String,
+              error: Schema.Struct({ reason: Schema.String }),
+              idempotencyKey: ({ id }) => id,
+              retry: {
+                while: () =>
+                  Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Effect.never),
+                  ),
+              },
+            });
+            const queue = TaskQueue.make(definition.name, definition);
+            yield* TaskQueue.offer(
+              queue,
+              { id: "interrupted" },
+              { onFailurePolicy: "mark-as-failure" },
+            );
+
+            const fiber = yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "handler-failed" }),
+            ).pipe(Effect.forkChild);
+            yield* Deferred.await(entered);
+            yield* Fiber.interrupt(fiber);
+
+            const task = yield* engine.getTask(queue.name, "interrupted");
+            expect(task?.outcome).toBeUndefined();
+            expect(task?.errors).toEqual([]);
+            expect((yield* getLists(queue.name)).active).toEqual([
+              "interrupted",
+            ]);
+          }),
+      );
+
+      it.effect(
+        "truncated retry history settles instead of resetting the schedule",
+        () =>
+          Effect.gen(function* () {
+            const definition = Task.make({
+              name: "tq-truncated-retry-history",
+              payload: { id: Schema.String },
+              success: Schema.String,
+              error: Schema.Struct({ reason: Schema.String }),
+              storageLimits: { maxErrorEntries: 1 },
+              idempotencyKey: ({ id }) => id,
+              retry: Schedule.recurs(2),
+              maxRetries: 10,
+            });
+            const queue = TaskQueue.make(definition.name, definition);
+            yield* TaskQueue.offer(
+              queue,
+              { id: "truncated" },
+              { onFailurePolicy: "mark-as-failure" },
+            );
+
+            yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "first" }),
+            );
+            yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "second" }),
+            );
+            const error = yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "third" }),
+            ).pipe(Effect.flip);
+
+            expect(error).toMatchObject({
+              _tag: "RetryPolicyError",
+              queue: queue.name,
+              taskId: "truncated",
+            });
+            expect((yield* getLists(queue.name)).failed).toEqual(["truncated"]);
+          }),
+      );
+
+      it.effect(
+        "stalled history is not replayed into handler retry policy",
+        () =>
+          Effect.gen(function* () {
+            const engine = yield* TaskEngine.TaskEngine;
+            const redis = yield* RedisPool.RedisPool;
+            const seen: Array<{ readonly reason: string }> = [];
+            const definition = Task.make({
+              name: "tq-stall-retry-input",
+              payload: { id: Schema.String },
+              success: Schema.String,
+              error: Schema.Struct({ reason: Schema.String }),
+              idempotencyKey: ({ id }) => id,
+              retry: {
+                while: (error) => {
+                  seen.push(error);
+                  return false;
+                },
+              },
+            });
+            const queue = TaskQueue.make(definition.name, definition);
+            const now = 2_000_000_000_000;
+            yield* TaskEngine.setMockTime(now);
+            yield* TaskQueue.offer(
+              queue,
+              { id: "stalled" },
+              { onFailurePolicy: "mark-as-failure" },
+            );
+
+            const first = yield* engine.takeTask(queue.name, 100);
+            expect(first).not.toBeNull();
+            yield* redis.send("DEL", `~effectmq:v1:${queue.name}:lock:stalled`);
+            yield* TaskEngine.stepMockTime(101);
+            yield* engine.maintain(queue.name);
+
+            yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "handler" }),
+            );
+            expect(seen).toEqual([{ reason: "handler" }]);
+          }),
+      );
+
+      it.effect(
+        "terminal failures remain waitable with zero error history",
+        () =>
+          Effect.gen(function* () {
+            const definition = Task.make({
+              name: "tq-zero-error-history",
+              payload: { id: Schema.String },
+              success: Schema.String,
+              error: Schema.Struct({ reason: Schema.String }),
+              storageLimits: { maxErrorEntries: 0 },
+              idempotencyKey: ({ id }) => id,
+            });
+            const queue = TaskQueue.make(definition.name, definition);
+            const offered = yield* TaskQueue.offer(
+              queue,
+              { id: "failed" },
+              { onFailurePolicy: "mark-as-failure" },
+            );
+            yield* TaskQueue.complete(queue, () =>
+              Effect.fail({ reason: "terminal" }),
+            );
+
+            const error = yield* TaskQueue.wait(queue, offered.handle).pipe(
+              Effect.flip,
+            );
+            expect(error).toMatchObject({
+              _tag: "TaskFailed",
+              failure: { reason: "terminal" },
+            });
+          }),
+      );
+
+      it.effect("wait rejects a handle from another queue", () =>
+        Effect.gen(function* () {
+          const queue = makeQueue("tq-handle-owner");
+          const otherQueue = TaskQueue.make("tq-handle-other", queue.task);
+          const offered = yield* TaskQueue.offer(queue, {
+            userId: "owner",
+            amount: 1,
+          });
+
+          const error = yield* TaskQueue.wait(otherQueue, offered.handle).pipe(
+            Effect.flip,
+          );
+          expect(error).toMatchObject({
+            _tag: "TaskHandleMismatch",
+            expectedQueue: otherQueue.name,
+            actualQueue: queue.name,
+          });
+        }),
       );
 
       it.effect("maxRetries cap of 0 skips retries even with a schedule", () =>

@@ -1,5 +1,5 @@
 ---
-"@effectmq/core": major
+"@effectmq/core": patch
 ---
 
 Make public Effect contracts honest and restructure the package around focused

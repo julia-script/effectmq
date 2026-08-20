@@ -49,7 +49,11 @@ export const nextRunAt = Effect.fnUntraced(function* <R>(
       (value) => Effect.succeed([value, -1] as const),
     );
     if (delay === -1) return undefined;
-    time = error.timestamp.getTime() + Duration.toMillis(delay);
+    const delayMillis = Duration.toMillis(delay);
+    time = error.timestamp.getTime() + delayMillis;
+    if (!Number.isFinite(time) || Math.abs(time) > Number.MAX_SAFE_INTEGER) {
+      return undefined;
+    }
   }
   return time;
 });

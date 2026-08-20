@@ -25,20 +25,23 @@ page describes the intended entry points and their contracts.
 - `execute(queue, payload, options?)` is offer followed by handle-based wait.
 - `completeOne(queue, handler, processing?)` acquires and supervises at most one
   attempt, returning whether work was processed.
-- `complete(queue, handler, processing?)` processes one task and returns its id.
+- `complete(queue, handler)` processes one task and returns its id.
 - `stream(queue, options?)` decodes versioned lifecycle events from a cursor.
 
 Important offer options include `taskId`, `delay`, `maxRetries`, completion
 policies, `onDuplicate`, and
-`retainResultUntil: "current-task-settles"`. Processing options configure lease
-duration, heartbeat interval, and bounded heartbeat transport retry.
+`retainResultUntil: "current-task-settles"`. Numeric overrides are validated
+before Redis is mutated. Processing options configure lease duration,
+heartbeat interval, and bounded heartbeat transport retry.
 
 ## `Worker`
 
 - `make(queue, handler, options?)` describes a managed worker.
 - `run(worker)` runs scoped acquisition slots plus maintenance until
   interrupted. Options include concurrency, poll/maintenance intervals, drain
-  timeout, and processing supervision.
+  timeout, and processing supervision. Invalid concurrency, durations, or
+  processing settings fail with `WorkerConfigurationError` before any fibers
+  start.
 
 ## `Scheduler`
 

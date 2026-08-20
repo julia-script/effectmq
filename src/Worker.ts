@@ -27,7 +27,7 @@ const TypeId = "~effectmq/Worker" as const;
  * @since 0.3.0
  */
 export interface WorkerOptions {
-  /** Number of independent acquire/process loops. Defaults to `1`. */
+  /** Number of independent acquire/process loops (1-1000). Defaults to `1`. */
   readonly concurrency?: number;
   /** Delay after an empty acquisition. Defaults to one second. */
   readonly pollInterval?: Duration.Input;
@@ -114,19 +114,152 @@ export const make = <
 
 class WorkerSlotStopped extends Data.TaggedError("WorkerSlotStopped") {}
 
+/** Indicates that a worker option cannot produce a bounded runtime. */
+export class WorkerConfigurationError extends Data.TaggedError(
+  "WorkerConfigurationError",
+)<{
+  readonly field:
+    | keyof Omit<WorkerOptions, "processing">
+    | `processing.${keyof TaskQueue.ProcessingOptions}`;
+  readonly constraint: string;
+  readonly actual: unknown;
+}> {}
+
+interface ResolvedWorkerOptions {
+  readonly concurrency: number;
+  readonly pollInterval: number;
+  readonly maintenanceInterval: number;
+  readonly drainTimeout: number;
+  readonly processing: TaskQueue.ProcessingOptions;
+}
+
+const invalidWorkerOption = (
+  field: WorkerConfigurationError["field"],
+  constraint: string,
+  actual: unknown,
+) => new WorkerConfigurationError({ field, constraint, actual });
+
+const workerDuration = Effect.fnUntraced(function* (
+  field: WorkerConfigurationError["field"],
+  input: Duration.Input,
+  allowZero: boolean,
+  requireWholeMilliseconds = false,
+) {
+  const value = yield* Effect.try({
+    try: () => Duration.toMillis(input),
+    catch: () => invalidWorkerOption(field, "a valid finite duration", input),
+  });
+  if (
+    !Number.isFinite(value) ||
+    value < 0 ||
+    (!allowZero && value === 0) ||
+    (requireWholeMilliseconds && !Number.isSafeInteger(value))
+  ) {
+    return yield* invalidWorkerOption(
+      field,
+      requireWholeMilliseconds
+        ? "a positive safe-integer number of milliseconds"
+        : allowZero
+          ? "a finite non-negative duration"
+          : "a finite duration greater than zero",
+      input,
+    );
+  }
+  return value;
+});
+
+const resolveWorkerOptions = Effect.fnUntraced(function* (
+  options: WorkerOptions,
+): Effect.fn.Return<ResolvedWorkerOptions, WorkerConfigurationError> {
+  const concurrency = options.concurrency ?? 1;
+  if (
+    !Number.isSafeInteger(concurrency) ||
+    concurrency < 1 ||
+    concurrency > 1_000
+  ) {
+    return yield* invalidWorkerOption(
+      "concurrency",
+      "a safe integer between 1 and 1000",
+      concurrency,
+    );
+  }
+  const pollInterval = yield* workerDuration(
+    "pollInterval",
+    options.pollInterval ?? Duration.seconds(1),
+    false,
+  );
+  const maintenanceInterval = yield* workerDuration(
+    "maintenanceInterval",
+    options.maintenanceInterval ?? Duration.seconds(1),
+    false,
+  );
+  const drainTimeout = yield* workerDuration(
+    "drainTimeout",
+    options.drainTimeout ?? Duration.seconds(30),
+    true,
+  );
+  const processing = options.processing ?? {};
+  const lockTimeout = yield* workerDuration(
+    "processing.lockTimeout",
+    processing.lockTimeout ?? Duration.seconds(30),
+    false,
+    true,
+  );
+  const lockRefresh = yield* workerDuration(
+    "processing.lockRefresh",
+    processing.lockRefresh ?? Duration.seconds(10),
+    false,
+    true,
+  );
+  if (lockRefresh >= lockTimeout) {
+    return yield* invalidWorkerOption(
+      "processing.lockRefresh",
+      "a duration shorter than processing.lockTimeout",
+      processing.lockRefresh ?? Duration.seconds(10),
+    );
+  }
+  const heartbeatRetryDelay = yield* workerDuration(
+    "processing.heartbeatRetryDelay",
+    processing.heartbeatRetryDelay ?? Duration.millis(250),
+    false,
+  );
+  const heartbeatRetryCount = processing.heartbeatRetryCount ?? 3;
+  if (!Number.isSafeInteger(heartbeatRetryCount) || heartbeatRetryCount < 0) {
+    return yield* invalidWorkerOption(
+      "processing.heartbeatRetryCount",
+      "a non-negative safe integer",
+      heartbeatRetryCount,
+    );
+  }
+  return {
+    concurrency,
+    pollInterval,
+    maintenanceInterval,
+    drainTimeout,
+    processing: {
+      lockTimeout,
+      lockRefresh,
+      heartbeatRetryDelay,
+      heartbeatRetryCount,
+    },
+  };
+});
+
 /**
  * Runs a worker until interrupted.
  *
  * Independent acquisition fibers use the worker Redis role while a maintenance
  * fiber uses the maintenance role. Interruption stops new acquisitions, keeps
  * heartbeats alive while handlers drain, then interrupts any remainder after
- * `drainTimeout`.
+ * `drainTimeout`. Invalid concurrency, timing, or processing configuration fails with
+ * {@link WorkerConfigurationError} before any worker fibers start.
  *
  * **Gotchas**
  *
  * Queue handlers have at-least-once delivery and must make externally visible
  * effects idempotent. Attempt and maintenance failures are logged and the loops
- * continue, so this long-running Effect has `never` in its failure channel.
+ * continue. After configuration validation, operational failures are observed
+ * and the long-running worker does not fail.
  *
  * @category Operations
  * @since 0.3.0
@@ -142,7 +275,7 @@ export const run = Effect.fnUntraced(function* <
   worker: Worker<Payload, Success, Error, QueueR, QueueIdentityR, HandlerR>,
 ): Effect.fn.Return<
   never,
-  never,
+  WorkerConfigurationError,
   | RedisConnectionRoles
   | Crypto.Crypto
   | QueueR
@@ -152,6 +285,7 @@ export const run = Effect.fnUntraced(function* <
   | Error["EncodingServices"]
 > {
   yield* TaskInvariant.validate(worker.queue.task);
+  const options = yield* resolveWorkerOptions(worker.options);
   return yield* Effect.scoped(
     Effect.gen(function* () {
       const roles = yield* RedisConnectionRoles;
@@ -163,15 +297,8 @@ export const run = Effect.fnUntraced(function* <
       ).pipe(Effect.orDie);
       const accepting = yield* Ref.make(true);
       const slots = yield* FiberSet.make<void, never>();
-      const pollInterval = worker.options.pollInterval ?? Duration.seconds(1);
-      const maintenanceInterval =
-        worker.options.maintenanceInterval ?? Duration.seconds(1);
-      const drainTimeout = worker.options.drainTimeout ?? Duration.seconds(30);
-      const concurrency = Math.max(
-        1,
-        Math.floor(worker.options.concurrency ?? 1),
-      );
-
+      const { concurrency, drainTimeout, maintenanceInterval, pollInterval } =
+        options;
       // Registered after FiberSet.make, so this LIFO finalizer drains before
       // the set's own finalizer interrupts any remaining handlers.
       yield* Effect.addFinalizer(() =>
@@ -189,7 +316,7 @@ export const run = Effect.fnUntraced(function* <
         const processed = yield* TaskQueue.completeOne(
           worker.queue,
           worker.handler,
-          worker.options.processing,
+          options.processing,
         ).pipe(
           Effect.provideService(TaskEngine.TaskEngine, workerEngine),
           Effect.matchEffect({

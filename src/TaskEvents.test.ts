@@ -358,6 +358,49 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         }),
     );
 
+    it.effect("malformed built-in failures are schema-validated", () =>
+      Effect.gen(function* () {
+        const queue = makeQueue("ev-corrupt-built-in");
+        const engine = yield* TaskEngine.TaskEngine;
+        const redis = yield* RedisPool.RedisPool;
+        yield* TaskQueue.offer(queue, { userId: "corrupt", amount: 1 });
+        const cursor = (yield* engine.eventCursors(queue.name)).latest;
+        const packr = new Packr({ useRecords: false });
+
+        yield* redis.send(
+          "XADD",
+          `~effectmq:v1:${queue.name}:events`,
+          "*",
+          "taskId",
+          "corrupt",
+          "generation",
+          "1",
+          "protocolVersion",
+          "1",
+          "schemaId",
+          queue.task.schemaId,
+          "_tag",
+          "task.failed",
+          "policy",
+          "keep",
+          "error",
+          packr.pack({ _tag: "~effectmq/Error/Stalled" }),
+          "failureKind",
+          "stall",
+          "attempt",
+          "1",
+          "terminal",
+          "1",
+        );
+
+        const error = yield* TaskQueue.stream(queue, { cursor }).pipe(
+          Stream.runHead,
+          Effect.flip,
+        );
+        expect(error._tag).toBe("SchemaError");
+      }),
+    );
+
     it.effect(
       "execute offers and resolves with the handler's success value",
       () =>

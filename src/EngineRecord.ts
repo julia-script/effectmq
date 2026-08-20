@@ -38,16 +38,58 @@ export const TextFromBytes = Schema.Unknown.pipe(
   }),
 );
 
+const numberFromText = (integer: boolean) =>
+  SchemaGetter.transformOrFail((value: string, options) => {
+    const pattern = integer
+      ? /^-?(?:0|[1-9]\d*)$/
+      : /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+    const parsed = Number(value);
+    return pattern.test(value) &&
+      Number.isFinite(parsed) &&
+      Math.abs(parsed) <= Number.MAX_SAFE_INTEGER
+      ? Effect.succeed(parsed)
+      : Effect.fail(
+          new SchemaIssue.InvalidValue(
+            {
+              message: integer
+                ? "Expected a safe decimal integer"
+                : "Expected a safe decimal number",
+            },
+            value,
+            options,
+          ),
+        );
+  });
+
 export const NumberFromBytes = TextFromBytes.pipe(
-  Schema.decodeTo(Schema.Number, {
-    decode: SchemaGetter.transform(Number),
+  Schema.decodeTo(Schema.Finite, {
+    decode: numberFromText(false),
+    encode: SchemaGetter.transform(String),
+  }),
+);
+
+export const IntegerFromBytes = TextFromBytes.pipe(
+  Schema.decodeTo(Schema.Int, {
+    decode: numberFromText(true),
     encode: SchemaGetter.transform(String),
   }),
 );
 
 export const BooleanFromBytes = TextFromBytes.pipe(
   Schema.decodeTo(Schema.Boolean, {
-    decode: SchemaGetter.transform((value) => value === "1"),
+    decode: SchemaGetter.transformOrFail((value, options) =>
+      value === "1"
+        ? Effect.succeed(true)
+        : value === "0"
+          ? Effect.succeed(false)
+          : Effect.fail(
+              new SchemaIssue.InvalidValue(
+                { message: 'Expected Redis boolean "0" or "1"' },
+                value,
+                options,
+              ),
+            ),
+    ),
     encode: SchemaGetter.transform((value) => (value ? "1" : "0")),
   }),
 );
@@ -57,28 +99,28 @@ const msgpackListFromBytes = <S extends Schema.Top>(item: S) =>
 
 export const EngineTaskSchema = Schema.Struct({
   id: TextFromBytes,
-  protocolVersion: NumberFromBytes,
+  protocolVersion: IntegerFromBytes,
   schemaId: TextFromBytes,
-  generation: NumberFromBytes,
+  generation: IntegerFromBytes,
   name: TextFromBytes,
   delay: NumberFromBytes,
-  maxRetries: NumberFromBytes,
-  maxStalledCount: NumberFromBytes,
-  maxErrorEntries: NumberFromBytes,
-  maxRelationships: NumberFromBytes,
-  maxEventEntries: NumberFromBytes,
-  taskRecordRetentionMs: NumberFromBytes,
-  resultRetentionMs: NumberFromBytes,
-  terminalIndexRetentionMs: NumberFromBytes,
-  deadLetterRetentionMs: NumberFromBytes,
-  eventRetentionMs: NumberFromBytes,
-  attempt: NumberFromBytes,
-  handlerFailureCount: NumberFromBytes,
-  stalledAttemptCount: NumberFromBytes,
+  maxRetries: IntegerFromBytes,
+  maxStalledCount: IntegerFromBytes,
+  maxErrorEntries: IntegerFromBytes,
+  maxRelationships: IntegerFromBytes,
+  maxEventEntries: IntegerFromBytes,
+  taskRecordRetentionMs: IntegerFromBytes,
+  resultRetentionMs: IntegerFromBytes,
+  terminalIndexRetentionMs: IntegerFromBytes,
+  deadLetterRetentionMs: IntegerFromBytes,
+  eventRetentionMs: IntegerFromBytes,
+  attempt: IntegerFromBytes,
+  handlerFailureCount: IntegerFromBytes,
+  stalledAttemptCount: IntegerFromBytes,
   onSuccessPolicy: TextFromBytes.pipe(Schema.decodeTo(CompletionPolicySchema)),
   onFailurePolicy: TextFromBytes.pipe(Schema.decodeTo(CompletionPolicySchema)),
-  createdAt: NumberFromBytes.pipe(Schema.decodeTo(DateFromNumberSchema)),
-  updatedAt: NumberFromBytes.pipe(Schema.decodeTo(DateFromNumberSchema)),
+  createdAt: IntegerFromBytes.pipe(Schema.decodeTo(DateFromNumberSchema)),
+  updatedAt: IntegerFromBytes.pipe(Schema.decodeTo(DateFromNumberSchema)),
   payload: UnknownFromMsgpack,
   success: UnknownFromMsgpack.pipe(Schema.optional),
   errors: msgpackListFromBytes(
@@ -100,11 +142,11 @@ export const EngineTaskSchema = Schema.Struct({
 export type EngineTask = typeof EngineTaskSchema.Type;
 
 export const EngineTerminalResultSchema = Schema.Struct({
-  protocolVersion: NumberFromBytes,
+  protocolVersion: IntegerFromBytes,
   schemaId: TextFromBytes,
-  generation: NumberFromBytes,
+  generation: IntegerFromBytes,
   outcome: TextFromBytes.pipe(Schema.decodeTo(TaskOutcomeSchema)),
-  settledAt: NumberFromBytes,
+  settledAt: IntegerFromBytes,
   success: UnknownFromMsgpack.pipe(Schema.optional),
   failure: UnknownFromMsgpack.pipe(Schema.optional),
 });

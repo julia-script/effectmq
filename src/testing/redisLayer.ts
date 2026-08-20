@@ -78,20 +78,39 @@ export const redisContainerLayer = ({
         ? yield* localServerClient()
         : yield* containerClient(image);
 
+    const toArg = (arg: string | Uint8Array) =>
+      typeof arg === "string" || Buffer.isBuffer(arg) ? arg : Buffer.from(arg);
+
     const send = <A = unknown>(
       command: string,
-      ...args: ReadonlyArray<string>
+      ...args: ReadonlyArray<string | Uint8Array>
     ) =>
       Effect.tryPromise({
-        try: () => client.call(command, ...args) as Promise<A>,
+        try: () => client.call(command, ...args.map(toArg)) as Promise<A>,
         catch: (cause) => new Redis.RedisError({ cause }),
       });
 
+    // callBuffer returns bulk strings as Buffers, keeping msgpack bytes intact
+    const sendBinary = <A = unknown>(
+      command: string,
+      ...args: ReadonlyArray<string | Uint8Array>
+    ) =>
+      Effect.tryPromise({
+        try: () => client.callBuffer(command, ...args.map(toArg)) as Promise<A>,
+        catch: (cause) => new Redis.RedisError({ cause }),
+      });
+
+    const redisPool = yield* RedisPool.make(send, sendBinary);
+    const roles = RedisPool.makeConnectionRoles(
+      redisPool,
+      redisPool,
+      redisPool,
+    );
     const redis = yield* Redis.make({ send });
-    return Context.make(
-      RedisPool.RedisPool,
-      RedisPool.RedisPool.of({ send, eval: redis.eval }),
-    ).pipe(Context.add(Redis.Redis, redis));
+    return Context.make(RedisPool.RedisPool, redisPool).pipe(
+      Context.add(RedisPool.RedisConnectionRoles, roles),
+      Context.add(Redis.Redis, redis),
+    );
   }).pipe(Layer.effectContext);
 const taskEngineLayer = TaskEngine.layer({
   debugMode: true,
@@ -108,11 +127,18 @@ export const getLists = (prefix: string) =>
   Effect.gen(function* () {
     const taskEngine = yield* TaskEngine.TaskEngine;
     return {
-      wait: yield* taskEngine.getList(prefix, "wait"),
-      scheduled: yield* taskEngine.getList(prefix, "scheduled"),
-      active: yield* taskEngine.getList(prefix, "active"),
-      failed: yield* taskEngine.getList(prefix, "failed"),
-      success: yield* taskEngine.getList(prefix, "success"),
+      wait: (yield* taskEngine.listTasks(prefix, "wait", { limit: 1_000 }))
+        .items,
+      scheduled: (yield* taskEngine.listTasks(prefix, "scheduled", {
+        limit: 1_000,
+      })).items,
+      active: (yield* taskEngine.listTasks(prefix, "active", { limit: 1_000 }))
+        .items,
+      failed: (yield* taskEngine.listTasks(prefix, "failed", { limit: 1_000 }))
+        .items,
+      success: (yield* taskEngine.listTasks(prefix, "success", {
+        limit: 1_000,
+      })).items,
     };
   });
 

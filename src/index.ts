@@ -9,11 +9,13 @@
  */
 
 export * as NodeRedisPool from "./NodeRedisPool.js";
+export * as Observability from "./Observability.js";
 export * as RedisPool from "./RedisPool.js";
 export * as Scheduler from "./Scheduler.js";
+export * as StorageProtocol from "./StorageProtocol.js";
 export type { TaskDefinition } from "./Task.js";
 export * as Task from "./Task.js";
 export * as TaskEngine from "./TaskEngine.js";
-
 export type { TaskHandler } from "./TaskQueue.js";
 export * as TaskQueue from "./TaskQueue.js";
+export * as Worker from "./Worker.js";

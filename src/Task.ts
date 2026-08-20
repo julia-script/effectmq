@@ -6,12 +6,55 @@
  */
 import { type Effect, Schedule, Schema } from "effect";
 import type { AnyStructSchema } from "effect/unstable/workflow/Workflow";
+import { defaultStorageLimits, type StorageLimits } from "./StorageProtocol.js";
 import { buildFromOptions } from "./utils.js";
 
 const TypeId = "~effectmq/Task" as const;
 
 /** Default retry cap applied when `maxRetries` is not set, so an unbounded schedule can't loop forever. */
 const DEFAULT_MAX_RETRIES = 5;
+
+/** Finite retention windows, in milliseconds, for one task generation. */
+export interface RetentionPolicy {
+  readonly taskRecordMs: number;
+  readonly resultMs: number;
+  readonly terminalIndexMs: number;
+  readonly deadLetterMs: number;
+  readonly eventMs: number;
+}
+
+export const defaultRetentionPolicy: RetentionPolicy = {
+  taskRecordMs: 7 * 24 * 60 * 60 * 1000,
+  resultMs: 24 * 60 * 60 * 1000,
+  terminalIndexMs: 7 * 24 * 60 * 60 * 1000,
+  deadLetterMs: 30 * 24 * 60 * 60 * 1000,
+  eventMs: 7 * 24 * 60 * 60 * 1000,
+};
+
+const resolveRetention = (
+  retention: Partial<RetentionPolicy> | undefined,
+): RetentionPolicy => {
+  const resolved = { ...defaultRetentionPolicy, ...retention };
+  for (const [name, value] of Object.entries(resolved)) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(`${name} must be a non-negative safe integer`);
+    }
+  }
+  return resolved;
+};
+
+const resolveStorageLimits = (
+  limits: Partial<StorageLimits> | undefined,
+): StorageLimits => {
+  const resolved = { ...defaultStorageLimits, ...limits };
+  for (const [name, value] of Object.entries(resolved)) {
+    const minimum = name === "maxEventEntries" ? 1 : 0;
+    if (!Number.isSafeInteger(value) || value < minimum) {
+      throw new RangeError(`${name} must be a non-negative safe integer`);
+    }
+  }
+  return resolved;
+};
 
 /**
  * A decoded task as seen by a handler: the typed payload/success/error fields
@@ -32,6 +75,8 @@ export interface TaskDefinition<
   readonly [TypeId]: typeof TypeId;
 
   readonly name: string;
+  /** Stable identity of this payload/success/failure schema family. */
+  readonly schemaId: string;
   readonly payloadSchema: Payload;
   readonly successSchema: Success;
   readonly errorSchema: Error;
@@ -42,6 +87,8 @@ export interface TaskDefinition<
     R
   >;
   readonly maxRetries: number;
+  readonly storageLimits: StorageLimits;
+  readonly retention: RetentionPolicy;
 
   readonly idempotencyKey: (payload: Payload["Type"]) => string;
 }
@@ -67,10 +114,13 @@ const makeInternal = <
   R = never,
 >(config: {
   name: string;
+  schemaId?: string;
   success: Success;
   error: Error;
   payload: Payload;
   maxRetries?: number | null;
+  storageLimits?: Partial<StorageLimits>;
+  retention?: Partial<RetentionPolicy>;
   idempotencyKey?: (payload: ResolvePayload<Payload>["Type"]) => string;
   retrySchedule?: Schedule.Schedule<any, NoInfer<Error["Type"]>, any, R>;
 }): TaskDefinition<ResolvePayload<Payload>, Success, Error, R> => {
@@ -81,6 +131,7 @@ const makeInternal = <
   const self: TaskDefinition<ResolvePayload<Payload>, Success, Error, R> = {
     [TypeId]: TypeId,
     name: config.name,
+    schemaId: config.schemaId ?? config.name,
     payloadSchema: payloadSchema,
     successSchema: successSchema,
     errorSchema: errorSchema,
@@ -90,6 +141,8 @@ const makeInternal = <
       config.maxRetries === undefined
         ? DEFAULT_MAX_RETRIES
         : (config.maxRetries ?? Infinity),
+    storageLimits: resolveStorageLimits(config.storageLimits),
+    retention: resolveRetention(config.retention),
     idempotencyKey:
       config.idempotencyKey ?? (() => `${config.name}/${crypto.randomUUID()}`),
   };
@@ -120,10 +173,13 @@ export const make: {
     R3 = never,
   >(config: {
     name: string;
+    schemaId?: string;
     success: Success;
     error: Error;
     payload: Payload;
     maxRetries?: number | null;
+    storageLimits?: Partial<StorageLimits>;
+    retention?: Partial<RetentionPolicy>;
     idempotencyKey?: (payload: ResolvePayload<Payload>["Type"]) => string;
     retry?: {
       while?:
@@ -150,10 +206,13 @@ export const make: {
     Env = never,
   >(config: {
     name: string;
+    schemaId?: string;
     payload: Payload;
     success: Success;
     error: Error;
     maxRetries?: number | null;
+    storageLimits?: Partial<StorageLimits>;
+    retention?: Partial<RetentionPolicy>;
     idempotencyKey?: (payload: ResolvePayload<Payload>["Type"]) => string;
     retry: Schedule.Schedule<
       any,
@@ -164,18 +223,24 @@ export const make: {
   }): TaskDefinition<ResolvePayload<Payload>, Success, Error, Env>;
 } = (({
   name,
+  schemaId,
   payload,
   success,
   error,
   maxRetries,
+  storageLimits,
+  retention,
   idempotencyKey,
   retry,
 }: {
   name: string;
+  schemaId?: string;
   payload: AnyStructSchema | Schema.Struct.Fields;
   success: Schema.Top;
   error: Schema.Top;
   maxRetries?: number | null;
+  storageLimits?: Partial<StorageLimits>;
+  retention?: Partial<RetentionPolicy>;
   idempotencyKey?: (
     payload: ResolvePayload<AnyStructSchema | Schema.Struct.Fields>["Type"],
   ) => string;
@@ -190,10 +255,13 @@ export const make: {
     : undefined;
   return makeInternal({
     name,
+    schemaId,
     success,
     error,
     payload,
     maxRetries,
+    storageLimits,
+    retention,
     idempotencyKey,
     retrySchedule: schedule,
   });

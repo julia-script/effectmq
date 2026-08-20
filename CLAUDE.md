@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`@effectmq/core` — a Redis-backed task queue built on **Effect 4 beta** (pinned to `effect@4.0.0-beta.85`; it does not work with stable Effect 3.x). Typed payloads/results/errors via schemas, with retries, delays, idempotency, and cron schedules. Single package, pnpm, ESM (`"type": "module"`, `nodenext` resolution — internal imports use `.js` extensions).
+`@effectmq/core` — a Redis-backed task queue built on **Effect 4 beta** (pinned to `effect@4.0.0-beta.107`; it does not work with stable Effect 3.x). Typed payloads/results/errors via schemas, with retries, delays, idempotency, and cron schedules. Single package, pnpm, ESM (`"type": "module"`, `nodenext` resolution — internal imports use `.js` extensions).
 
 ## Commands
 
@@ -35,7 +35,7 @@ Changesets-based: run `pnpm changeset` to record a change; the release workflow 
 Flat `src/` with a strict layering, top to bottom:
 
 - **`TaskQueue.ts`** — the high-level API users live in: `make` (bind a queue name to a task definition), `offer` (enqueue), `complete` (take → run handler → report outcome, applying the task's retry schedule on failure), `stream` (typed lifecycle events), `wait` / `execute` (await a task's terminal result). Decodes engine tasks/events against the task's schemas.
-- **`Scheduler.ts`** — cron-driven recurring work. Uses the engine's `setSchedule`/`consumeSchedule` so multiple processes running the same named scheduler fire once per tick collectively.
+- **`Scheduler.ts`** — cron-driven durable task materialization. Competing processes idempotently offer the same tick task; managed workers execute it with at-least-once delivery.
 - **`Task.ts`** — `Task.make`: the schema-bearing task definition (payload/success/error schemas, `idempotencyKey` — which *is* the task id, so same key = same task — `retry` as an Effect `Schedule`, `maxRetries` default 5, `null` = unbounded).
 - **`TaskEngine.ts`** (the big one, ~1000 lines) — the low-level `Context.Service` implementing queue primitives as **atomic Lua scripts** (inline `/*lua*/` strings, built by `buildScripts`): create/take/writeSuccess/writeError, lock extend/remove, delayed + cron schedule state. Tasks move between Redis lists: `wait`, `scheduled`, `active`, `failed`, `success`. Every state change publishes to a per-queue Redis Stream (`<prefix>:<name>:events`, via `XADD`); `stream` polls it with `XREAD` (default 1s). Consumers rarely call the engine directly — go through `TaskQueue`/`Scheduler`.
 - **`RedisPool.ts`** — the minimal service the engine depends on: just `send` + `eval`. Any Redis client can implement it.
@@ -48,9 +48,9 @@ The library deliberately has **no built-in concurrency/rate limiting** — one `
 
 ## Conventions
 
-- **Effect 4 beta idioms**: `Context.Service` classes for services, `Schema.TaggedErrorClass` for errors, `Effect.fnUntraced` for functions, `Data.TaggedError` for engine errors, imports from `effect/unstable/*` where needed (e.g. `effect/unstable/persistence/Redis`). Match these when adding code.
+- **Effect 4 beta idioms**: `Context.Service` classes for services, `Schema.TaggedError` for schema-backed errors, `Effect.fnUntraced` for functions, `Data.TaggedError` for engine errors, imports from `effect/unstable/*` where needed (e.g. `effect/unstable/persistence/Redis`). Match these when adding code.
 - Type IDs are string constants like `"~effectmq/TaskEngine"`; built-in error tags use the `~effectmq/Error/...` namespace.
-- `effect` is a **peerDependency** (`>=4.0.0-beta.85`) and devDependency, never a hard dependency. The only runtime dependency is `redis`.
+- `effect` is a **peerDependency** (`>=4.0.0-beta.107`) and devDependency, never a hard dependency. Direct `@effect/*` development dependencies use the same beta baseline. The only runtime dependencies are `msgpackr` and `redis`.
 - Public API (everything re-exported from `src/index.ts` as namespace exports) carries TSDoc, including `@module` headers per file. Keep new exports documented.
 - Formatting/linting is Biome (2-space indent); config in `biome.json`.
 

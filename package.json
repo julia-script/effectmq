@@ -1,9 +1,23 @@
 {
   "name": "@effectmq/core",
-  "version": "0.2.0",
+  "version": "0.3.0-rc.0",
   "description": "Effect-based message queue",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/julia-script/effectmq"
+  },
+  "homepage": "https://github.com/julia-script/effectmq#readme",
+  "bugs": {
+    "url": "https://github.com/julia-script/effectmq/issues"
+  },
   "type": "module",
+  "bin": {
+    "effectmq-storage-inspect": "./dist/cli/inspect-pre-release-data.js"
+  },
   "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=20.19"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -21,6 +35,10 @@
       "types": "./dist/Scheduler.d.ts",
       "default": "./dist/Scheduler.js"
     },
+    "./StorageProtocol": {
+      "types": "./dist/StorageProtocol.d.ts",
+      "default": "./dist/StorageProtocol.js"
+    },
     "./Task": {
       "types": "./dist/Task.d.ts",
       "default": "./dist/Task.js"
@@ -32,35 +50,57 @@
     "./TaskQueue": {
       "types": "./dist/TaskQueue.d.ts",
       "default": "./dist/TaskQueue.js"
+    },
+    "./Worker": {
+      "types": "./dist/Worker.d.ts",
+      "default": "./dist/Worker.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src/lua/*.lua"
   ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm clean && pnpm gen:lua && tsc -p tsconfig.json",
     "clean": "rm -rf dist",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "lint": "turbo run lint",
+    "test": "pnpm gen:lua && vitest run",
+    "test:fault": "EFFECTMQ_TEST_REDIS=local EFFECTMQ_TEST_SENTINEL=local vitest run src/testing/FaultInjection.test.ts src/RedisRestart.test.ts src/RedisSentinel.test.ts",
+    "test:watch": "pnpm gen:lua && vitest",
+    "typecheck": "tsc --noEmit",
+    "format:check": "biome format .",
+    "lint": "biome lint .",
+    "check:lua": "tsx scripts/check-lua.ts",
+    "check:docs": "tsx scripts/check-docs.ts",
+    "check:release": "tsx scripts/check-release.ts",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm check:lua && pnpm check:docs && pnpm check:release",
     "lint:fix": "pnpm biome check --write --unsafe",
     "changeset": "changeset",
     "version:packages": "changeset version",
-    "release": "pnpm build && changeset publish"
+    "release": "pnpm build && changeset publish",
+    "gen:lua": "tsx scripts/gen-lua.ts",
+    "storage:inspect": "tsx src/cli/inspect-pre-release-data.ts",
+    "bench:maintenance": "tsx scripts/benchmark-maintenance.ts",
+    "soak": "tsx scripts/soak.ts",
+    "rehearse:rollback": "tsx scripts/rehearse-rollback.ts",
+    "verify:package": "pnpm build && tsx scripts/verify-package.ts"
   },
   "keywords": [],
   "author": "",
   "license": "MIT",
   "peerDependencies": {
-    "effect": ">=4.0.0-beta.85"
+    "effect": ">=4.0.0-beta.107"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.1",
     "@changesets/cli": "^2.31.0",
-    "@effect/platform-node": "4.0.0-beta.85",
+    "@effect/platform-node": "4.0.0-beta.107",
     "@testcontainers/redis": "^12.0.3",
     "@types/node": "^22.0.0",
-    "effect": "4.0.0-beta.85",
+    "effect": "4.0.0-beta.107",
     "ioredis": "^5.11.1",
     "testcontainers": "^12.0.3",
     "tsx": "^4.22.4",
@@ -68,6 +108,7 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
+    "msgpackr": "^2.0.4",
     "redis": "^6.1.0"
   }
 }

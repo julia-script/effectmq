@@ -3,7 +3,7 @@
 It's a task queue built on [Effect](https://effect.website): typed payloads, typed results, typed errors, all the way down. You describe a unit of work as a schema, hand it to a queue, and process it with a handler that is just an `Effect`. Retries, delays, idempotency, cron schedules: handled. The available engine is backed by Redis, but, like many things in Effect, it can be swapped for a different implementation.
 
 ```bash
-pnpm add @effectmq/core effect@4.0.0-beta.85 @effect/platform-node@4.0.0-beta.85
+pnpm add @effectmq/core effect@4.0.0-beta.107 @effect/platform-node@4.0.0-beta.107
 ```
 
 This library is built on the Effect 4 beta and doesn't work with the current stable Effect release. The examples below use the bundled `NodeRedisPool` layer, a connection-pooled Redis client that ships with the package (`@effect/platform-node` is only needed for `NodeRuntime`). This is beta-era software riding beta-era Effect; pin accordingly.
@@ -60,7 +60,9 @@ const AppLayer = Layer.provideMerge(
 );
 ```
 
-`NodeRedisPool.layer()` accepts node-redis client options and connects lazily on first command. It's the convenient default, but anything that provides the `RedisPool` service works — it's just `send` + `eval`, so you can back it with your own client (ioredis, an in-memory fake for tests) or a Redis-compatible server (Valkey, Dragonfly, and friends).
+`NodeRedisPool.layer()` accepts node-redis client options and establishes separate producer, worker, and maintenance pools when the Layer starts. It supports standalone Redis and Sentinel; Redis Cluster fails startup because queue transitions use multi-key atomic scripts. See the [operations runbook](./docs/operations.md) for TLS, ACL, bounded-pool, persistence, failover, health, and shutdown guidance. Anything that provides the `RedisPool` service can still be used as a custom integration.
+
+The tested platform matrix is in the [support policy](./docs/support-policy.md), and reproducible throughput/tail-latency results are published as [performance evidence](./docs/performance.md).
 
 `TaskEngine` is the machinery underneath: atomic Lua scripts, locks, the lists tasks move between. Provide its layer and forget it; the API you live in is `TaskQueue` and `Scheduler`.
 
@@ -171,10 +173,10 @@ const messageId = yield* TaskQueue.execute(emails, {
 
 // Or await a task you already offered.
 const task = yield* TaskQueue.offer(emails, payload);
-const result = yield* TaskQueue.wait(emails, task.id);
+const result = yield* TaskQueue.wait(emails, task.handle);
 ```
 
-`execute` opens the stream *before* offering, so even a handler that finishes near-instantly won't slip its terminal event past you. Streams poll Redis (default every second); pass a cursor to resume from a known event id.
+`wait` reads durable state, subscribes from the handle's authoritative Redis cursor, and rechecks state after subscription, so completion before or during subscription is observed. Streams poll Redis (default every second); persist a retained cursor when building a resumable event consumer.
 
 ---
 
@@ -202,7 +204,7 @@ const worker = Effect.gen(function* () {
 });
 ```
 
-Want a rate limit instead of a raw permit count? Compose one from a `Semaphore` and a `Schedule`. Want retries with jitter? `Schedule`. Want to fan out across a cluster? Run more processes. None of it is our invention, all of it composes. The queue's job is to hand you the next task, exactly once, safely. What you do with your fibers is your business.
+Want a rate limit instead of a raw permit count? Compose one from a `Semaphore` and a `Schedule`. Want retries with jitter? `Schedule`. Want to fan out? Run more worker processes. None of it is our invention, all of it composes. The queue's job is to preserve eligible work and fence the current attempt; handlers remain at-least-once and must make external side effects idempotent.
 
 ---
 
@@ -216,7 +218,7 @@ That power has a price that sometimes isn't worth paying. Sometimes you don't ha
 
 So:
 
-> If **Workflow is Temporal** (durable, replayable, cluster-coordinated orchestration) then **this is BullMQ**: a queue. You put work in, workers take it out, it runs once, retries if it must, and then it's done. No replay log, no shard map, no requirement that the whole cluster be breathing. Just a queue, with Effect's types and Effect's primitives.
+> If **Workflow is Temporal** (durable, replayable, cluster-coordinated orchestration) then **this is BullMQ**: a queue. You put work in, workers take attempts, and Redis keeps unfinished work recoverable across retries and worker loss. No workflow replay log or shard map—just a queue with Effect's types and primitives.
 
 Pick durable execution when the *process* is the thing you can't afford to lose. Pick a queue when the *work* is.
 
@@ -224,20 +226,33 @@ Pick durable execution when the *process* is the thing you can't afford to lose.
 
 ## Scheduling
 
-For recurring work, `Scheduler.make` runs a handler on a cron expression. If you've used Effect's [`ClusterCron`](https://effect.website) (`effect/unstable/cluster/ClusterCron`), it'll feel familiar. The schedule state lives in the engine, so multiple processes running the same named scheduler will collectively fire the handler once per tick, not once per process.
+For recurring work, `Scheduler.make` durably materializes an ordinary queue
+task for each selected cron tick. The task id is derived from the schedule name
+and nominal tick time, so competing schedulers and crash recovery can safely
+re-offer it. A managed worker executes the task with the queue's normal leases,
+retries, and **at-least-once** delivery semantics.
 
 ```ts
-import { Cron } from "effect";
-import { Scheduler } from "@effectmq/core";
+import { Cron, Schema } from "effect";
+import { Scheduler, Task, TaskQueue, Worker } from "@effectmq/core";
 
-const nightlyReport = Scheduler.make({
+const reportTask = Task.make({
+  name: "nightly-report-task",
+  payload: { scheduledAt: Schema.String },
+  success: Schema.Void,
+  error: Schema.String,
+});
+const reportQueue = TaskQueue.make("nightly-reports", reportTask);
+
+const nightlyReportSchedule = Scheduler.make({
   name: "nightly-report",
-  cron: Cron.parseUnsafe("0 2 * * *"), // 02:00 every day
-  handler: Effect.gen(function* () {
-    yield* buildAndSendReport();
-  }),
+  cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
+  queue: reportQueue,
+  payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
+  missed: { _tag: "coalesce" },
 });
 
+const nightlyReportWorker = Worker.make(reportQueue, () => buildAndSendReport());
 ```
 
 ---
@@ -246,9 +261,25 @@ const nightlyReport = Scheduler.make({
 
 - **Completion policies.** `offer` accepts `onSuccessPolicy` and `onFailurePolicy`, each one of `delete` | `keep` | `mark-as-success` | `mark-as-failure`. They decide where a finished task lands: gone, quietly retained, or parked on the success/failed list for inspection. Defaults are `delete`.
 - **Retries.** Declare `retry` on the task definition (`Task.make`) as an Effect `Schedule` — or a `{ while, until, times, schedule }` options object. On failure the next run time is computed from the schedule and the task lands on the scheduled list until then; when the schedule is exhausted, the failure policy applies. `maxRetries` caps the attempts so an unbounded schedule (e.g. `Schedule.forever`) can't loop forever: it defaults to `5`, is overridable per-`offer` (the per-offer value wins), and set it to `null` for truly unbounded retries. A `Canceled` error skips remaining retries.
-- **Idempotency.** The `idempotencyKey` is the task id. Same key, same task: offering again updates rather than duplicates.
+- **Idempotency.** The `idempotencyKey` is the task id. By default, offering the same key returns the existing generation unchanged; replacement requires explicit new-generation mode.
 - **Delays.** `offer(..., { delay })` schedules the task for the future; it sits on the scheduled list until its time comes.
 - **The engine.** `TaskEngine` is the low-level, Lua-backed layer all of this sits on. You provide its layer; you rarely call it directly.
+
+## Production guides
+
+- [API reference](./docs/api-reference.md)
+- [Delivery guarantees](./docs/delivery-guarantees.md)
+- [Idempotent offers](./docs/idempotent-offers.md)
+- [Task relationships](./docs/task-relationships.md)
+- [Durable scheduling](./docs/scheduler.md)
+- [Storage protocol v1](./docs/storage-protocol-v1.md)
+- [Operations](./docs/operations.md)
+- [Support policy](./docs/support-policy.md)
+- [Upgrade and rollback](./docs/upgrade-and-rollback.md)
+- [Performance evidence](./docs/performance.md)
+- [Soak evidence](./docs/soak.md)
+- [Release process](./docs/releasing.md)
+- [Current release record](./docs/release-readiness.md)
 
 ---
 

@@ -1,0 +1,12 @@
+{
+  "mode": "pre",
+  "tag": "rc",
+  "initialVersions": {
+    "@effectmq/core": "0.2.0"
+  },
+  "changesets": [
+    "production-ready-core",
+    "spotty-months-tan",
+    "tough-lions-repair"
+  ]
+}

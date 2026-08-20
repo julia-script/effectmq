@@ -1,9 +1,10 @@
 /**
  * The low-level task engine: a Redis-backed service implementing the queue
  * primitives (create/take/complete/fail, locking, delayed and cron schedules,
- * and a per-queue event stream) as atomic Lua scripts. Most consumers should
- * use the higher-level `TaskQueue`/`Scheduler` APIs rather than calling the
- * engine directly.
+ * and a per-queue event stream) as an atomic Lua script (see
+ * `src/lua/taskEngine.lua`, loaded by content and invoked via `EVALSHA`).
+ * Most consumers should use the higher-level `TaskQueue`/`Scheduler` APIs
+ * rather than calling the engine directly.
  *
  * @module
  */
@@ -12,26 +13,33 @@ import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import * as Redis from "effect/unstable/persistence/Redis";
-import { RedisPool } from "./RedisPool.js";
+import taskEngineScript from "./lua/taskEngine.js";
+import * as Observability from "./Observability.js";
+import { RedisPool, type RedisPoolService } from "./RedisPool.js";
 import {
   type EngineTask,
-  EngineTaskFromRedisEntriesSchema,
   type EngineTaskInsert,
+  EngineTaskSchema,
+  type EngineTerminalResult,
+  EngineTerminalResultSchema,
   type Event,
-  IncomingRedisEventSchema,
+  EventSchema,
+  UnknownFromMsgpack,
 } from "./Schemas.js";
 
 const TypeId = "~effectmq/TaskEngine" as const;
 
-type TaskEngineConfig = {
+export type TaskEngineConfig = {
   debugMode?: boolean;
   prefix?: string;
-  workerId?: string;
+  maintenanceBatchSize?: number;
 };
+/** Largest supported number of records processed by one atomic maintenance call. */
+export const maxMaintenanceBatchSize = 1_000;
 export class TaskEngineError extends Data.TaggedError("TaskEngineError")<{
   readonly message?: string;
   readonly cause: unknown;
@@ -40,6 +48,66 @@ export class TaskEngineError extends Data.TaggedError("TaskEngineError")<{
     return (cause: unknown) => new TaskEngineError({ cause, message });
   }
 }
+
+export interface TaskCreateResult {
+  readonly status: "created" | "existing";
+  readonly cursor: string;
+  readonly task: EngineTask;
+}
+
+/** One acquired execution attempt and its opaque ownership credential. */
+export interface TaskAttempt {
+  readonly task: EngineTask;
+  readonly leaseToken: string;
+}
+
+export class LeaseLost extends Data.TaggedError("LeaseLost")<{
+  readonly prefix: string;
+  readonly taskId: string;
+  readonly cause: TaskEngineError;
+}> {}
+
+export interface EventCursors {
+  readonly first: string;
+  readonly earliest: string;
+  readonly latest: string;
+}
+
+export type TaskList = "wait" | "scheduled" | "active" | "failed" | "success";
+
+export interface TaskListPage {
+  /** Task ids in FIFO order for `wait`, otherwise ascending score then id. */
+  readonly items: readonly string[];
+  /** Opaque cursor for the next page; absent when this page is final. */
+  readonly nextCursor?: string;
+}
+
+export class CursorExpired extends Data.TaggedError("CursorExpired")<{
+  readonly requested: string;
+  readonly earliest: string;
+}> {}
+
+const causeText = (cause: unknown, depth = 0): string => {
+  if (depth >= 6) return String(cause);
+  if (typeof cause !== "object" || cause === null) return String(cause);
+
+  const parts = [String(cause)];
+  if ("message" in cause) parts.push(String(cause.message));
+  if ("cause" in cause) parts.push(causeText(cause.cause, depth + 1));
+  return parts.join(" ");
+};
+
+const isLeaseLost = (error: TaskEngineError) =>
+  causeText(error.cause).includes("LEASE_LOST");
+
+const compareStreamIds = (left: string, right: string): number => {
+  const [leftTime = "0", leftSequence = "0"] = left.split("-");
+  const [rightTime = "0", rightSequence = "0"] = right.split("-");
+  const timeDifference = BigInt(leftTime) - BigInt(rightTime);
+  if (timeDifference !== 0n) return timeDifference < 0n ? -1 : 1;
+  const sequenceDifference = BigInt(leftSequence) - BigInt(rightSequence);
+  return sequenceDifference === 0n ? 0 : sequenceDifference < 0n ? -1 : 1;
+};
 
 /**
  * The task engine service. Provides the atomic queue operations (create, take,
@@ -53,40 +121,69 @@ export class TaskEngine extends Context.Service<
     readonly createTask: (
       task: EngineTaskInsert,
     ) => Effect.Effect<EngineTask, TaskEngineError>;
+    readonly offerTask: (
+      task: EngineTaskInsert,
+    ) => Effect.Effect<TaskCreateResult, TaskEngineError>;
     readonly getTask: (
       prefix: string,
       id: string,
     ) => Effect.Effect<EngineTask | null, TaskEngineError>;
-    readonly getList: (
+    readonly getGeneration: (
       prefix: string,
-      list: "wait" | "scheduled" | "active" | "failed" | "success",
-    ) => Effect.Effect<string[], TaskEngineError>;
+      id: string,
+    ) => Effect.Effect<number, TaskEngineError>;
+    readonly getResult: (
+      prefix: string,
+      id: string,
+      generation: number,
+    ) => Effect.Effect<EngineTerminalResult | null, TaskEngineError>;
+    readonly listTasks: (
+      prefix: string,
+      list: TaskList,
+      options?: { readonly cursor?: string; readonly limit?: number },
+    ) => Effect.Effect<TaskListPage, TaskEngineError>;
+    /** Run one bounded maintenance sweep for a queue. */
+    readonly maintain: (
+      prefix: string,
+    ) => Effect.Effect<Observability.QueueHealth, TaskEngineError>;
+    readonly eventCursors: (
+      prefix: string,
+    ) => Effect.Effect<EventCursors, TaskEngineError>;
 
     readonly writeSuccess: (
       prefix: string,
       id: string,
+      leaseToken: string,
       result: unknown,
-    ) => Effect.Effect<void, TaskEngineError>;
+    ) => Effect.Effect<void, TaskEngineError | LeaseLost>;
     readonly writeError: (
       prefix: string,
       id: string,
+      leaseToken: string,
       error: unknown,
       retryAt?: Duration.Input,
-    ) => Effect.Effect<void, TaskEngineError>;
+    ) => Effect.Effect<void, TaskEngineError | LeaseLost>;
     readonly extendLock: (
       prefix: string,
       id: string,
+      leaseToken: string,
       lockTimeout: number,
-    ) => Effect.Effect<void, TaskEngineError>;
+    ) => Effect.Effect<void, TaskEngineError | LeaseLost>;
     readonly removeLock: (
       prefix: string,
       id: string,
-    ) => Effect.Effect<void, TaskEngineError>;
+      leaseToken: string,
+    ) => Effect.Effect<void, TaskEngineError | LeaseLost>;
     readonly takeTask: (
       prefix: string,
       lockTimeout: number,
-    ) => Effect.Effect<EngineTask | null, TaskEngineError>;
+    ) => Effect.Effect<TaskAttempt | null, TaskEngineError>;
     readonly removeTask: (
+      prefix: string,
+      id: string,
+    ) => Effect.Effect<void, TaskEngineError>;
+    /** Administratively remove a generation even while results are retained. */
+    readonly forceRemoveTask: (
       prefix: string,
       id: string,
     ) => Effect.Effect<void, TaskEngineError>;
@@ -103,9 +200,9 @@ export class TaskEngine extends Context.Service<
     /**
      * Stream lifecycle events for a queue, read from its Redis Stream
      * (`<prefix>:<name>:events`) via `XREAD`. Starts from `cursor` (defaulting
-     * to now) and polls every `pollInterval` (default 1s), advancing the cursor
-     * past each yielded event. Events are raw {@link Event}s; `TaskQueue.stream`
-     * decodes their payloads against the queue's schemas.
+     * to now) and advances the cursor past each yielded event. Events are raw
+     * {@link Event}s; `TaskQueue.stream` decodes their payloads against the
+     * queue's schemas.
      */
     readonly stream: (
       name: string,
@@ -113,314 +210,16 @@ export class TaskEngine extends Context.Service<
         cursor?: string;
         pollInterval?: Duration.Duration;
       },
-    ) => Stream.Stream<Event, TaskEngineError | Schema.SchemaError>;
+    ) => Stream.Stream<
+      Event,
+      TaskEngineError | CursorExpired | Schema.SchemaError
+    >;
   }
 >()("TaskEngine") {}
 
-const importMap = {
-  scheduleHash: /*lua*/ `local function scheduleHash(prefix, name) return prefix .. ":schedule:" .. name end`,
-  taskHash: /*lua*/ `local function taskHash(prefix, id) return prefix .. ":task:" .. id end`,
-  delayedList: /*lua*/ `local function delayedList(prefix) return prefix .. ":scheduled" end`,
-  waitList: /*lua*/ `local function waitList(prefix) return prefix .. ":wait" end`,
-  successList: /*lua*/ `local function successList(prefix) return prefix .. ":success" end`,
-  failedList: /*lua*/ `local function failedList(prefix) return prefix .. ":failed" end`,
-  activeList: /*lua*/ `local function activeList(prefix) return prefix .. ":active" end`,
-  eventStream: /*lua*/ `local function eventStream(prefix) return prefix .. ":events" end`,
-  lockHash: /*lua*/ `local function lockHash(prefix, id) return prefix .. ":lock:" .. id end`,
-
-  removeFromFailedList: /*lua*/ `local function removeFromFailedList(prefix, id) return redis.call("ZREM", failedList(prefix), id) end`,
-  removeFromSuccessList: /*lua*/ `local function removeFromSuccessList(prefix, id) return redis.call("ZREM", successList(prefix), id) end`,
-  removeFromWaitList: /*lua*/ `local function removeFromWaitList(prefix, id) return redis.call("LREM", waitList(prefix), 0, id) end`,
-  removeFromDelayedList: /*lua*/ `local function removeFromDelayedList(prefix, id) return redis.call("ZREM", delayedList(prefix), id) end`,
-  removeFromActiveLists: /*lua*/ `local function removeFromActiveLists(prefix, id) return redis.call("ZREM", activeList(prefix), id) end`,
-
-  publishEvent: /*lua*/ `local function publishEvent(prefix, id, eventType, payload) return redis.call("XADD", eventStream(prefix), "*", "taskId", id, "_tag", eventType, "payload", cjson.encode(payload)) end`,
-  indexOf: /*lua*/ `local function indexOf(list, id) 
-    if list == "wait" then
-      return redis.call("LPOS", list, id)
-    end
-    return redis.call("ZRANK", list, id) 
-  end
-  `,
-  findTaskList: /*lua*/ `local function findTaskList(prefix, id)
-    if indexOf(waitList(prefix), id) ~= nil then
-      return "wait"
-    end
-    if indexOf(delayedList(prefix), id) ~= nil then
-      return "scheduled"
-    end
-    if indexOf(activeList(prefix), id) ~= nil then
-      return "active"
-    end
-    if indexOf(failedList(prefix), id) ~= nil then
-      return "failed"
-    end
-    if indexOf(successList(prefix), id) ~= nil then
-      return "success"
-    end
-    return nil
-  end
-  `,
-  getListSize: /*lua*/ `local function getListSize(list) 
-  if list == "wait" then
-    return redis.call("LLEN", list)
-  end
-  if list == "scheduled" then
-    return redis.call("ZCARD", list)
-  end
-  if list == "active" then
-    return redis.call("ZCARD", list)
-  end
-  if list == "failed" then
-    return redis.call("ZCARD", list)
-  end
-  if list == "success" then
-    return redis.call("ZCARD", list)
-  end
-  return 0
-  end`,
-  removeFromCurrentLists: /*lua*/ `local function removeFromCurrentLists(prefix, id) 
-     if removeFromWaitList(prefix, id) > 0 then
-      return "wait"
-    end
-    if removeFromDelayedList(prefix, id) > 0 then
-      return "scheduled"
-    end
-    if removeFromActiveLists(prefix, id)  > 0 then
-      return "active"
-    end
-    if removeFromFailedList(prefix, id) > 0 then
-      return "failed"
-    end
-    if removeFromSuccessList(prefix, id) > 0 then
-      return "success"
-    end
-    return nil
-  end`,
-
-  addToActiveLists: /*lua*/ `local function addToActiveLists(prefix, id)
-    return redis.call("ZADD", activeList(prefix), now, id)
-  end`,
-  addToWaitList: /*lua*/ `local function addToWaitList(prefix, id)
-    return redis.call("RPUSH", waitList(prefix), id)
-  end`,
-  addToDelayedList: /*lua*/ `local function addToDelayedList(prefix, id, readyAt)
-    return redis.call("ZADD", delayedList(prefix), readyAt, id)
-  end`,
-  addToSuccessList: /*lua*/ `local function addToSuccessList(prefix, id)
-    return redis.call("ZADD", successList(prefix), now, id)
-  end`,
-  addToFailedList: /*lua*/ `local function addToFailedList(prefix, id)
-    return redis.call("ZADD", failedList(prefix), now, id)
-  end`,
-
-  // the add* helpers no longer clear other lists; moveToList is the single entry
-  // point that removes from the current list, adds to the target, and emits task.moved
-  moveToList: /*lua*/ `local function moveToList(prefix, id, list, readyAt)
-    local currentList = removeFromCurrentLists(prefix, id)
-    if currentList == list then
-      return
-    end
-    if list == "wait" then
-      addToWaitList(prefix, id)
-    elseif list == "scheduled" then
-      addToDelayedList(prefix, id, readyAt)
-    elseif list == "active" then
-      addToActiveLists(prefix, id)
-    elseif list == "failed" then
-      addToFailedList(prefix, id)
-    elseif list == "success" then
-      addToSuccessList(prefix, id)
-    end
-
-    publishEvent(prefix, id, "task.moved", { from = currentList, to = list })
-  end`,
-  deleteTask: /*lua*/ `local function deleteTask(prefix, id) 
-    moveToList(prefix, id, nil)
-    return redis.call("DEL", taskHash(prefix, id)) 
-  end`,
-  popWaitList: /*lua*/ `local function popWaitList(prefix) return redis.call("LINDEX", waitList(prefix), 0) end`,
-
-  getActiveList: /*lua*/ `local function getActiveList(prefix) return redis.call("ZRANGE", activeList(prefix), 0, -1) end`,
-
-  getTask: /*lua*/ `local function getTask(prefix, id) 
-   local fields = redis.call("HGETALL", taskHash(prefix, id))
-   if #fields > 0 then
-    return {"id", id,  unpack(fields) }
-   end
-   return nil
-  end`,
-  getTaskField: /*lua*/ `local function getTaskField(prefix, id, field) return redis.call("HGET", taskHash(prefix, id), field) end`,
-  getTaskErrors: /*lua*/ `local function getTaskErrors(prefix, id) 
-    return cjson.decode(redis.call("HGET", taskHash(prefix, id), "errors")) 
-  end`,
-  setTask: /*lua*/ `local function setTask(prefix, id, ...) return redis.call("HSET", taskHash(prefix, id), "updatedAt", now, ...) end`,
-  setTaskErrors: /*lua*/ `local function setTaskErrors(prefix, id, errors) return setTask(prefix, id, "errors", cjson.encode(errors)) end`,
-  appendTaskError: /*lua*/ `local function appendTaskError(prefix, id, error, retryAt) 
-		local errorsList = getTaskErrors(prefix, id)
-		errorsList[#errorsList + 1] = {error = error, timestamp = now, retryAt = retryAt}
-		setTaskErrors(prefix, id, errorsList)
-		return errorsList
-	end`,
-
-  exists: /*lua*/ `local function exists(key) return redis.call("EXISTS", key) end`,
-  lockTask: /*lua*/ `local function lockTask(prefix, id, workerId, lockTimeout)
-    moveToList(prefix, id, "active")
-    return redis.call("SET", lockHash(prefix, id), workerId, "PX", lockTimeout)
-  end`,
-  unlockTask: /*lua*/ `local function unlockTask(prefix, id) return redis.call("DEL", lockHash(prefix, id)) end`,
-  isLocked: /*lua*/ `local function isLocked(prefix, id) return redis.call("EXISTS", lockHash(prefix, id)) > 0 end`,
-  getLockId: /*lua*/ `local function getLockId(prefix, id) return redis.call("GET", lockHash(prefix, id)) end`,
-  isLockedBy: /*lua*/ `local function isLockedBy(prefix, id, workerId) return getLockId(prefix, id) == workerId end`,
-
-  // death: a task dies when it is done (outcome recorded) and refCount == 0.
-  // Dying applies the outcome-keyed policy and releases the task's own refs;
-  // removeTask composes deleteTask + releaseRefs instead (removal deletes,
-  // it never applies a policy). Ref prefixes are stored fully qualified, so
-  // cross-queue targets (and their event streams) resolve directly.
-  applyDeathPolicy: /*lua*/ `local function applyDeathPolicy(prefix, id)
-    local policy
-    if getTaskField(prefix, id, "outcome") == "success" then
-      policy = getTaskField(prefix, id, "onSuccessPolicy")
-    else
-      policy = getTaskField(prefix, id, "onFailurePolicy")
-    end
-    if policy == "delete" then
-      deleteTask(prefix, id)
-    else
-      -- retained dead record: flag it and clear refs — the caller releases
-      -- them now, so a later removeTask must not release them again
-      setTask(prefix, id, "dead", "true", "refs", "[]")
-      if policy == "mark-as-success" then
-        moveToList(prefix, id, "success")
-      elseif policy == "mark-as-failure" then
-        moveToList(prefix, id, "failed")
-      else
-        moveToList(prefix, id, nil)
-      end
-    end
-  end`,
-  releaseRefs: /*lua*/ `local function releaseRefs(refs)
-    -- decrement every target; one that is done and reaches refCount 0 dies
-    -- here too, appending its own refs to the worklist (iterative cascade)
-    local n = 1
-    while n <= #refs do
-      local ref = refs[n]
-      n = n + 1
-      if exists(taskHash(ref.prefix, ref.id)) == 1 then
-        local rc = tonumber(redis.call("HINCRBY", taskHash(ref.prefix, ref.id), "refCount", -1))
-        if rc <= 0 and getTaskField(ref.prefix, ref.id, "outcome") then
-          local childRefs = cjson.decode(getTaskField(ref.prefix, ref.id, "refs") or "[]")
-          applyDeathPolicy(ref.prefix, ref.id)
-          for j, childRef in ipairs(childRefs) do
-            refs[#refs + 1] = childRef
-          end
-        end
-      end
-    end
-  end`,
-  dieTask: /*lua*/ `local function dieTask(prefix, id)
-    local refs = cjson.decode(getTaskField(prefix, id, "refs") or "[]")
-    applyDeathPolicy(prefix, id)
-    releaseRefs(refs)
-  end`,
-  settleDoneTask: /*lua*/ `local function settleDoneTask(prefix, id)
-    -- a task just reached a terminal outcome: it dies now unless pinned, in
-    -- which case it parks in no list and its policy is deferred to release
-    if tonumber(getTaskField(prefix, id, "refCount") or "0") > 0 then
-      moveToList(prefix, id, nil)
-    else
-      dieTask(prefix, id)
-    end
-  end`,
-  failTask: /*lua*/ `
-  local function failTask(prefix, id, error, retryAt) 
-		-- error arrives as a JSON string (writeError) or a Lua table (syncLocks); normalize to a table
-		-- so the stored errors list holds objects, not double-encoded strings
-    
-    unlockTask(prefix, id)
-
-		local errorObj = error
-		if type(error) == "string" then
-			local ok, decoded = pcall(cjson.decode, error)
-			errorObj = ok and decoded or error
-		end
-			-- retryAt arrives as -1 (or nil) when no retry is scheduled; normalize
-			-- to nil so it is omitted from the stored error and the event payload
-			if (retryAt or -1) < 0 then retryAt = nil end
-		 appendTaskError(prefix, id, errorObj, retryAt)
-	   local onFailurePolicy = getTaskField(prefix, id, "onFailurePolicy")
-
-		 local errorTag = type(errorObj) == "table" and errorObj._tag or nil
-
-     local willRetry = errorTag ~= "~effectmq/Error/Canceled" and retryAt ~= nil
-      publishEvent(prefix, id, "task.failed", { 
-        error = errorObj, 
-        policy = onFailurePolicy,  
-        retryAt = retryAt
-      })
-		 if willRetry then
-        if retryAt > now then
-
-            moveToList(prefix, id, "scheduled", retryAt)
-
-          else
-            moveToList(prefix, id, "wait")
-          end
-			  return
-			end
-      setTask(prefix, id, "outcome", "failure")
-      settleDoneTask(prefix, id)
-	end`,
-  syncLocks: /*lua*/ `local function syncLocks(prefix)
-    -- clear expired locks. Locks will be removed automatically when the lock expires,
-    -- but they could remain in the active list if the task is not completed
-    local activeList = getActiveList(prefix)
-    for i, id in ipairs(activeList) do
-      if not isLocked(prefix, id) then
-				failTask(prefix, id, {
-					_tag = "~effectmq/Error/Stalled",
-					timestamp = now,
-				}, 0)
-      end
-    end
-  end`,
-
-  syncDelayed: /*lua*/ `local function syncDelayed(prefix)
-  -- we lazily move tasks from the delayed list to the wait list so we need to sync
-  -- before performing any other operations
-    local delayedList = delayedList(prefix)
-    local items = redis.call("ZRANGEBYSCORE", delayedList, 0, now)
-    for i, item in ipairs(items) do
-      moveToList(prefix, item, "wait")
-    end
-  end`,
-  syncAll: /*lua*/ `local function syncAll(prefix)
-    syncDelayed(prefix)
-    syncLocks(prefix)
-  end`,
-};
 export type TaskEngineService = TaskEngine["Service"];
+// must match MOCKTIME_KEY in src/lua/taskEngine.lua
 const MOCKTIME_KEY = "$$$effectmq/debug/mocktime";
-const declare = (code: string, debugMode: boolean = false) => {
-  let header = ``;
-
-  for (const [key, value] of Object.entries(importMap).reverse()) {
-    const reg = new RegExp(`\\b${key}\\b`, "g");
-    if (reg.test(code) || reg.test(header)) {
-      header = `${value}\n${header}\n`;
-    }
-  }
-  let now = ``;
-  if (debugMode) {
-    now = /*lua*/ `local now = tonumber(redis.call("GET", "${MOCKTIME_KEY}") or (1000 * tonumber(redis.call("TIME")[1])))\n`;
-  } else {
-    now = /*lua*/ `local now = 1000 * tonumber(redis.call("TIME")[1])\n`;
-  }
-
-  const result = `${now}\n${header}\n${code}`;
-  return result;
-};
 
 /**
  * Override the engine's notion of "now" (only honored when the engine is built
@@ -439,607 +238,409 @@ export const stepMockTime = (time: Duration.Input) =>
     yield* redis.send("INCRBY", MOCKTIME_KEY, String(Duration.toMillis(time)));
   }).pipe(Effect.mapError(TaskEngineError.of("Failed to step mock time")));
 
-const buildScripts = (debugMode: boolean) => {
-  const CreateOrUpdateTaskScript = Redis.script(
-    (params: EngineTaskInsert, throwOnExists: boolean = false) => [
-      params.prefix,
-      throwOnExists,
-      params.id,
-      params.name,
-      JSON.stringify(params.payload),
-      params.delay,
-      params.maxRetries ?? -1,
-      params.onSuccessPolicy,
-      params.onFailurePolicy,
-      JSON.stringify(params.heldBy ?? []),
-      params.createdBy ? JSON.stringify(params.createdBy) : "",
-    ],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-      local prefix = ARGV[1]
-      syncAll(prefix)
-      local throwOnExists = ARGV[2]
+const asText = (value: unknown): string =>
+  typeof value === "string"
+    ? value
+    : Buffer.from(value as Uint8Array).toString("utf8");
 
-      local id = ARGV[3]
-
-      local name = ARGV[4]
-      local payload = ARGV[5]
-      local delay = tonumber(ARGV[6])
-      local maxRetries = tonumber(ARGV[7])
-      local onSuccessPolicy = ARGV[8]
-      local onFailurePolicy = ARGV[9]
-      -- heldBy/createdBy arrive with fully-qualified prefixes (the service
-      -- layer applies the global prefix, same as ARGV[1]); stored refs keep
-      -- that form so they are directly key-addressable
-      local heldBy = cjson.decode(ARGV[10])
-      local createdBy = ARGV[11]
-      local hash = taskHash(prefix, id)
-      local existingTask = getTask(prefix, id)
-
-      if throwOnExists == true and existingTask ~= nil then
-        return redis.error_reply("task already exists")
-      end
-
-      -- refs are acquired only when the task is created; an idempotent
-      -- re-offer (replay) skips acquisition entirely so holders never
-      -- double-pin. Holders must be alive: a dead-but-retained record
-      -- (keep/mark-as-*) has already released and would pin forever.
-      -- Validate every holder before writing anything.
-      if existingTask == nil then
-        for i, holder in ipairs(heldBy) do
-          if exists(taskHash(holder.prefix, holder.id)) == 0 then
-            return redis.error_reply("holder not found: " .. holder.prefix .. ":" .. holder.id)
-          end
-          if getTaskField(holder.prefix, holder.id, "dead") == "true" then
-            return redis.error_reply("holder is dead: " .. holder.prefix .. ":" .. holder.id)
-          end
-        end
-      end
-
-    setTask(
-        prefix, id, 
-        "name", name, 
-				"createdAt", now,
-        "payload", payload, 
-        "delay", delay, 
-        "maxRetries", maxRetries, 
-        "onSuccessPolicy", onSuccessPolicy,
-        "onFailurePolicy", onFailurePolicy,
-        "errors", "[]"
-      )
-      -- refs/refCount/createdBy are written only at creation and never reset
-      -- on an idempotent re-offer (refs records pins the task already holds)
-      if existingTask == nil then
-        setTask(prefix, id, "refs", "[]", "refCount", #heldBy)
-        if createdBy ~= "" then
-          setTask(prefix, id, "createdBy", createdBy)
-        end
-        for i, holder in ipairs(heldBy) do
-          local holderRefs = cjson.decode(getTaskField(holder.prefix, holder.id, "refs") or "[]")
-          holderRefs[#holderRefs + 1] = { prefix = prefix, id = id }
-          setTask(holder.prefix, holder.id, "refs", cjson.encode(holderRefs))
-        end
-      end
-      local newTask = getTask(prefix, id)
-      if existingTask ~= nil then
-        publishEvent(prefix, id, "task.updated", { existingTask = existingTask, newTask = newTask})
-      else
-        publishEvent(prefix, id, "task.created", { newTask = newTask})
-      end
-
-      if delay > 0 then
-        moveToList(prefix, id, "scheduled", now + delay)
-      else
-        moveToList(prefix, id, "wait")
-      end
-
-      return newTask
-
-      `,
-        debugMode,
-      ),
-    },
-  ).withReturnType<string[]>();
-
-  const WriteSuccessResultScript = Redis.script(
-    (prefix: string, workerId: string, id: string, result: unknown) => [
-      prefix,
-      workerId,
-      id,
-      JSON.stringify(result),
-    ],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-      local prefix = ARGV[1]
-			local workerId = ARGV[2]
-      local id = ARGV[3]
-      local result = ARGV[4]
-      local hash = taskHash(prefix, id)
-
-      -- result arrives as a JSON string; normalize to a Lua value for the event
-      -- payload so publishEvent's cjson.encode wraps it exactly once (mirrors the
-      -- errorObj handling in failTask), not double-encoded
-      local successObj = result
-      if type(result) == "string" then
-        local ok, decoded = pcall(cjson.decode, result)
-        successObj = ok and decoded or result
-      end
-
-      syncAll(prefix)
-
-
-      if not exists(hash) then
-        return redis.error_reply("Task not found")
-      end
-			if not isLockedBy(prefix, id, workerId) then
-				return redis.error_reply("Task is locked by another worker")
-			end
-      setTask(prefix, id, "success", result, "outcome", "success")
-      local task = getTask(prefix, id)
-      local successPolicy = getTaskField(prefix, id, "onSuccessPolicy")
-
-      publishEvent(prefix, id, "task.completed", {
-        success = successObj,
-        policy = successPolicy
-      })
-
-      settleDoneTask(prefix, id)
-      return task
-    `,
-        debugMode,
-      ),
-    },
-  );
-
-  const WriteErrorResultScript = Redis.script(
-    (
-      prefix: string,
-      workerId: string,
-      id: string,
-      error: unknown,
-      retryAt: number,
-    ) => [prefix, workerId, id, JSON.stringify(error), retryAt],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-      local prefix = ARGV[1]
-      syncAll(prefix)
-			local workerId = ARGV[2]
-      local id = ARGV[3]
-      local error = cjson.decode(ARGV[4])
-      local retryAt = tonumber(ARGV[5]) or -1
-      local hash = taskHash(prefix, id)
-
-
-
-      if not exists(hash) then
-        return redis.error_reply("Task not found")
-      end
-			if not isLockedBy(prefix, id, workerId) then
-				return redis.error_reply("Task is locked by another worker")
-			end
-
-
-      local task = getTask(prefix, id)
-			failTask(prefix, id, error, retryAt)
-				return task
-    `,
-        debugMode,
-      ),
-    },
-  );
-
-  const RemoveTaskScript = Redis.script(
-    (prefix: string, workerId: string, id: string) => [prefix, workerId, id],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-      local prefix = ARGV[1]
-      syncAll(prefix)
-      local workerId = ARGV[2]
-      local id = ARGV[3]
-
-			local lock = getLockId(prefix, id)
-	
-			if lock and lock ~= workerId then
-				return redis.error_reply("Task is locked by another worker")
-			end
-      -- deleting a pinned task is illegal: its holders may still read it.
-      -- Remove the holders first — their deaths release (and dispose of)
-      -- this task via the normal cascade.
-      if tonumber(getTaskField(prefix, id, "refCount") or "0") > 0 then
-        return redis.error_reply("task is pinned: remove the tasks holding it first")
-      end
-      -- removal deletes the record regardless of outcome/policy, but its
-      -- refs still release (cascading), or a removed holder would leak its
-      -- children
-      local refs = cjson.decode(getTaskField(prefix, id, "refs") or "[]")
-      deleteTask(prefix, id)
-      releaseRefs(refs)
-      return
-      `,
-        debugMode,
-      ),
-    },
-  );
-
-  const TakeTaskScript = Redis.script(
-    (prefix: string, workerId: string, lockTimeout: number) => [
-      prefix,
-      workerId,
-      lockTimeout,
-    ],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-  local prefix = ARGV[1]
-  syncAll(prefix)
-	local workerId = ARGV[2]
-	local lockTimeout = tonumber(ARGV[3])
-
-	local taskId = popWaitList(prefix)
-
-	-- LPOP returns false (not nil) on an empty list
-	if not taskId then
-		return nil
-	end
-		-- sanity check: tasks on wait list should never be locked, but just in case
-	if isLocked(prefix, taskId) then
-		moveToList(prefix, taskId, "active")
-		return redis.error_reply("Task is locked by another worker")
-	end
-
-	local lock = lockTask(prefix, taskId, workerId, lockTimeout)
-	if lock == nil then
-		return nil
-	end
-	local task = getTask(prefix, taskId)
-	return task
-
-  `,
-        debugMode,
-      ),
-    },
-  );
-
-  const ExtendLockScript = Redis.script(
-    (prefix: string, workerId: string, id: string, lockTimeout: number) => [
-      prefix,
-      workerId,
-      id,
-      lockTimeout,
-    ],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-			local prefix = ARGV[1]
-			local workerId = ARGV[2]
-			local id = ARGV[3]
-			local lockTimeout = tonumber(ARGV[4])
-			local lock = getLockId(prefix, id)
-			-- GET returns false (not nil) when the lock key is absent
-			if not lock then
-				return
-			end
-			if lock ~= workerId then
-				return redis.error_reply("Task is locked by another worker")
-			end
-			lockTask(prefix, id, workerId, lockTimeout)
-			return
-			`,
-        debugMode,
-      ),
-    },
-  );
-
-  const RemoveLockScript = Redis.script(
-    (prefix: string, workerId: string, id: string) => [prefix, workerId, id],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-			local prefix = ARGV[1]
-			local workerId = ARGV[2]
-			local id = ARGV[3]
-			local lock = getLockId(prefix, id)
-			-- GET returns false (not nil) when the lock key is absent
-			if not lock then
-			  return
-		  end
-			if lock ~= workerId then
-				return redis.error_reply("Task is locked by another worker")
-			end
-			unlockTask(prefix, id)
-			return
-			`,
-        debugMode,
-      ),
-    },
-  );
-
-  const SetScheduleScript = Redis.script(
-    (prefix: string, name: string, next: string) => [prefix, name, next],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-			local prefix = ARGV[1]
-			local name = ARGV[2]
-			local next = tonumber(ARGV[3])
-			local hash = scheduleHash(prefix, name)
-			redis.call("HSETNX", hash, "next", next)
-
-			return tonumber(redis.call("HGET", hash, "next"))
-			
-			`,
-        debugMode,
-      ),
-    },
-  ).withReturnType<number>();
-
-  const ConsumeScheduleScript = Redis.script(
-    (prefix: string, name: string, current: number, next: number) => [
-      prefix,
-      name,
-      current,
-      next,
-    ],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-				local prefix = ARGV[1]
-				local name = ARGV[2]
-				local currentToConsume = tonumber(ARGV[3])
-				local nextToSet = tonumber(ARGV[4])
-				local hash = scheduleHash(prefix, name)
-
-				-- consumed is reported as 1/0 rather than a boolean: Redis converts a
-				-- Lua false to a null reply, which truncates the returned array
-				local currentSchedule = tonumber(redis.call("HGET", hash, "next"))
-				-- if schedule is not set, we return nil
-				if not currentSchedule then
-					return { 0 }
-				end
-
-				-- if the expected current schedule is not equal to the current schedule,
-				-- we assume the "next" schedule has been calculated relative to the wrong time
-				-- so we discard it and send the acual current schedule so the worker can use it to try again
-				if currentSchedule ~= currentToConsume then
-					return { 0, currentSchedule }
-				end
-
-				-- if the current schedule match, but the vent is still in the future, we also discard it
-				if now < currentSchedule then
-			  	return { 0, currentSchedule }
-				end
-
-				-- if the event is in the past, we can consume it and schedule the next event
-				if currentSchedule < nextToSet then
-					redis.call("HSET", hash, "next", nextToSet)
-					return { 1, nextToSet }
-				end
-
-				return { 0, currentSchedule }
-
-				`,
-        debugMode,
-      ),
-    },
-  ).withReturnType<[0 | 1, number | null]>();
-
-  const GetListScript = Redis.script(
-    (
-      prefix: string,
-      list: "wait" | "scheduled" | "active" | "failed" | "success",
-    ) => [prefix, list],
-    {
-      numberOfKeys: 0,
-      lua: declare(
-        /*lua*/ `
-				local prefix = ARGV[1]
-				syncAll(prefix)
-				local list = ARGV[2]
-				if list == "scheduled" then
-					return redis.call("ZRANGEBYSCORE", delayedList(prefix), "0", "inf")
-				elseif list == "wait" then
-					return redis.call("LRANGE", waitList(prefix), 0, -1)
-				elseif list == "active" then
-					return redis.call("ZRANGEBYSCORE", activeList(prefix), 0, "inf")
-				elseif list == "failed" then
-					return redis.call("ZRANGEBYSCORE", failedList(prefix), 0, "inf")
-				elseif list == "success" then
-					return redis.call("ZRANGEBYSCORE", successList(prefix), 0, "inf")
-				end
-				return redis.error_reply("Invalid list")
-				`,
-        debugMode,
-      ),
-    },
-  ).withReturnType<string[]>();
-  return {
-    CreateOrUpdateTaskScript,
-    WriteSuccessResultScript,
-    WriteErrorResultScript,
-    RemoveTaskScript,
-    TakeTaskScript,
-    ExtendLockScript,
-    RemoveLockScript,
-    SetScheduleScript,
-    ConsumeScheduleScript,
-    GetListScript,
-  };
+/** Fold a flat `[k1, v1, k2, v2, ...]` reply into a record, keys as utf8. */
+const entriesToRecord = (entries: ReadonlyArray<unknown>) => {
+  const record: Record<string, unknown> = {};
+  for (let i = 0; i < entries.length; i += 2) {
+    record[asText(entries[i])] = entries[i + 1];
+  }
+  return record;
 };
 
-/** Decode a flat `["id", id, "name", name, ...]` field list from Redis into an {@link EngineTask}. */
-const parseTask = (task: string[]) =>
-  Schema.decodeEffect(EngineTaskFromRedisEntriesSchema)(task).pipe(
+/** Decode a flat `["id", id, "name", name, ...]` raw-entry reply from Lua. */
+const parseTask = (task: ReadonlyArray<unknown>) =>
+  Schema.decodeUnknownEffect(EngineTaskSchema)(entriesToRecord(task)).pipe(
     Effect.mapError(TaskEngineError.of("Failed to decode task")),
   );
+
+const parseTerminalResult = (result: ReadonlyArray<unknown>) =>
+  Schema.decodeUnknownEffect(EngineTerminalResultSchema)(
+    entriesToRecord(result),
+  ).pipe(
+    Effect.mapError(TaskEngineError.of("Failed to decode terminal result")),
+  );
+
+const packUnknown = Schema.encodeEffect(UnknownFromMsgpack);
+/** Encode a structured value as msgpack bytes for a script argument. */
+const pack = (value: unknown) =>
+  packUnknown(value).pipe(
+    Effect.mapError(TaskEngineError.of("Failed to encode value")),
+  );
+
+const decodeEvents = Schema.decodeUnknownEffect(Schema.Array(EventSchema));
+
 export const makePrefix = (...prefixes: string[]) => prefixes.join(":");
 
 /**
  * Build a {@link TaskEngine} implementation against the ambient
- * {@link RedisPool} service. `debugMode` enables the mockable clock (see
- * {@link setMockTime});
- * `prefix` namespaces all keys; `workerId` identifies this worker for locking.
+ * {@link RedisPool} service. The script is loaded lazily by exact content and
+ * invoked through cached `EVALSHA`, with one transparent `NOSCRIPT` recovery.
+ * `debugMode` enables the mockable clock (see {@link setMockTime});
+ * `prefix` namespaces all keys. Every acquisition creates a fresh opaque lease
+ * token; callers must present it for every ownership-sensitive transition.
  * Usually consumed via {@link layer}.
  */
-export const make = ({
-  debugMode = false,
-  prefix = "~effectmq",
-  workerId = `worker/${crypto.randomUUID()}`,
-}: TaskEngineConfig = {}) =>
+export const makeWithRedis = (
+  redis: RedisPoolService,
+  {
+    debugMode = false,
+    prefix = "~effectmq:v1",
+    maintenanceBatchSize = 100,
+  }: TaskEngineConfig = {},
+) =>
   Effect.gen(function* () {
-    const redis = yield* RedisPool;
-    const scripts = buildScripts(debugMode);
+    if (
+      !Number.isSafeInteger(maintenanceBatchSize) ||
+      maintenanceBatchSize < 1 ||
+      maintenanceBatchSize > maxMaintenanceBatchSize
+    ) {
+      return yield* Effect.die(
+        new RangeError(
+          `maintenanceBatchSize must be an integer between 1 and ${maxMaintenanceBatchSize}`,
+        ),
+      );
+    }
+    const debugFlag = debugMode ? "1" : "0";
     const withPrefix = (key: string) => `${prefix}:${key}`;
-    const ev = <
-      Config extends {
-        readonly params: ReadonlyArray<unknown>;
-        readonly result: unknown;
-      },
-    >(
-      script: Redis.Script<Config>,
-      message: string,
-    ) => {
-      const fn = redis.eval(script);
-      // the numbered Lua source is a debugging aid; keep it out of production errors
-      const detail = debugMode
-        ? `${message}\n${script.lua
-            .split("\n")
-            .map((line, i) => `[${i}] ${line}`)
-            .join("\n")}`
-        : message;
-      return (...params: Config["params"]) =>
-        fn(...params).pipe(Effect.mapError(TaskEngineError.of(detail)));
-    };
 
-    const createTask = ev(
-      scripts.CreateOrUpdateTaskScript,
-      "Failed to create task",
+    // Every operation receives its name followed by the debug flag and its
+    // own arguments. The Lua dispatcher preserves the operation-local layout.
+    const call =
+      <A = unknown>(name: string, message: string) =>
+      (...args: ReadonlyArray<string | Uint8Array>) =>
+        redis
+          .evalScript<A>(
+            taskEngineScript,
+            {},
+            name,
+            debugFlag,
+            String(maintenanceBatchSize),
+            ...args,
+          )
+          .pipe(Effect.mapError(TaskEngineError.of(message)));
+
+    // binary replies: these functions return msgpack-encoded tasks
+    const callBinary =
+      <A = unknown>(name: string, message: string) =>
+      (...args: ReadonlyArray<string | Uint8Array>) =>
+        redis
+          .evalScript<A>(
+            taskEngineScript,
+            { binaryReply: true },
+            name,
+            debugFlag,
+            String(maintenanceBatchSize),
+            ...args,
+          )
+          .pipe(Effect.mapError(TaskEngineError.of(message)));
+
+    const createTaskFn = callBinary<
+      readonly [unknown, unknown, ReadonlyArray<unknown>]
+    >("effectmq_createTask", "Failed to create task");
+    const getTaskFn = callBinary<ReadonlyArray<unknown> | null>(
+      "effectmq_getTask",
+      "Failed to get task",
     );
-    const writeSuccessResult = ev(
-      scripts.WriteSuccessResultScript,
+    const getGenerationFn = call<number>(
+      "effectmq_getGeneration",
+      "Failed to read task generation",
+    );
+    const getResultFn = callBinary<ReadonlyArray<unknown> | null>(
+      "effectmq_getResult",
+      "Failed to get terminal result",
+    );
+    const takeTaskFn = callBinary<
+      readonly [unknown, ReadonlyArray<unknown>] | null
+    >("effectmq_takeTask", "Failed to take task");
+    const writeSuccessFn = call(
+      "effectmq_writeSuccess",
       "Failed to write success result",
     );
-    const writeErrorResult = ev(
-      scripts.WriteErrorResultScript,
+    const writeErrorFn = call(
+      "effectmq_writeError",
       "Failed to write error result",
     );
-    const takeTask = ev(
-      scripts.TakeTaskScript.withReturnType<string[]>(),
-      "Failed to take task",
+    const removeTaskFn = call("effectmq_removeTask", "Failed to remove task");
+    const forceRemoveTaskFn = call(
+      "effectmq_forceRemoveTask",
+      "Failed to force-remove task",
     );
-    const removeTask = ev(scripts.RemoveTaskScript, "Failed to remove task");
-    const extendLock = ev(scripts.ExtendLockScript, "Failed to extend lock");
-    const removeLock = ev(scripts.RemoveLockScript, "Failed to remove lock");
-    const setSchedule = ev(scripts.SetScheduleScript, "Failed to set schedule");
-    const consumeSchedule = ev(
-      scripts.ConsumeScheduleScript,
+    const extendLockFn = call("effectmq_extendLock", "Failed to extend lock");
+    const removeLockFn = call("effectmq_removeLock", "Failed to remove lock");
+    const setScheduleFn = call<number>(
+      "effectmq_setSchedule",
+      "Failed to set schedule",
+    );
+    const consumeScheduleFn = call<[0 | 1, number | null]>(
+      "effectmq_consumeSchedule",
       "Failed to consume schedule",
     );
-    const getList = ev(scripts.GetListScript, "Failed to get list");
+    const listTasksFn = call<readonly [string, ...string[]]>(
+      "effectmq_listTasks",
+      "Failed to list tasks",
+    );
+    const maintainFn = call<readonly number[]>(
+      "effectmq_maintain",
+      "Failed to maintain queue",
+    );
+    const eventCursorsFn = call<readonly [string, string, string]>(
+      "effectmq_eventCursors",
+      "Failed to read event cursors",
+    );
+
+    const withLeaseFence = <A>(
+      operation: Effect.Effect<A, TaskEngineError>,
+      queue: string,
+      taskId: string,
+    ) =>
+      operation.pipe(
+        Effect.tapError((error) =>
+          isLeaseLost(error)
+            ? Effect.all([
+                Effect.logWarning("effectmq task ownership lost", {
+                  queue,
+                  taskId,
+                }),
+                Metric.update(
+                  Metric.withAttributes(Observability.ownershipLosses, {
+                    queue,
+                  }),
+                  1,
+                ),
+              ]).pipe(Effect.asVoid)
+            : Effect.void,
+        ),
+        Effect.mapError((cause) =>
+          isLeaseLost(cause)
+            ? new LeaseLost({ cause, prefix: queue, taskId })
+            : cause,
+        ),
+      );
+
+    const offerTask = Effect.fnUntraced(function* (task: EngineTaskInsert) {
+      const retentionHolder = task.retentionHolder
+        ? yield* pack({
+            ...task.retentionHolder,
+            queue: withPrefix(task.retentionHolder.queue),
+          })
+        : "";
+      const creator = task.creator
+        ? yield* pack({
+            ...task.creator,
+            queue: withPrefix(task.creator.queue),
+          })
+        : "";
+      const reply = yield* createTaskFn(
+        withPrefix(task.prefix),
+        "0", // throwOnExists
+        task.id,
+        task.name,
+        yield* pack(task.payload),
+        String(task.delay),
+        String(task.maxRetries ?? -1),
+        task.onSuccessPolicy,
+        task.onFailurePolicy,
+        retentionHolder,
+        creator,
+        task.onDuplicate ?? "return-existing",
+        String(task.maxStalledCount ?? 1),
+        task.schemaId ?? task.name,
+        String(task.maxErrorEntries ?? 100),
+        String(task.maxRelationships ?? 1000),
+        String(task.maxEventEntries ?? 10_000),
+        String(task.taskRecordRetentionMs ?? 7 * 24 * 60 * 60 * 1000),
+        String(task.resultRetentionMs ?? 24 * 60 * 60 * 1000),
+        String(task.terminalIndexRetentionMs ?? 7 * 24 * 60 * 60 * 1000),
+        String(task.deadLetterRetentionMs ?? 30 * 24 * 60 * 60 * 1000),
+        String(task.eventRetentionMs ?? 7 * 24 * 60 * 60 * 1000),
+      );
+      return {
+        status: asText(reply[0]) as TaskCreateResult["status"],
+        cursor: asText(reply[1]),
+        task: yield* parseTask(reply[2]),
+      } satisfies TaskCreateResult;
+    });
 
     return TaskEngine.of({
       [TypeId]: TypeId,
-      createTask: (task: EngineTaskInsert) => {
-        return createTask(
-          {
-            ...task,
-            prefix: withPrefix(task.prefix),
-            // stored TaskRef prefixes are fully qualified, one rule for all
-            // refs in the data: they are directly key-addressable
-            heldBy: task.heldBy?.map((ref) => ({
-              ...ref,
-              prefix: withPrefix(ref.prefix),
-            })),
-            createdBy: task.createdBy && {
-              ...task.createdBy,
-              prefix: withPrefix(task.createdBy.prefix),
-            },
-          },
-          false,
-        ).pipe(Effect.flatMap(parseTask));
-      },
+      offerTask,
+      createTask: (task) =>
+        offerTask(task).pipe(Effect.map((result) => result.task)),
 
-      getTask: (prefix: string, id: string) =>
-        redis
-          .send<string[]>("HGETALL", withPrefix(`${prefix}:task:${id}`))
-          .pipe(
-            Effect.flatMap((fields) =>
-              // the task hash does not store its own id, so inject it like the Lua getTask does
-              fields.length > 0
-                ? parseTask(["id", id, ...fields])
-                : Effect.succeed(null),
-            ),
-            Effect.mapError(TaskEngineError.of("Failed to get task")),
+      getTask: Effect.fnUntraced(function* (prefix: string, id: string) {
+        const reply = yield* getTaskFn(withPrefix(prefix), id);
+        return reply ? yield* parseTask(reply) : null;
+      }),
+      getGeneration: (prefix, id) => getGenerationFn(withPrefix(prefix), id),
+      getResult: Effect.fnUntraced(function* (
+        prefix: string,
+        id: string,
+        generation: number,
+      ) {
+        const reply = yield* getResultFn(
+          withPrefix(prefix),
+          id,
+          String(generation),
+        );
+        return reply ? yield* parseTerminalResult(reply) : null;
+      }),
+      writeSuccess: Effect.fnUntraced(function* (
+        prefix: string,
+        id: string,
+        leaseToken: string,
+        result: unknown,
+      ) {
+        yield* withLeaseFence(
+          writeSuccessFn(
+            withPrefix(prefix),
+            leaseToken,
+            id,
+            yield* pack(result),
           ),
-      writeSuccess: (prefix: string, id: string, result: unknown) => {
-        return writeSuccessResult(withPrefix(prefix), workerId, id, result);
-      },
+          prefix,
+          id,
+        );
+      }),
       writeError: Effect.fnUntraced(function* (
         prefix: string,
         id: string,
+        leaseToken: string,
         error: unknown,
         retryAt?: Duration.Input,
       ) {
-        return yield* writeErrorResult(
-          withPrefix(prefix),
-          workerId,
+        yield* withLeaseFence(
+          writeErrorFn(
+            withPrefix(prefix),
+            leaseToken,
+            id,
+            yield* pack(error),
+            String(retryAt ? Duration.toMillis(retryAt) : -1),
+          ),
+          prefix,
           id,
-          error,
-          retryAt ? Duration.toMillis(retryAt) : -1,
         );
       }),
-      getList: (
+      listTasks: Effect.fnUntraced(function* (
         prefix: string,
-        list: "wait" | "scheduled" | "active" | "failed" | "success",
-      ) =>
-        Effect.gen(function* () {
-          return yield* getList(withPrefix(prefix), list);
-        }),
+        list: TaskList,
+        options: { readonly cursor?: string; readonly limit?: number } = {},
+      ) {
+        const cursor = options.cursor ?? "0";
+        const offset = Number(cursor);
+        const limit = options.limit ?? 100;
+        if (
+          !Number.isSafeInteger(offset) ||
+          offset < 0 ||
+          !Number.isSafeInteger(limit) ||
+          limit < 1 ||
+          limit > 1_000
+        ) {
+          return yield* new TaskEngineError({
+            message: "Invalid task-list page",
+            cause: new RangeError(
+              "cursor must be a non-negative integer and limit must be between 1 and 1000",
+            ),
+          });
+        }
+        const [nextCursor, ...items] = yield* listTasksFn(
+          withPrefix(prefix),
+          list,
+          cursor,
+          String(limit),
+        );
+        return {
+          items,
+          nextCursor: nextCursor === "" ? undefined : nextCursor,
+        };
+      }),
+      maintain: Effect.fnUntraced(function* (prefix: string) {
+        const values = yield* maintainFn(withPrefix(prefix)).pipe(
+          Effect.tapError((error) =>
+            Effect.all([
+              Metric.update(
+                Metric.withAttributes(Observability.retentionFailures, {
+                  queue: prefix,
+                }),
+                1,
+              ),
+              Effect.logError("effectmq maintenance sweep failed", {
+                queue: prefix,
+                error,
+              }),
+            ]).pipe(Effect.asVoid),
+          ),
+        );
+        const health: Observability.QueueHealth = {
+          depth: Number(values[0] ?? 0),
+          oldestTaskAgeMs: Number(values[1] ?? 0),
+          sweepLagMs: Number(values[2] ?? 0),
+          dueBacklog: Number(values[3] ?? 0),
+          expiredLeaseBacklog: Number(values[4] ?? 0),
+          retentionBacklog: Number(values[5] ?? 0),
+          processed: Number(values[6] ?? 0),
+        };
+        yield* Observability.recordQueueHealth(prefix, health);
+        return health;
+      }),
+      eventCursors: (prefix) =>
+        eventCursorsFn(withPrefix(prefix)).pipe(
+          Effect.map(([first, earliest, latest]) => ({
+            first: asText(first),
+            earliest: asText(earliest),
+            latest: asText(latest),
+          })),
+        ),
       takeTask: Effect.fnUntraced(function* (
         prefix: string,
         lockTimeout: number,
       ) {
-        const result = yield* takeTask(
+        const leaseToken = `lease/${crypto.randomUUID()}`;
+        const reply = yield* takeTaskFn(
           withPrefix(prefix),
-          workerId,
-          lockTimeout,
+          leaseToken,
+          String(lockTimeout),
         );
 
-        return result ? yield* parseTask(result) : null;
+        return reply
+          ? ({
+              leaseToken: asText(reply[0]),
+              task: yield* parseTask(reply[1]),
+            } satisfies TaskAttempt)
+          : null;
       }),
-      removeTask: (prefix, id) => {
-        return removeTask(withPrefix(prefix), workerId, id);
-      },
+      removeTask: (prefix, id) =>
+        removeTaskFn(withPrefix(prefix), id).pipe(Effect.asVoid),
+      forceRemoveTask: (prefix, id) =>
+        forceRemoveTaskFn(withPrefix(prefix), id).pipe(Effect.asVoid),
 
-      extendLock: (prefix, id, lockTimeout) => {
-        return extendLock(withPrefix(prefix), workerId, id, lockTimeout);
-      },
-      removeLock: (prefix, id) => {
-        return removeLock(withPrefix(prefix), workerId, id);
-      },
+      extendLock: (prefix, id, leaseToken, lockTimeout) =>
+        withLeaseFence(
+          extendLockFn(withPrefix(prefix), leaseToken, id, String(lockTimeout)),
+          prefix,
+          id,
+        ).pipe(Effect.asVoid),
+      removeLock: (prefix, id, leaseToken) =>
+        withLeaseFence(
+          removeLockFn(withPrefix(prefix), leaseToken, id),
+          prefix,
+          id,
+        ).pipe(Effect.asVoid),
       setSchedule: (name, next) => {
-        return setSchedule(prefix, name, String(next.getTime())).pipe(
+        return setScheduleFn(prefix, name, String(next.getTime())).pipe(
           Effect.map((next) => new Date(next)),
         );
       },
       consumeSchedule: (name, toConsume, next) => {
-        return consumeSchedule(
+        return consumeScheduleFn(
           prefix,
           name,
-          toConsume.getTime(),
-          next.getTime(),
+          String(toConsume.getTime()),
+          String(next.getTime()),
         ).pipe(
           Effect.map(([consumed, next]) => ({
             consumed: consumed === 1,
@@ -1050,53 +651,143 @@ export const make = ({
 
       stream: (
         name,
-        options: { cursor?: string; pollInterval?: Duration.Duration } = {},
+        options: {
+          cursor?: string;
+          pollInterval?: Duration.Duration;
+        } = {},
       ) => {
-        const { cursor = `${Date.now()}`, pollInterval = Duration.seconds(1) } =
-          options;
-        const responseSchema = Schema.Array(
-          Schema.Tuple([Schema.String, Schema.Array(IncomingRedisEventSchema)]),
-        );
-        const decode = Schema.decodeUnknownEffect(responseSchema);
-
         const streamKey = `${withPrefix(name)}:events`;
-        return Stream.paginate(cursor, (cursor) =>
-          Effect.gen(function* () {
-            // BLOCK makes the server hold the read until an event arrives
-            // (or 2s pass), so the repeat below re-issues immediately on an
-            // empty reply without a client-side polling schedule.
-            const reply = yield* redis
-              .send("XREAD", "BLOCK", "2000", "STREAMS", streamKey, cursor)
-              .pipe(
-                Effect.mapError(TaskEngineError.of("Failed to poll stream")),
-                Effect.repeat({
-                  until: (value) => !!value,
-                }),
+        const blockMilliseconds = Duration.toMillis(
+          options.pollInterval ?? Duration.seconds(2),
+        );
+
+        // XREAD reply shapes vary by client and RESP version: ioredis
+        // replies with [stream, entries] tuples, node-redis with a Map
+        // (binary type mapping) or an object keyed by stream name.
+        // Normalize to the entry list of the single stream we read.
+        const entriesOf = (
+          reply: unknown,
+        ): ReadonlyArray<[unknown, ReadonlyArray<unknown>]> => {
+          if (reply instanceof Map) return [...reply.values()][0];
+          if (Array.isArray(reply)) return reply[0][1];
+          return Object.values(reply as object)[0];
+        };
+
+        const readFrom = (cursor: string) =>
+          Stream.paginate(cursor, (cursor) =>
+            Effect.gen(function* () {
+              // BLOCK makes the server hold the read until an event arrives
+              // (or 2s pass), so the repeat below re-issues immediately on an
+              // empty reply without a client-side polling schedule.
+              const reply = yield* redis
+                .sendBinary(
+                  "XREAD",
+                  "BLOCK",
+                  String(blockMilliseconds),
+                  "STREAMS",
+                  streamKey,
+                  cursor,
+                )
+                .pipe(
+                  Effect.mapError(TaskEngineError.of("Failed to poll stream")),
+                  Effect.repeat({
+                    until: (value) => !!value,
+                  }),
+                );
+
+              // reassemble each entry's flat fields into an event record:
+              // "new:"/"existing:" prefixed fields are task snapshots, the
+              // rest is the tag-specific payload (values stay raw bytes — the
+              // event schema decodes scalars and msgpack blobs per field)
+              const records = entriesOf(reply).map(([entryId, fields]) => {
+                const flat: Record<string, unknown> = {};
+                const newTask: Record<string, unknown> = {};
+                const existingTask: Record<string, unknown> = {};
+                for (let i = 0; i < fields.length; i += 2) {
+                  const key = asText(fields[i]);
+                  const value = fields[i + 1];
+                  if (key.startsWith("new:")) {
+                    newTask[key.slice("new:".length)] = value;
+                  } else if (key.startsWith("existing:")) {
+                    existingTask[key.slice("existing:".length)] = value;
+                  } else {
+                    flat[key] = value;
+                  }
+                }
+                const {
+                  taskId,
+                  generation,
+                  protocolVersion,
+                  schemaId,
+                  _tag,
+                  ...payloadFields
+                } = flat;
+                const tag = asText(_tag);
+                const payload =
+                  tag === "task.created"
+                    ? { ...payloadFields, newTask }
+                    : tag === "task.updated"
+                      ? { ...payloadFields, existingTask, newTask }
+                      : payloadFields;
+                return {
+                  id: asText(entryId),
+                  taskId: asText(taskId),
+                  generation,
+                  protocolVersion,
+                  schemaId,
+                  _tag: tag,
+                  payload,
+                };
+              });
+
+              const events = yield* decodeEvents(records).pipe(
+                Effect.tapError((error) => Effect.log(error.toString())),
               );
-            if (!reply) {
-              yield* Effect.sleep(pollInterval);
-            }
 
-            // ioredis replies with [stream, entries] tuples; node-redis
-            // replies with an object keyed by stream name. Normalize to the
-            // tuple shape before decoding.
-            const normalized = Array.isArray(reply)
-              ? reply
-              : Object.entries(reply as object);
-            const entries = yield* decode(normalized).pipe(
-              Effect.tapError((error) => Effect.log(error.toString())),
+              const nextCursor = events[events.length - 1].id;
+
+              return [events, Option.some(nextCursor)] as const;
+            }),
+          );
+
+        return Stream.unwrap(
+          Effect.gen(function* () {
+            const [first, earliest, latest] = yield* eventCursorsFn(
+              withPrefix(name),
             );
-            const events = entries[0][1];
-
-            const nextCursor = events[events.length - 1].id;
-
-            return [events, Option.some(nextCursor)] as const;
+            const cursors = {
+              first: asText(first),
+              earliest: asText(earliest),
+              latest: asText(latest),
+            };
+            const cursor = options.cursor ?? cursors.latest;
+            const streamWasTrimmed =
+              cursors.first !== "0-0" &&
+              compareStreamIds(cursors.earliest, cursors.first) > 0;
+            const requestedTrimmedEvent =
+              cursor === "0" ||
+              (compareStreamIds(cursor, cursors.first) >= 0 &&
+                compareStreamIds(cursor, cursors.earliest) < 0);
+            if (streamWasTrimmed && requestedTrimmedEvent) {
+              return yield* new CursorExpired({
+                requested: cursor,
+                earliest: cursors.earliest,
+              });
+            }
+            return readFrom(cursor);
           }),
         );
       },
     });
   });
 
-/** A `Layer` providing the {@link TaskEngine} service; requires a `Redis` service. */
+/** Build a task engine from the ambient producer Redis pool. */
+export const make = (config?: TaskEngineConfig) =>
+  Effect.gen(function* () {
+    const redis = yield* RedisPool;
+    return yield* makeWithRedis(redis, config);
+  });
+
+/** A `Layer` providing the {@link TaskEngine} service; requires a `RedisPool` service. */
 export const layer = (config?: TaskEngineConfig) =>
   Layer.effect(TaskEngine, make(config));

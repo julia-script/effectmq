@@ -1,135 +1,236 @@
-import { Cron, Effect, Fiber } from "effect";
+import { Cron, Effect, Schedule, Schema } from "effect";
 import { describe, expect, test } from "vitest";
-import { Scheduler, TaskEngine } from "./index.js";
+import {
+  Scheduler,
+  StorageProtocol,
+  Task,
+  TaskEngine,
+  TaskQueue,
+} from "./index.js";
 import { TestRuntime } from "./testing/redisLayer.js";
 
-describe("schedule primitives", () => {
-  test("setSchedule is first-writer-wins", () =>
-    Effect.gen(function* () {
-      const engine = yield* TaskEngine.TaskEngine;
-      const first = new Date(1000000000000);
-      const second = new Date(1000000060000);
+const makeQueue = (name: string, retry = false) => {
+  const task = Task.make({
+    name,
+    payload: {
+      scheduledAt: Schema.String,
+      missedFrom: Schema.String,
+      missedTo: Schema.String,
+    },
+    success: Schema.String,
+    error: Schema.Struct({ reason: Schema.String }),
+    idempotencyKey: (payload) => payload.scheduledAt,
+    ...(retry ? { retry: Schedule.spaced("10 millis"), maxRetries: 1 } : {}),
+  });
+  return TaskQueue.make(name, task);
+};
 
-      const initial = yield* engine.setSchedule("sched-first-wins", first);
-      expect(initial.getTime()).toBe(first.getTime());
-
-      // a second worker proposing a different next run keeps the stored one
-      const kept = yield* engine.setSchedule("sched-first-wins", second);
-      expect(kept.getTime()).toBe(first.getTime());
-    }).pipe(TestRuntime.runPromise));
-
-  test("consumeSchedule on an unset schedule consumes nothing", () =>
-    Effect.gen(function* () {
-      const engine = yield* TaskEngine.TaskEngine;
-      const result = yield* engine.consumeSchedule(
-        "sched-unset",
-        new Date(1000000000000),
-        new Date(1000000060000),
-      );
-      expect(result.consumed).toBe(false);
-      expect(result.next).toBeUndefined();
-    }).pipe(TestRuntime.runPromise));
-
-  test("consumeSchedule with a stale expected tick returns the stored schedule", () =>
-    Effect.gen(function* () {
-      const engine = yield* TaskEngine.TaskEngine;
-      const now = 1000000000000;
-      yield* TaskEngine.setMockTime(now);
-      const stored = new Date(now + 60000);
-      yield* engine.setSchedule("sched-mismatch", stored);
-
-      // the worker computed its tick from a stale value; it must not consume,
-      // and it gets the actual stored schedule back to retry with
-      const result = yield* engine.consumeSchedule(
-        "sched-mismatch",
-        new Date(now + 999),
-        new Date(now + 120000),
-      );
-      expect(result.consumed).toBe(false);
-      expect(result.next?.getTime()).toBe(stored.getTime());
-    }).pipe(TestRuntime.runPromise));
-
-  test("consumeSchedule leaves a future tick unconsumed until the clock reaches it", () =>
-    Effect.gen(function* () {
-      const engine = yield* TaskEngine.TaskEngine;
-      const now = 1000000000000;
-      yield* TaskEngine.setMockTime(now);
-      const tick = new Date(now + 60000);
-      const following = new Date(now + 120000);
-      yield* engine.setSchedule("sched-future", tick);
-
-      const early = yield* engine.consumeSchedule(
-        "sched-future",
-        tick,
-        following,
-      );
-      expect(early.consumed).toBe(false);
-      expect(early.next?.getTime()).toBe(tick.getTime());
-
-      yield* TaskEngine.stepMockTime(60000);
-      const due = yield* engine.consumeSchedule(
-        "sched-future",
-        tick,
-        following,
-      );
-      expect(due.consumed).toBe(true);
-      expect(due.next?.getTime()).toBe(following.getTime());
-    }).pipe(TestRuntime.runPromise));
-
-  test("a due tick is consumed by exactly one of two workers", () =>
-    Effect.gen(function* () {
-      const engine = yield* TaskEngine.TaskEngine;
-      const now = 1000000000000;
-      yield* TaskEngine.setMockTime(now);
-      const tick = new Date(now - 1000);
-      const following = new Date(now + 59000);
-      yield* engine.setSchedule("sched-race", tick);
-
-      // both workers derived the same (tick, following) pair; only the first
-      // consume wins, the loser is handed the advanced schedule
-      const winner = yield* engine.consumeSchedule(
-        "sched-race",
-        tick,
-        following,
-      );
-      const loser = yield* engine.consumeSchedule(
-        "sched-race",
-        tick,
-        following,
-      );
-
-      expect(winner.consumed).toBe(true);
-      expect(winner.next?.getTime()).toBe(following.getTime());
-      expect(loser.consumed).toBe(false);
-      expect(loser.next?.getTime()).toBe(following.getTime());
-    }).pipe(TestRuntime.runPromise));
+const config = (
+  name: string,
+  queue: ReturnType<typeof makeQueue>,
+  missed: Scheduler.MissedTickPolicy = { _tag: "coalesce" },
+) => ({
+  name,
+  cron: Cron.parseUnsafe("* * * * *", "UTC"),
+  queue,
+  missed,
+  payload: (tick: Scheduler.Tick) => ({
+    scheduledAt: tick.scheduledAt.toISOString(),
+    missedFrom: tick.missedFrom.toISOString(),
+    missedTo: tick.missedTo.toISOString(),
+  }),
 });
 
-describe("Scheduler", () => {
-  test("two workers running the same named scheduler fire the handler once per tick", () =>
+describe("durable Scheduler", () => {
+  test("competing schedulers materialize one deterministic tick task", () =>
     Effect.gen(function* () {
-      // Move the engine clock two minutes ahead of the wall clock, so the first
-      // cron tick (computed from the wall clock) is already due, while the
-      // following tick stays out of reach for the duration of the test.
-      yield* TaskEngine.setMockTime(Date.now() + 120_000);
+      const engine = yield* TaskEngine.TaskEngine;
+      const queue = makeQueue("scheduled-race-queue");
+      const definition = config("scheduled-race", queue);
+      const now = new Date("2026-01-01T00:01:30.000Z");
+      const tick = new Date("2026-01-01T00:01:00.000Z");
+      yield* TaskEngine.setMockTime(now.getTime());
+      yield* engine.setSchedule(definition.name, tick);
 
-      let fires = 0;
-      const makeWorker = () =>
-        Scheduler.make({
-          cron: Cron.parseUnsafe("* * * * *"),
-          name: "sched-collective",
-          handler: Effect.sync(() => {
-            fires++;
-          }),
-        });
+      yield* Effect.all(
+        [
+          Scheduler.materializeDue(definition, now),
+          Scheduler.materializeDue(definition, now),
+        ],
+        { concurrency: "unbounded" },
+      );
 
-      const worker1 = yield* makeWorker().pipe(Effect.forkChild);
-      const worker2 = yield* makeWorker().pipe(Effect.forkChild);
-
-      yield* Effect.sleep("2 seconds");
-      yield* Fiber.interrupt(worker1);
-      yield* Fiber.interrupt(worker2);
-
-      expect(fires).toBe(1);
+      const waiting = yield* engine.listTasks(queue.name, "wait");
+      expect(waiting.items).toEqual([`scheduled-race/${tick.toISOString()}`]);
+      expect(
+        (yield* engine.getTask(queue.name, waiting.items[0]))?.generation,
+      ).toBe(1);
     }).pipe(TestRuntime.runPromise));
+
+  test("an offer committed before a scheduler crash is replay-safe", () =>
+    Effect.gen(function* () {
+      const engine = yield* TaskEngine.TaskEngine;
+      const queue = makeQueue("scheduled-crash-queue");
+      const definition = config("scheduled-crash", queue);
+      const tick = new Date("2026-01-01T00:02:00.000Z");
+      const now = new Date("2026-01-01T00:02:30.000Z");
+      yield* TaskEngine.setMockTime(now.getTime());
+      yield* engine.setSchedule(definition.name, tick);
+
+      // This is the state left by a process that offered and died before it
+      // advanced the schedule cursor.
+      yield* TaskQueue.offer(
+        queue,
+        {
+          scheduledAt: tick.toISOString(),
+          missedFrom: tick.toISOString(),
+          missedTo: tick.toISOString(),
+        },
+        { taskId: `scheduled-crash/${tick.toISOString()}` },
+      );
+      yield* Scheduler.materializeDue(definition, now);
+
+      const waiting = yield* engine.listTasks(queue.name, "wait");
+      expect(waiting.items).toEqual([`scheduled-crash/${tick.toISOString()}`]);
+      expect(
+        (yield* engine.getTask(queue.name, waiting.items[0]))?.generation,
+      ).toBe(1);
+    }).pipe(TestRuntime.runPromise));
+
+  test("a crash before offer leaves the due cursor available", () =>
+    Effect.gen(function* () {
+      const engine = yield* TaskEngine.TaskEngine;
+      const queue = makeQueue("scheduled-before-offer-queue");
+      const definition = config("scheduled-before-offer", queue);
+      const tick = new Date("2026-01-01T00:03:00.000Z");
+      const now = new Date("2026-01-01T00:03:30.000Z");
+      yield* TaskEngine.setMockTime(now.getTime());
+      yield* engine.setSchedule(definition.name, tick);
+
+      // No operation occurs before the simulated crash. A replacement
+      // scheduler sees the same cursor and materializes the task normally.
+      yield* Scheduler.materializeDue(definition, now);
+      expect((yield* engine.listTasks(queue.name, "wait")).items).toEqual([
+        `scheduled-before-offer/${tick.toISOString()}`,
+      ]);
+    }).pipe(TestRuntime.runPromise));
+
+  test("skip, coalesce, and bounded backfill have explicit downtime behavior", () =>
+    Effect.gen(function* () {
+      const engine = yield* TaskEngine.TaskEngine;
+      const now = new Date("2026-01-01T00:05:00.000Z");
+      const firstMissed = new Date("2026-01-01T00:00:00.000Z");
+      yield* TaskEngine.setMockTime(now.getTime());
+
+      const skipQueue = makeQueue("scheduled-skip-queue");
+      const skip = config("scheduled-skip", skipQueue, { _tag: "skip" });
+      yield* engine.setSchedule(skip.name, firstMissed);
+      yield* Scheduler.materializeDue(skip, now);
+      expect((yield* engine.listTasks(skipQueue.name, "wait")).items).toEqual(
+        [],
+      );
+
+      const coalesceQueue = makeQueue("scheduled-coalesce-queue");
+      const coalesce = config("scheduled-coalesce", coalesceQueue);
+      yield* engine.setSchedule(coalesce.name, firstMissed);
+      yield* Scheduler.materializeDue(coalesce, now);
+      const coalesced = (yield* engine.listTasks(coalesceQueue.name, "wait"))
+        .items;
+      expect(coalesced).toEqual([`scheduled-coalesce/${now.toISOString()}`]);
+      const coalescedTask = yield* engine.getTask(
+        coalesceQueue.name,
+        coalesced[0],
+      );
+      const coalescedPayload = yield* StorageProtocol.decodeValue(
+        coalescedTask?.payload,
+        coalesceQueue.task.schemaId,
+        "payload",
+      );
+      expect(coalescedPayload).toMatchObject({
+        missedFrom: firstMissed.toISOString(),
+      });
+
+      const backfillQueue = makeQueue("scheduled-backfill-queue");
+      const backfill = config("scheduled-backfill", backfillQueue, {
+        _tag: "backfill",
+        maxBackfill: 2,
+      });
+      yield* engine.setSchedule(backfill.name, firstMissed);
+      yield* Scheduler.materializeDue(backfill, now);
+      expect(
+        (yield* engine.listTasks(backfillQueue.name, "wait")).items,
+      ).toEqual([
+        `scheduled-backfill/2026-01-01T00:04:00.000Z`,
+        `scheduled-backfill/2026-01-01T00:05:00.000Z`,
+      ]);
+    }).pipe(TestRuntime.runPromise));
+
+  test("scheduled work executes and retries through normal queue semantics", () =>
+    Effect.gen(function* () {
+      const engine = yield* TaskEngine.TaskEngine;
+      const queue = makeQueue("scheduled-retry-queue", true);
+      const definition = config("scheduled-retry", queue);
+      const now = new Date(Math.floor(Date.now() / 60_000) * 60_000 + 30_000);
+      const tick = new Date(now.getTime() - 30_000);
+      yield* TaskEngine.setMockTime(now.getTime());
+      yield* engine.setSchedule(definition.name, tick);
+      yield* Scheduler.materializeDue(definition, now);
+
+      let attempts = 0;
+      yield* TaskQueue.complete(queue, () => {
+        attempts++;
+        return Effect.fail({ reason: "retry" });
+      });
+      const retryTask = yield* engine.getTask(
+        queue.name,
+        `scheduled-retry/${tick.toISOString()}`,
+      );
+      const retryAt = retryTask?.errors.at(-1)?.retryAt;
+      expect(retryAt).toBeDefined();
+      if (retryAt === undefined) return yield* Effect.die("Expected retryAt");
+      // Retry schedules are evaluated from the recorded handler-failure time.
+      // Advance the mocked Redis clock to that durable deadline instead of
+      // assuming it is within 20 ms of this process's wall clock.
+      yield* TaskEngine.setMockTime(retryAt + 1);
+      yield* engine.maintain(queue.name);
+      yield* TaskQueue.complete(queue, () => {
+        attempts++;
+        return Effect.succeed("done");
+      });
+
+      expect(attempts).toBe(2);
+    }).pipe(TestRuntime.runPromise));
+
+  test("a lost scheduled-task lease can execute the handler again", () =>
+    Effect.gen(function* () {
+      const engine = yield* TaskEngine.TaskEngine;
+      const queue = makeQueue("scheduled-at-least-once-queue");
+      const definition = config("scheduled-at-least-once", queue);
+      const now = new Date("2026-01-01T00:08:30.000Z");
+      const tick = new Date("2026-01-01T00:08:00.000Z");
+      yield* TaskEngine.setMockTime(now.getTime());
+      yield* engine.setSchedule(definition.name, tick);
+      yield* Scheduler.materializeDue(definition, now);
+
+      let executions = 0;
+      const abandoned = yield* engine.takeTask(queue.name, 100);
+      if (abandoned === null)
+        return yield* Effect.die("Expected scheduled task");
+      executions++;
+      yield* TaskEngine.stepMockTime(101);
+      yield* engine.maintain(queue.name);
+
+      yield* TaskQueue.complete(queue, () => {
+        executions++;
+        return Effect.succeed("done");
+      });
+      expect(executions).toBe(2);
+    }).pipe(TestRuntime.runPromise));
+
+  test("the configured cron timezone determines the nominal tick", () => {
+    const cron = Cron.parseUnsafe("0 9 * * *", "America/New_York");
+    expect(Cron.next(cron, new Date("2026-03-08T12:00:00.000Z"))).toEqual(
+      new Date("2026-03-08T13:00:00.000Z"),
+    );
+  });
 });

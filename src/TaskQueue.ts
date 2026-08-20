@@ -6,13 +6,21 @@
  *
  * @module
  */
-import { Fiber, Schedule, Stream } from "effect";
+import { Schedule, Stream } from "effect";
+import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Function from "effect/Function";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
-import { type CompletionPolicy, decodeTask } from "./Schemas.js";
+import {
+  type CompletionPolicy,
+  decodeTask,
+  type EngineTerminalResult,
+  TaskErrorSchema,
+} from "./Schemas.js";
+import * as StorageProtocol from "./StorageProtocol.js";
 import type * as Task from "./Task.js";
 import * as TaskContext from "./TaskContext.js";
 import * as TaskEngine from "./TaskEngine.js";
@@ -51,6 +59,16 @@ export const make = <
 interface TakeOptions {
   readonly lockTimeout?: Duration.Input;
   readonly poolInterval?: Duration.Input;
+  readonly poll?: boolean;
+}
+
+interface TaskAttempt<
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+> {
+  readonly task: Task.Task<Payload, Success, Error>;
+  readonly leaseToken: string;
 }
 /**
  * Take the next available task from the queue, polling every `poolInterval`
@@ -59,7 +77,7 @@ interface TakeOptions {
  * the lock lifecycle (extend/release) and for reporting success/failure;
  * prefer {@link complete} for the managed path.
  */
-const takeUnsafe = Effect.fnUntraced(function* <
+const takeAvailable = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
@@ -68,8 +86,10 @@ const takeUnsafe = Effect.fnUntraced(function* <
   queue: TaskQueue<Payload, Success, Error, R>,
   options?: TakeOptions,
 ): Effect.fn.Return<
-  Task.Task<Payload, Success, Error>,
-  TaskEngine.TaskEngineError | Schema.SchemaError,
+  TaskAttempt<Payload, Success, Error> | null,
+  | StorageProtocol.StorageProtocolError
+  | TaskEngine.TaskEngineError
+  | Schema.SchemaError,
   TaskEngine.TaskEngine | Payload["DecodingServices"]
 > {
   const engine = yield* TaskEngine.TaskEngine;
@@ -80,40 +100,158 @@ const takeUnsafe = Effect.fnUntraced(function* <
     options?.lockTimeout ?? Duration.seconds(30),
   );
 
-  const task = yield* engine
-    .takeTask(TaskEngine.makePrefix(queue.name), lockTimeout)
-    .pipe(
-      Effect.repeat({
-        until: (task) => task !== null,
-        schedule: Schedule.spaced(poolInterval),
-      }),
-    );
+  const take = engine.takeTask(TaskEngine.makePrefix(queue.name), lockTimeout);
+  const attempt =
+    options?.poll === false
+      ? yield* take
+      : yield* take.pipe(
+          Effect.repeat({
+            until: (task) => task !== null,
+            schedule: Schedule.spaced(poolInterval),
+          }),
+        );
 
-  const decodedTask = yield* decodeTask(queue.task, task);
-  return decodedTask;
+  if (attempt === null) return null;
+
+  return {
+    leaseToken: attempt.leaseToken,
+    task: yield* decodeTask(queue.task, attempt.task),
+  };
+});
+
+const takeUnsafe = Effect.fnUntraced(function* <
+  Payload extends Schema.Top,
+  Success extends Schema.Top = Schema.Void,
+  Error extends Schema.Top = Schema.Never,
+  R = never,
+>(queue: TaskQueue<Payload, Success, Error, R>, options?: TakeOptions) {
+  const attempt = yield* takeAvailable(queue, options);
+  if (attempt === null) {
+    return yield* Effect.die("Polling take unexpectedly returned null");
+  }
+  return attempt;
 });
 
 export interface TaskOptions {
+  /** Explicit task identity override, used by durable scheduler tick tasks. */
+  readonly taskId?: string;
   delay?: number;
   maxRetries?: number;
+  maxStalledCount?: number;
   onSuccessPolicy?: CompletionPolicy;
   onFailurePolicy?: CompletionPolicy;
-  /**
-   * When offering from inside a handler, skip pinning the new task to the
-   * running task (it is still attributed via `createdBy`). No effect outside
-   * a handler.
-   */
-  detached?: boolean;
+  /** Keep this task's terminal result until the currently running task settles. */
+  retainResultUntil?: "current-task-settles";
+  /** Behavior when the idempotency identity already has a stored generation. */
+  onDuplicate?: "return-existing" | "new-generation";
 }
+
+/**
+ * Redis connection loss made it impossible to determine whether an offer was
+ * committed. Retry with the same queue payload/idempotency identity; the
+ * default duplicate behavior will return the committed generation unchanged.
+ */
+export class IndeterminateWriteError extends Data.TaggedError(
+  "IndeterminateWriteError",
+)<{
+  readonly queue: string;
+  readonly taskId: string;
+  readonly cause: TaskEngine.TaskEngineError;
+}> {}
+
+/** Explicit result retention was requested outside a managed task handler. */
+export class RetentionContextRequired extends Data.TaggedError(
+  "RetentionContextRequired",
+)<{
+  readonly queue: string;
+  readonly taskId: string;
+}> {}
+
+const causeText = (cause: unknown, depth = 0): string => {
+  if (depth >= 4) return String(cause);
+  if (typeof cause !== "object" || cause === null || !("cause" in cause)) {
+    return String(cause);
+  }
+  return `${String(cause)} ${causeText(cause.cause, depth + 1)}`;
+};
+
+const isIndeterminateConnectionFailure = (
+  error: TaskEngine.TaskEngineError,
+): boolean =>
+  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket closed|connection (?:is )?closed|connection lost|read only/i.test(
+    causeText(error.cause),
+  );
+
+const relationshipLimit = (
+  error: TaskEngine.TaskEngineError,
+): StorageProtocol.StorageCountLimitExceeded | undefined => {
+  const match = causeText(error.cause).match(
+    /STORAGE_RELATIONSHIP_LIMIT (holder|retained) (\d+)/,
+  );
+  if (!match) return undefined;
+  const maxCount = Number(match[2]);
+  return new StorageProtocol.StorageCountLimitExceeded({
+    resource: "relationships",
+    scope: match[1] as "holder" | "retained",
+    actualCount: maxCount,
+    maxCount,
+  });
+};
+
+declare const TaskHandleSuccess: unique symbol;
+declare const TaskHandleError: unique symbol;
+
+/** A durable, schema-aware reference to exactly one offered task generation. */
+export interface TaskHandle<Success, Error> {
+  readonly _tag: "TaskHandle";
+  readonly queue: string;
+  readonly taskId: string;
+  readonly generation: number;
+  readonly cursor: string;
+  readonly taskName: string;
+  readonly schemaId: string;
+  readonly protocolVersion: 1;
+  readonly [TaskHandleSuccess]?: (_: Success) => Success;
+  readonly [TaskHandleError]?: (_: Error) => Error;
+}
+
+export class TaskFailed<Failure> extends Data.TaggedError("TaskFailed")<{
+  readonly handle: TaskHandle<unknown, Failure>;
+  readonly failure: Failure;
+}> {}
+
+export class TaskNotFound extends Data.TaggedError("TaskNotFound")<{
+  readonly handle: TaskHandle<unknown, unknown>;
+}> {}
+
+export class ResultExpired extends Data.TaggedError("ResultExpired")<{
+  readonly handle: TaskHandle<unknown, unknown>;
+  readonly latestGeneration: number;
+}> {}
+
+export class CallerTimeout extends Data.TaggedError("CallerTimeout")<{
+  readonly handle: TaskHandle<unknown, unknown>;
+  readonly timeout: Duration.Input;
+}> {}
+
+export type OfferOutcome<
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+> = {
+  readonly _tag: "TaskCreated" | "TaskExisting";
+  readonly task: Task.Task<Payload, Success, Error>;
+  readonly handle: TaskHandle<Success["Type"], Error["Type"]>;
+};
 /**
  * Enqueue `payload` onto the queue. The payload is encoded via the task's
  * payload schema and the task id is derived from the definition's
  * idempotency key. Honors `delay` and the success/failure policy options.
  *
- * When called from inside a {@link complete} handler, the new task records the
- * running task as its creator (`createdBy`) and — unless `detached` is set —
- * is pinned by it (`heldBy`), deferring its completion policy until the outer
- * task dies.
+ * Inside a {@link complete} handler, the new task records immutable creator
+ * provenance. Nested offers remain execution-independent by default. Request
+ * `retainResultUntil: "current-task-settles"` only when the spawned task's
+ * terminal record must remain readable until the current task settles.
  */
 export const offer = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
@@ -125,30 +263,96 @@ export const offer = Effect.fnUntraced(function* <
   payload: Payload["Type"],
   options?: TaskOptions,
 ): Effect.fn.Return<
-  Task.Task<Payload, Success, Error>,
-  TaskEngine.TaskEngineError | Schema.SchemaError,
+  OfferOutcome<Payload, Success, Error>,
+  | IndeterminateWriteError
+  | RetentionContextRequired
+  | StorageProtocol.StorageProtocolError
+  | TaskEngine.TaskEngineError
+  | Schema.SchemaError,
   TaskEngine.TaskEngine | Payload["DecodingServices"]
 > {
   const encodePayload = Schema.encodeEffect(queue.task.payloadSchema);
-  const id = queue.task.idempotencyKey(payload);
+  const id = options?.taskId ?? queue.task.idempotencyKey(payload);
   const engine = yield* TaskEngine.TaskEngine;
-  const parentTask = yield* TaskContext.parentTask;
+  const currentTask = yield* TaskContext.currentTask;
+  if (options?.retainResultUntil && currentTask === undefined) {
+    return yield* new RetentionContextRequired({
+      queue: queue.name,
+      taskId: id,
+    });
+  }
 
-  const task = yield* engine.createTask({
-    heldBy: parentTask && !options?.detached ? [parentTask] : [],
-    createdBy: parentTask,
-    prefix: queue.name,
-    id,
-    name: queue.task.name,
-    payload: yield* encodePayload(payload),
-    delay: options?.delay ?? 0,
-    maxRetries: options?.maxRetries ?? -1,
-    onSuccessPolicy: options?.onSuccessPolicy ?? "delete",
-    onFailurePolicy: options?.onFailurePolicy ?? "delete",
-  });
+  const offered = yield* engine
+    .offerTask({
+      retentionHolder:
+        currentTask && options?.retainResultUntil ? currentTask : undefined,
+      creator: currentTask,
+      prefix: queue.name,
+      id,
+      name: queue.task.name,
+      payload: yield* StorageProtocol.encodeValue(
+        queue.task.schemaId,
+        "payload",
+        yield* encodePayload(payload),
+        queue.task.storageLimits,
+      ),
+      schemaId: queue.task.schemaId,
+      delay: options?.delay ?? 0,
+      maxRetries: options?.maxRetries ?? -1,
+      maxStalledCount: options?.maxStalledCount ?? 1,
+      maxErrorEntries: queue.task.storageLimits.maxErrorEntries,
+      maxRelationships: queue.task.storageLimits.maxRelationships,
+      maxEventEntries: queue.task.storageLimits.maxEventEntries,
+      taskRecordRetentionMs: queue.task.retention.taskRecordMs,
+      resultRetentionMs: queue.task.retention.resultMs,
+      terminalIndexRetentionMs: queue.task.retention.terminalIndexMs,
+      deadLetterRetentionMs: queue.task.retention.deadLetterMs,
+      eventRetentionMs: queue.task.retention.eventMs,
+      onSuccessPolicy: options?.onSuccessPolicy ?? "delete",
+      onFailurePolicy: options?.onFailurePolicy ?? "delete",
+      onDuplicate: options?.onDuplicate ?? "return-existing",
+    })
+    .pipe(
+      Effect.catchIf(
+        () => true,
+        (
+          cause,
+        ): Effect.Effect<
+          never,
+          | IndeterminateWriteError
+          | StorageProtocol.StorageCountLimitExceeded
+          | TaskEngine.TaskEngineError
+        > => {
+          const limit = relationshipLimit(cause);
+          if (limit) return Effect.fail(limit);
+          return isIndeterminateConnectionFailure(cause)
+            ? Effect.fail(
+                new IndeterminateWriteError({
+                  cause,
+                  queue: queue.name,
+                  taskId: id,
+                }),
+              )
+            : Effect.fail(cause);
+        },
+      ),
+    );
 
-  const res = yield* decodeTask(queue.task, task);
-  return res satisfies Task.Task<Payload, Success, Error>;
+  const task = yield* decodeTask(queue.task, offered.task);
+  return {
+    _tag: offered.status === "created" ? "TaskCreated" : "TaskExisting",
+    task,
+    handle: {
+      _tag: "TaskHandle",
+      queue: queue.name,
+      taskId: task.id,
+      generation: task.generation,
+      cursor: offered.cursor,
+      taskName: queue.task.name,
+      schemaId: queue.task.schemaId,
+      protocolVersion: StorageProtocol.protocolVersion,
+    },
+  } satisfies OfferOutcome<Payload, Success, Error>;
 });
 
 export const extendLock = Effect.fnUntraced(function* <
@@ -158,17 +362,18 @@ export const extendLock = Effect.fnUntraced(function* <
   R = never,
 >(
   queue: TaskQueue<Payload, Success, Error, R>,
-  task: Task.Task<Payload, Success, Error>,
+  attempt: TaskAttempt<Payload, Success, Error>,
   lockTimeout?: Duration.Input,
 ) {
   const engine = yield* TaskEngine.TaskEngine;
 
   yield* Effect.logDebug(
-    `extending lock for task ${task.id} with timeout ${lockTimeout}`,
+    `extending lock for task ${attempt.task.id} with timeout ${lockTimeout}`,
   );
   return yield* engine.extendLock(
     queue.name,
-    task.id,
+    attempt.task.id,
+    attempt.leaseToken,
     Duration.toMillis(lockTimeout ?? Duration.seconds(30)),
   );
 });
@@ -178,9 +383,16 @@ export const release = Effect.fnUntraced(function* <
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
->(queue: TaskQueue<Payload, Success, Error, R>, taskId: string) {
+>(
+  queue: TaskQueue<Payload, Success, Error, R>,
+  attempt: TaskAttempt<Payload, Success, Error>,
+) {
   const engine = yield* TaskEngine.TaskEngine;
-  return yield* engine.removeLock(queue.name, taskId);
+  return yield* engine.removeLock(
+    queue.name,
+    attempt.task.id,
+    attempt.leaseToken,
+  );
 });
 
 const succeed = Effect.fnUntraced(function* <
@@ -190,17 +402,24 @@ const succeed = Effect.fnUntraced(function* <
   R = never,
 >(
   queue: TaskQueue<Payload, Success, Error, R>,
-  task: Task.Task<Payload, Success, Error>,
+  attempt: TaskAttempt<Payload, Success, Error>,
   success: Success["Type"],
 ) {
   const engine = yield* TaskEngine.TaskEngine;
-  // encode to the schema's value (not a JSON string); the engine script
-  // JSON-encodes it once, mirroring how `fail` hands off the raw error value
+  // Encode to the schema's wire value before wrapping it in the storage
+  // envelope. Lua treats that envelope as an opaque ASCII-safe byte string.
   const encode = Schema.encodeEffect(queue.task.successSchema);
+  const encoded = yield* encode(success);
   return yield* engine.writeSuccess(
     queue.name,
-    task.id,
-    yield* encode(success),
+    attempt.task.id,
+    attempt.leaseToken,
+    yield* StorageProtocol.encodeValue(
+      queue.task.schemaId,
+      "success",
+      encoded,
+      queue.task.storageLimits,
+    ),
   );
 });
 
@@ -212,24 +431,38 @@ const fail = Effect.fnUntraced(function* <
   R = never,
 >(
   queue: TaskQueue<Payload, Success, Error, R>,
-  task: Task.Task<Payload, Success, Error>,
+  attempt: TaskAttempt<Payload, Success, Error>,
   failure: Error["Type"],
 ) {
   const engine = yield* TaskEngine.TaskEngine;
+  const encodeFailure = Schema.encodeEffect(queue.task.errorSchema);
 
   // the per-offer maxRetries (-1 when unset) overrides the definition's cap
   const maxRetries =
-    task.maxRetries !== -1 ? task.maxRetries : queue.task.maxRetries;
+    attempt.task.maxRetries !== -1
+      ? attempt.task.maxRetries
+      : queue.task.maxRetries;
 
   const retryAt =
-    queue.task.retrySchedule && task.errors.length < maxRetries
+    queue.task.retrySchedule && attempt.task.handlerFailureCount < maxRetries
       ? yield* nextRunAt(
           queue.task.retrySchedule,
-          new Date(task.createdAt.getTime() + task.delay),
-          [...task.errors, { timestamp: new Date(), error: failure }],
+          new Date(attempt.task.createdAt.getTime() + attempt.task.delay),
+          [...attempt.task.errors, { timestamp: new Date(), error: failure }],
         )
       : undefined;
-  return yield* engine.writeError(queue.name, task.id, failure, retryAt);
+  return yield* engine.writeError(
+    queue.name,
+    attempt.task.id,
+    attempt.leaseToken,
+    yield* StorageProtocol.encodeValue(
+      queue.task.schemaId,
+      "failure",
+      yield* encodeFailure(failure),
+      queue.task.storageLimits,
+    ),
+    retryAt,
+  );
 });
 
 export type TaskHandler<
@@ -240,6 +473,76 @@ export type TaskHandler<
 > = (
   task: Task.Task<Payload, Success, Error>,
 ) => Effect.Effect<Success["Type"], Error["Type"], R>;
+
+export interface ProcessingOptions {
+  readonly lockTimeout?: Duration.Input;
+  readonly lockRefresh?: Duration.Input;
+  readonly heartbeatRetryDelay?: Duration.Input;
+  readonly heartbeatRetryCount?: number;
+}
+
+const processAttempt = Effect.fnUntraced(function* <
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+  TR = never,
+  R = never,
+>(
+  self: TaskQueue<Payload, Success, Error, TR>,
+  attempt: TaskAttempt<Payload, Success, Error>,
+  handler: TaskHandler<Payload, Success, Error, R>,
+  options?: ProcessingOptions,
+) {
+  const lockTimeout = Duration.toMillis(
+    options?.lockTimeout ?? Duration.seconds(30),
+  );
+  const lockRefresh = Duration.toMillis(
+    options?.lockRefresh ?? Duration.seconds(10),
+  );
+  const retryDelay = Math.max(
+    1,
+    Duration.toMillis(options?.heartbeatRetryDelay ?? Duration.millis(250)),
+  );
+  const safetyWindow = Math.max(0, lockTimeout - lockRefresh);
+  const heartbeatRetryCount = Math.min(
+    Math.max(0, options?.heartbeatRetryCount ?? 3),
+    Math.floor(safetyWindow / retryDelay),
+  );
+
+  const renew = extendLock(self, attempt, lockTimeout).pipe(
+    Effect.retry({
+      while: (error) => error._tag === "TaskEngineError",
+      times: heartbeatRetryCount,
+      schedule: Schedule.spaced(retryDelay),
+    }),
+  );
+  const heartBeat = renew.pipe(
+    Effect.repeat(Schedule.spaced(lockRefresh)),
+    // The heartbeat has no successful completion: only ownership loss or an
+    // exhausted bounded transport retry may win the attempt race.
+    Effect.flatMap(() => Effect.never),
+  );
+
+  const handlerResult = handler(attempt.task).pipe(
+    Effect.provide(
+      TaskContext.layer({
+        currentTask: {
+          queue: self.name,
+          id: attempt.task.id,
+          generation: attempt.task.generation,
+        },
+      }),
+    ),
+    Effect.result,
+  );
+  const result = yield* Effect.raceFirst(handlerResult, heartBeat);
+  if (Result.isSuccess(result)) {
+    yield* succeed(self, attempt, result.success);
+  } else {
+    yield* fail(self, attempt, result.failure);
+  }
+  return attempt.task.id;
+});
 
 /**
  * Take the next task and run it to completion: it locks the task, keeps the
@@ -260,7 +563,10 @@ export const complete: {
     self: TaskQueue<Payload, Success, Error, TR>,
   ) => Effect.Effect<
     string,
-    TaskEngine.TaskEngineError | Schema.SchemaError,
+    | StorageProtocol.StorageProtocolError
+    | TaskEngine.LeaseLost
+    | TaskEngine.TaskEngineError
+    | Schema.SchemaError,
     TR | R
   >;
   <
@@ -274,7 +580,10 @@ export const complete: {
     handler: TaskHandler<Payload, Success, Error, R>,
   ): Effect.Effect<
     string,
-    TaskEngine.TaskEngineError | Schema.SchemaError,
+    | StorageProtocol.StorageProtocolError
+    | TaskEngine.LeaseLost
+    | TaskEngine.TaskEngineError
+    | Schema.SchemaError,
     TR | R
   >;
 } = Function.dual(
@@ -290,7 +599,10 @@ export const complete: {
     handler: TaskHandler<Payload, Success, Error, R>,
   ): Effect.Effect<
     string,
-    Schema.SchemaError | TaskEngine.TaskEngineError,
+    | StorageProtocol.StorageProtocolError
+    | Schema.SchemaError
+    | TaskEngine.LeaseLost
+    | TaskEngine.TaskEngineError,
     | TaskEngine.TaskEngine
     | TR
     | R
@@ -299,30 +611,35 @@ export const complete: {
     | Error["EncodingServices"]
   > => {
     return Effect.gen(function* () {
-      const task = yield* takeUnsafe(self);
-      const lockTimeout = Duration.seconds(30);
-      const lockRefresh = Duration.seconds(10);
-      const policy = Schedule.spaced(lockRefresh);
-      const heartBeat = yield* extendLock(self, task, lockTimeout)
-        .pipe(Effect.repeat(policy))
-        .pipe(Effect.forkChild);
-
-      const result = yield* handler(task).pipe(
-        Effect.provide(
-          TaskContext.layer({ parentTask: { prefix: self.name, id: task.id } }),
-        ),
-        Effect.result,
-      );
-      yield* Fiber.interrupt(heartBeat);
-      if (Result.isSuccess(result)) {
-        yield* succeed(self, task, result.success);
-      } else {
-        yield* fail(self, task, result.failure);
-      }
-      return task.id;
+      const attempt = yield* takeUnsafe(self);
+      return yield* processAttempt(self, attempt, handler);
     });
   },
 );
+
+/**
+ * Try to acquire and process one currently available task without polling.
+ * Returns `false` when the queue is empty. Intended for managed worker loops.
+ */
+export const completeOne = Effect.fnUntraced(function* <
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+  TR = never,
+  R = never,
+>(
+  self: TaskQueue<Payload, Success, Error, TR>,
+  handler: TaskHandler<Payload, Success, Error, R>,
+  options?: ProcessingOptions,
+) {
+  const attempt = yield* takeAvailable(self, {
+    poll: false,
+    lockTimeout: options?.lockTimeout,
+  });
+  if (attempt === null) return false;
+  yield* processAttempt(self, attempt, handler, options);
+  return true;
+});
 
 /**
  * Stream this queue's lifecycle events, decoded against the queue's schemas.
@@ -340,15 +657,17 @@ export const stream = <
 >(
   queue: TaskQueue<Payload, Success, Error>,
   {
-    cursor = `${Date.now()}-0`,
+    cursor,
+    pollInterval,
   }: {
     cursor?: string;
+    pollInterval?: Duration.Duration;
   } = {},
 ) =>
   Effect.gen(function* () {
     const engine = yield* TaskEngine.TaskEngine;
 
-    return engine.stream(queue.name, { cursor }).pipe(
+    return engine.stream(queue.name, { cursor, pollInterval }).pipe(
       Stream.mapEffect((event) =>
         Effect.gen(function* () {
           if (event._tag === "task.created") {
@@ -356,6 +675,7 @@ export const stream = <
             return {
               ...event,
               payload: {
+                ...event.payload,
                 newTask: yield* decodeTask(queue.task, task),
               },
             };
@@ -365,6 +685,7 @@ export const stream = <
             return {
               ...event,
               payload: {
+                ...event.payload,
                 existingTask: yield* decodeTask(queue.task, existingTask),
                 newTask: yield* decodeTask(queue.task, newTask),
               },
@@ -372,21 +693,41 @@ export const stream = <
           }
           if (event._tag === "task.failed") {
             const decodeError = Schema.decodeEffect(queue.task.errorSchema);
+            const rawFailure = event.payload.error;
+            const builtIn =
+              typeof rawFailure === "object" &&
+              rawFailure !== null &&
+              "_tag" in rawFailure &&
+              Object.values(StorageProtocol.builtInErrorTags).includes(
+                rawFailure._tag as never,
+              );
+            const failure = builtIn
+              ? rawFailure
+              : yield* StorageProtocol.decodeValue(
+                  rawFailure,
+                  queue.task.schemaId,
+                  "failure",
+                );
             return {
               ...event,
               payload: {
                 ...event.payload,
-                error: yield* decodeError(event.payload.error),
+                error: builtIn ? failure : yield* decodeError(failure),
               },
             };
           }
           if (event._tag === "task.completed") {
             const decodeSuccess = Schema.decodeEffect(queue.task.successSchema);
+            const success = yield* StorageProtocol.decodeValue(
+              event.payload.success,
+              queue.task.schemaId,
+              "success",
+            );
             return {
               ...event,
               payload: {
                 ...event.payload,
-                success: yield* decodeSuccess(event.payload.success),
+                success: yield* decodeSuccess(success),
               },
             };
           }
@@ -397,43 +738,200 @@ export const stream = <
     );
   }).pipe(Stream.unwrap);
 
-/**
- * Await a task's terminal event: resolves with its decoded success value once
- * the task completes, or fails with its decoded error if it fails terminally.
- * Watches the queue's event {@link stream} for the matching `taskId`.
- */
-export const wait = Effect.fnUntraced(function* <
+export interface WaitOptions {
+  readonly timeout?: Duration.Input;
+}
+
+/** Await the exact task generation named by a handle. */
+export const wait = <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
 >(
   queue: TaskQueue<Payload, Success, Error>,
-  taskId: string,
-): Effect.fn.Return<
-  Success["Type"],
-  Error["Type"],
-  TaskEngine.TaskEngine | Payload["DecodingServices"]
-> {
-  const events = stream(queue);
-  const [result] = yield* events.pipe(
-    Stream.filter(
-      (event) =>
-        event.taskId === taskId &&
-        (event._tag === "task.completed" || event._tag === "task.failed"),
-    ),
-    Stream.take(1),
-    Stream.runCollect,
-  );
-  if (result._tag === "task.completed") {
-    return result.payload.success;
-  } else if (result._tag === "task.failed") {
-    return yield* Effect.fail(result.payload.error);
-  }
-});
+  handle: TaskHandle<Success["Type"], Error["Type"]>,
+  options: WaitOptions = {},
+) => {
+  const operation = Effect.gen(function* () {
+    if (handle.protocolVersion !== StorageProtocol.protocolVersion) {
+      return yield* new StorageProtocol.UnsupportedProtocolVersion({
+        encountered: handle.protocolVersion,
+        supported: StorageProtocol.readableProtocolVersions,
+      });
+    }
+    if (handle.schemaId !== queue.task.schemaId) {
+      return yield* new StorageProtocol.SchemaIdentityMismatch({
+        expected: queue.task.schemaId,
+        encountered: handle.schemaId,
+      });
+    }
+
+    const engine = yield* TaskEngine.TaskEngine;
+    const decodeTerminalResult = Effect.fnUntraced(function* (
+      result: EngineTerminalResult,
+    ) {
+      if (
+        !StorageProtocol.readableProtocolVersions.includes(
+          result.protocolVersion as 1,
+        )
+      ) {
+        return yield* new StorageProtocol.UnsupportedProtocolVersion({
+          encountered: result.protocolVersion,
+          supported: StorageProtocol.readableProtocolVersions,
+        });
+      }
+      if (result.schemaId !== queue.task.schemaId) {
+        return yield* new StorageProtocol.SchemaIdentityMismatch({
+          expected: queue.task.schemaId,
+          encountered: result.schemaId,
+        });
+      }
+      if (result.generation !== handle.generation) {
+        return yield* new StorageProtocol.CorruptStorageValue({
+          message: "Terminal result generation does not match its key",
+        });
+      }
+      if (result.outcome === "success") {
+        if (result.success === undefined) {
+          return yield* new StorageProtocol.CorruptStorageValue({
+            message: "Terminal success has no result value",
+          });
+        }
+        const value = yield* StorageProtocol.decodeValue(
+          result.success,
+          queue.task.schemaId,
+          "success",
+        );
+        return {
+          _tag: "Success",
+          value: yield* Schema.decodeEffect(queue.task.successSchema)(value),
+        } as const;
+      }
+      if (result.failure === undefined) {
+        return yield* new StorageProtocol.CorruptStorageValue({
+          message: "Terminal failure has no error value",
+        });
+      }
+      const builtIn =
+        typeof result.failure === "object" &&
+        result.failure !== null &&
+        "_tag" in result.failure &&
+        Object.values(StorageProtocol.builtInErrorTags).includes(
+          result.failure._tag as never,
+        );
+      const failure = builtIn
+        ? result.failure
+        : yield* StorageProtocol.decodeValue(
+            result.failure,
+            queue.task.schemaId,
+            "failure",
+          );
+      const decoded = yield* Schema.decodeEffect(
+        Schema.Union([TaskErrorSchema, queue.task.errorSchema]),
+      )(failure);
+      return yield* new TaskFailed({ handle, failure: decoded });
+    });
+
+    const readDurable = Effect.gen(function* () {
+      const stored = yield* engine.getTask(handle.queue, handle.taskId);
+      if (stored === null) {
+        const result = yield* engine.getResult(
+          handle.queue,
+          handle.taskId,
+          handle.generation,
+        );
+        if (result !== null) return yield* decodeTerminalResult(result);
+        const latestGeneration = yield* engine.getGeneration(
+          handle.queue,
+          handle.taskId,
+        );
+        return latestGeneration === 0
+          ? yield* new TaskNotFound({ handle })
+          : yield* new ResultExpired({ handle, latestGeneration });
+      }
+      if (stored.generation !== handle.generation) {
+        const result = yield* engine.getResult(
+          handle.queue,
+          handle.taskId,
+          handle.generation,
+        );
+        if (result !== null) return yield* decodeTerminalResult(result);
+        return yield* new ResultExpired({
+          handle,
+          latestGeneration: stored.generation,
+        });
+      }
+      if (stored.outcome === undefined) return { _tag: "Pending" } as const;
+
+      const task = yield* decodeTask(queue.task, stored);
+      if (stored.outcome === "success") {
+        return { _tag: "Success", value: task.success } as const;
+      }
+      const lastFailure = task.errors.at(-1)?.error;
+      if (lastFailure === undefined) {
+        return yield* new StorageProtocol.CorruptStorageValue({
+          message: "Terminal failure has no error entry",
+        });
+      }
+      return yield* new TaskFailed({ handle, failure: lastFailure });
+    });
+
+    const initial = yield* readDurable;
+    if (initial._tag === "Success") return initial.value as Success["Type"];
+
+    const eventFiber = yield* stream(queue, {
+      cursor: handle.cursor,
+      pollInterval: Duration.millis(100),
+    }).pipe(
+      Stream.filter(
+        (event) =>
+          event.taskId === handle.taskId &&
+          event.generation === handle.generation &&
+          (event._tag === "task.completed" || event._tag === "task.failed"),
+      ),
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild,
+    );
+
+    // Let XREAD begin, then re-read durable state. If settlement raced the
+    // subscription, either this read or the stream necessarily observes it.
+    yield* Effect.yieldNow;
+    const rechecked = yield* readDurable;
+    if (rechecked._tag === "Success") {
+      yield* Fiber.interrupt(eventFiber);
+      return rechecked.value as Success["Type"];
+    }
+
+    const [event] = yield* Fiber.join(eventFiber);
+    if (event._tag === "task.completed") return event.payload.success;
+    if (event._tag === "task.failed") {
+      return yield* new TaskFailed({ handle, failure: event.payload.error });
+    }
+    return yield* new StorageProtocol.CorruptStorageValue({
+      message: "Wait stream ended without a terminal event",
+    });
+  });
+
+  const timeout = options.timeout;
+  return timeout === undefined
+    ? operation
+    : operation.pipe(
+        Effect.timeoutOrElse({
+          duration: timeout,
+          orElse: () =>
+            Effect.fail(
+              new CallerTimeout({
+                handle,
+                timeout,
+              }),
+            ),
+        }),
+      );
+};
 /**
- * Offer a task and await its outcome in one call: resolves with the decoded
- * success value or fails with the decoded error. Opens the event stream before
- * offering so a fast handler's terminal event isn't missed.
+ * Offer a task and await its outcome through the same generation-safe handle
+ * protocol as {@link wait}.
  */
 export const execute = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
@@ -448,22 +946,6 @@ export const execute = Effect.fnUntraced(function* <
   Error["Type"],
   TaskEngine.TaskEngine | Payload["DecodingServices"]
 > {
-  const events = stream(queue);
-  const task = yield* offer(queue, payload, options);
-
-  const [result] = yield* events.pipe(
-    Stream.filter((event) => {
-      return (
-        event.taskId === task.id &&
-        (event._tag === "task.completed" || event._tag === "task.failed")
-      );
-    }),
-    Stream.take(1),
-    Stream.runCollect,
-  );
-  if (result._tag === "task.completed") {
-    return result.payload.success;
-  } else if (result._tag === "task.failed") {
-    return yield* Effect.fail(result.payload.error);
-  }
+  const offered = yield* offer(queue, payload, options);
+  return yield* wait(queue, offered.handle);
 });

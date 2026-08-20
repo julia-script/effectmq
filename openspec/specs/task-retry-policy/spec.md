@@ -49,23 +49,54 @@ On failure, when a retry is due, the engine SHALL compute the next run time from
 
 ### Requirement: maxRetries caps an unbounded schedule
 
-`maxRetries` SHALL act as a hard cap on retry attempts that bounds an otherwise-unbounded schedule (e.g. `Schedule.forever`). A queue-level default cap of **5** SHALL apply when the offer does not specify one; a per-offer `maxRetries` SHALL override the queue-level default for that task. Once the recorded error count reaches the effective cap, the task SHALL NOT be retried regardless of the schedule. Setting `maxRetries` to `null` or `Infinity` SHALL disable the cap, allowing the schedule to run unbounded.
+`maxRetries` SHALL cap retries caused by typed handler failures and SHALL NOT be
+overloaded with lease-loss recovery. A task-definition default of 5 SHALL apply
+unless explicitly overridden for the task; `null` SHALL disable the
+handler-failure cap. The stored attempt history SHALL distinguish handler
+failures from stalls and ownership loss.
 
-#### Scenario: Default cap prevents infinite loop
+#### Scenario: Default cap prevents infinite handler retries
 
-- **WHEN** a task uses an unbounded schedule and is offered without a per-offer `maxRetries`
-- **THEN** retries stop once the error count reaches the queue-level default cap of 5
-- **AND** the failure policy is then applied
+- **WHEN** a task uses an unbounded retry schedule and no override
+- **THEN** handler-failure retries stop at the default cap of 5
+- **AND** its terminal failure policy is applied subject to result retention
 
-#### Scenario: Per-offer override wins
+#### Scenario: Per-task override wins
 
-- **WHEN** a task is offered with an explicit `maxRetries`
-- **THEN** that value is used as the cap for that task instead of the queue-level default
+- **WHEN** a task is offered with an explicit handler retry cap
+- **THEN** that cap is used instead of the task-definition default
 
-#### Scenario: Explicit unbounded retries
+#### Scenario: Explicit unbounded handler retries
 
-- **WHEN** a task's `maxRetries` is set to `null` or `Infinity`
-- **THEN** no cap is applied and retries continue for as long as the schedule yields run times
+- **WHEN** the effective handler retry cap is `null`
+- **THEN** the schedule alone determines whether another handler attempt is made
+
+### Requirement: Stalled attempts have a separate bounded policy
+
+Lease expiry and ownership loss SHALL increment a stalled-attempt counter and
+SHALL NOT be fed into the user's typed error `Schedule`. A configurable
+`maxStalledCount` SHALL bound recovery and default to a finite value.
+
+#### Scenario: Stall below the cap
+
+- **WHEN** an attempt loses its lease and stalled attempts remain
+- **THEN** the task returns to an eligible retry state with a stalled event
+
+#### Scenario: Stall cap exhausted
+
+- **WHEN** another lease expires after the stalled cap is exhausted
+- **THEN** the task settles with a terminal built-in stalled error
+
+### Requirement: Ownership loss is not a handler failure
+
+A stale or lost lease SHALL fail the processing attempt with `LeaseLost` and
+SHALL NOT append the handler's typed error or run its retry schedule.
+
+#### Scenario: Old attempt reports failure
+
+- **WHEN** a stale attempt tries to report a typed handler failure
+- **THEN** acknowledgement fails with `LeaseLost`
+- **AND** neither error history nor retry schedule state changes
 
 ### Requirement: Canceled errors short-circuit retries
 

@@ -2,82 +2,96 @@
 
 ## Purpose
 
-Defines how the TaskEngine publishes task-lifecycle events to a per-queue Redis Stream and exposes them as a decoded Effect `Stream`, and how TaskQueue builds typed streaming, `wait`, and `execute` on top of it.
+Defines how the TaskEngine publishes task-lifecycle events to a per-queue Redis
+Stream and exposes them as a decoded Effect `Stream`, and how TaskQueue builds
+typed streaming, `wait`, and `execute` on top of it.
 
 ## Requirements
 
 ### Requirement: Engine publishes task-lifecycle events
 
-The TaskEngine SHALL publish an event to a per-queue Redis Stream (`<prefix>:<name>:events`) whenever a task's lifecycle state changes. The emitted event types SHALL be: `task.created`, `task.updated`, `task.failed`, `task.completed`, and `task.moved`. Each event SHALL carry the task id and a tag-specific payload.
+The TaskEngine SHALL publish a versioned event whenever a task's lifecycle
+state changes. Events SHALL include a stable event id, task generation
+identity, event tag, protocol version, and tag-specific payload. Returning an
+unchanged task for a duplicate offer SHALL NOT emit an update event; an explicit
+accepted replacement SHALL emit `task.updated`.
 
 #### Scenario: Task created emits task.created
+- **WHEN** a new task generation is created
+- **THEN** a `task.created` event is published carrying its generation identity and new state
 
-- **WHEN** a task is created that did not previously exist
-- **THEN** a `task.created` event is published carrying the new task
+#### Scenario: Duplicate offer returns unchanged
+- **WHEN** a create is issued for an existing task without an accepted replacement
+- **THEN** the existing task is returned and no lifecycle update event is emitted
 
-#### Scenario: Existing task re-created emits task.updated
+#### Scenario: Task state changes
+- **WHEN** a task moves between delayed, waiting, leased, retry-scheduled, succeeded, and failed states
+- **THEN** a state-change event is published carrying the previous and new states
 
-- **WHEN** a create is issued for a task id that already exists
-- **THEN** a `task.updated` event is published carrying both the existing and the new task
+#### Scenario: Task attempt fails
+- **WHEN** an attempt reports a typed handler failure, lease loss, or stall
+- **THEN** a failure event identifies the failure kind, attempt, terminal status, and next retry time when present
 
-#### Scenario: Task moved between lists emits task.moved
-
-- **WHEN** a task is moved between the wait/scheduled/active/failed/success lists (or removed)
-- **THEN** a `task.moved` event is published carrying `from` and `to` list names
-
-#### Scenario: Task failure emits task.failed
-
-- **WHEN** a handler reports a failure
-- **THEN** a `task.failed` event is published carrying the error, `maxRetries`, `retryCount`, failure `policy`, and `willRetry`
-
-#### Scenario: Task success emits task.completed
-
-- **WHEN** a handler reports success
-- **THEN** a `task.completed` event is published carrying the success value and success `policy`
+#### Scenario: Task succeeds
+- **WHEN** the current fenced attempt reports success
+- **THEN** a terminal completion event is published carrying the encoded success envelope and completion policy
 
 ### Requirement: Engine exposes an event stream
 
-The TaskEngine SHALL expose a `stream(name, options?)` method that returns an Effect `Stream` of decoded events read from the queue's Redis Stream via `XREAD`. The stream SHALL start from an optional `cursor` (defaulting to the current time) and SHALL poll at a configurable interval, advancing the cursor past events it has yielded.
+The TaskEngine SHALL expose a decoded Effect `Stream` beginning after an
+explicit authoritative Redis cursor. When no cursor is supplied, the API SHALL
+obtain a server-authoritative start position. It SHALL advance from the last
+yielded id and expose the earliest retained cursor and a typed cursor-expired
+error.
 
 #### Scenario: Stream yields published events
+- **WHEN** a consumer opens a stream and a later event is published
+- **THEN** the consumer receives the decoded event exactly once within that stream run
 
-- **WHEN** a consumer runs the engine stream for a queue and an event is published
-- **THEN** the consumer receives the decoded event
+#### Scenario: Stream resumes from a retained cursor
+- **WHEN** a consumer opens the stream with a retained prior event id
+- **THEN** only retained events after that cursor are delivered
 
-#### Scenario: Stream resumes from a cursor
-
-- **WHEN** a consumer opens the stream with a cursor of a prior event id
-- **THEN** only events after that cursor are delivered
+#### Scenario: Cursor has expired
+- **WHEN** a consumer resumes from an id older than event retention
+- **THEN** the stream fails with a typed cursor-expired error containing the earliest available cursor
 
 ### Requirement: TaskQueue stream decodes payloads against queue schemas
 
-`TaskQueue.stream(queue)` SHALL wrap the engine stream and decode each event's task-shaped payload against the queue's payload/success/error schemas, so consumers receive typed tasks, success values, and errors rather than raw stored strings.
+`TaskQueue.stream(queue)` SHALL validate the storage protocol and decode task
+payloads, successes, and failures against the queue's schemas. Unsupported
+versions, corruption, and schema mismatches SHALL remain typed stream failures
+and SHALL NOT be normalized into valid-looking events.
 
 #### Scenario: Typed task in created event
+- **WHEN** a supported `task.created` event is streamed for a typed queue
+- **THEN** its task value is decoded to the queue's task type
 
-- **WHEN** a `task.created` event is streamed for a typed queue
-- **THEN** `payload.newTask` is decoded to the queue's task type
-
-#### Scenario: Typed error in failed event
-
-- **WHEN** a `task.failed` event is streamed for a typed queue
-- **THEN** `payload.error` is decoded against the queue's error schema
+#### Scenario: Corrupt failure event
+- **WHEN** a failure event contains invalid encoded bytes
+- **THEN** the stream fails with a typed decoding error rather than yielding an empty or partial failure
 
 ### Requirement: wait and execute await a task's terminal event
 
-`TaskQueue.wait(queue, taskId)` SHALL await the task's terminal event and resolve with its typed success value or fail with its typed error. `TaskQueue.execute(queue, payload, options?)` SHALL offer the task and then await its terminal event as a single call.
+`TaskQueue.wait` SHALL accept a task/result handle containing generation
+identity and an authoritative cursor. It SHALL check durable terminal state,
+subscribe from the cursor, then recheck state to close the race. It SHALL
+resolve typed success or fail with typed task failure, task-not-found,
+result-expired, cursor-expired, or timeout. `TaskQueue.execute` SHALL offer and
+await through the same protocol.
 
-#### Scenario: wait resolves on completion
+#### Scenario: Task already completed
+- **WHEN** `wait` begins after the retained task has already completed
+- **THEN** it resolves immediately from durable terminal state
 
-- **WHEN** `wait` is called for a task id that subsequently completes
-- **THEN** it resolves with the decoded success value
+#### Scenario: Completion races subscription
+- **WHEN** completion occurs between the initial state read and stream subscription
+- **THEN** the subscription or recheck observes the same terminal generation and `wait` resolves
 
-#### Scenario: wait fails on failure
+#### Scenario: Result expired
+- **WHEN** terminal metadata exists but its result retention has expired
+- **THEN** `wait` fails with a typed result-expired error
 
-- **WHEN** `wait` is called for a task id that subsequently fails terminally
-- **THEN** it fails with the decoded error
-
-#### Scenario: execute round-trips a task
-
-- **WHEN** `execute` is called and a handler completes the task
-- **THEN** it resolves with the handler's success value
+#### Scenario: Execute round-trips a task
+- **WHEN** `execute` offers a task and a managed worker completes it
+- **THEN** it resolves with the decoded success for the offered generation

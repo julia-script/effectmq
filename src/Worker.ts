@@ -20,6 +20,12 @@ import * as TaskQueue from "./TaskQueue.js";
 
 const TypeId = "~effectmq/Worker" as const;
 
+/**
+ * Configures worker concurrency, polling, maintenance, and graceful shutdown.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface WorkerOptions {
   /** Number of independent acquire/process loops. Defaults to `1`. */
   readonly concurrency?: number;
@@ -33,6 +39,15 @@ export interface WorkerOptions {
   readonly processing?: TaskQueue.ProcessingOptions;
 }
 
+/**
+ * A queue, handler, and runtime policy ready to be run as a managed worker.
+ *
+ * This value is only a description; creating it does not acquire Redis
+ * connections or start background fibers.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface Worker<
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -46,7 +61,33 @@ export interface Worker<
   readonly options: WorkerOptions;
 }
 
-/** Describe a worker. Use {@link run} inside an application scope. */
+/**
+ * Describes a worker without starting it.
+ *
+ * **Example: Build a two-slot worker**
+ *
+ * ```ts
+ * import { Effect, Schema } from "effect"
+ * import { Task, TaskQueue, Worker } from "@effectmq/core"
+ *
+ * const email = Task.make({
+ *   name: "email",
+ *   payload: { address: Schema.String },
+ *   success: Schema.Void,
+ *   error: Schema.String
+ * })
+ * const emails = TaskQueue.make("emails", email)
+ *
+ * const worker = Worker.make(
+ *   emails,
+ *   ({ payload }) => Effect.log(`Emailing ${payload.address}`),
+ *   { concurrency: 2 }
+ * )
+ * ```
+ *
+ * @category Constructors
+ * @since 0.3.0
+ */
 export const make = <
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -67,9 +108,21 @@ export const make = <
 class WorkerSlotStopped extends Data.TaggedError("WorkerSlotStopped") {}
 
 /**
- * Run until interrupted. Interruption stops new acquisitions, waits up to
- * `drainTimeout` for active handlers (whose heartbeats keep running), then
- * interrupts any remainder and releases the role-specific Redis resources.
+ * Runs a worker until interrupted.
+ *
+ * Independent acquisition fibers use the worker Redis role while a maintenance
+ * fiber uses the maintenance role. Interruption stops new acquisitions, keeps
+ * heartbeats alive while handlers drain, then interrupts any remainder after
+ * `drainTimeout`.
+ *
+ * **Gotchas**
+ *
+ * Queue handlers have at-least-once delivery and must make externally visible
+ * effects idempotent. Attempt and maintenance failures are logged and the loops
+ * continue, so this long-running Effect has `never` in its failure channel.
+ *
+ * @category Operations
+ * @since 0.3.0
  */
 export const run = <
   Payload extends Schema.Top,

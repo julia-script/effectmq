@@ -1,6 +1,6 @@
 /**
  * Typed task definitions: the schema-bearing description of a unit of work
- * (payload, success, and error types) that a {@link TaskQueue} processes.
+ * (payload, success, and error types) that a `TaskQueue` processes.
  *
  * @module
  */
@@ -14,7 +14,15 @@ const TypeId = "~effectmq/Task" as const;
 /** Default retry cap applied when `maxRetries` is not set, so an unbounded schedule can't loop forever. */
 const DEFAULT_MAX_RETRIES = 5;
 
-/** Finite retention windows, in milliseconds, for one task generation. */
+/**
+ * Finite retention windows, in milliseconds, for one task generation.
+ *
+ * Each resource expires independently during bounded maintenance sweeps. A
+ * result can therefore expire before its task record or terminal index.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface RetentionPolicy {
   readonly taskRecordMs: number;
   readonly resultMs: number;
@@ -23,6 +31,15 @@ export interface RetentionPolicy {
   readonly eventMs: number;
 }
 
+/**
+ * Default retention windows for task records, results, indexes, and events.
+ *
+ * Task records, terminal indexes, and events default to seven days; results to
+ * one day; and dead-letter entries to 30 days.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export const defaultRetentionPolicy: RetentionPolicy = {
   taskRecordMs: 7 * 24 * 60 * 60 * 1000,
   resultMs: 24 * 60 * 60 * 1000,
@@ -57,14 +74,25 @@ const resolveStorageLimits = (
 };
 
 /**
- * A decoded task as seen by a handler: the typed payload/success/error fields
- * plus the engine-assigned `id` and `name`.
+ * A decoded task generation as seen by a handler.
+ *
+ * It includes the typed payload, optional terminal value, attempt and stall
+ * counters, retry policy, retention policy, and engine-assigned identity.
+ *
+ * @category Models
+ * @since 0.1.0
  */
 export type { Task } from "./Schemas.js";
 
 /**
- * The schema-bearing definition of a task type: its name, payload/success/error
- * schemas, and how to derive an idempotency key from a payload.
+ * The schema-bearing definition of one task family.
+ *
+ * A definition owns payload, success, and failure schemas; retry behavior;
+ * storage and retention limits; and the idempotency-key function used by
+ * `TaskQueue.offer`.
+ *
+ * @category Models
+ * @since 0.1.0
  */
 export interface TaskDefinition<
   Payload extends Schema.Top,
@@ -92,11 +120,26 @@ export interface TaskDefinition<
 
   readonly idempotencyKey: (payload: Payload["Type"]) => string;
 }
+/**
+ * Resolves either a struct schema or bare struct fields to a struct schema.
+ *
+ * @category Schemas
+ * @since 0.2.0
+ */
 export type ResolvePayload<T extends AnyStructSchema | Schema.Struct.Fields> =
   T extends AnyStructSchema
     ? T
     : Schema.Struct<T extends Schema.Struct.Fields ? T : never>;
 
+/**
+ * Normalizes a task payload declaration to a struct schema.
+ *
+ * Existing schemas are returned unchanged; bare fields are wrapped with
+ * `Schema.Struct`.
+ *
+ * @category Schemas
+ * @since 0.2.0
+ */
 export const resolvePayloadSchema = <
   T extends AnyStructSchema | Schema.Struct.Fields,
 >(
@@ -151,17 +194,39 @@ const makeInternal = <
 };
 
 /**
- * Define a task type.
+ * Defines a typed task family.
  *
- * `payload` may be either a `Schema.Struct` or a bare fields object (which is
- * wrapped into a struct). `success`/`error` default to
- * `Schema.Void`/`Schema.Never`. When `idempotencyKey` is omitted, a random
- * key is generated per offer, so identical payloads are treated as distinct.
- * `retry` is a `Schedule` (or `{ while, until, times, schedule }` options)
- * that drives when a failed task is retried; `maxRetries` caps the attempts
- * (default 5; `null` for unbounded).
+ * `payload` accepts either a `Schema.Struct` or bare fields. `success` and
+ * `error` explicitly define the two terminal channels. `retry` accepts an
+ * Effect `Schedule` or repeat-style options, while `maxRetries` independently
+ * caps retries at five by default; pass `null` only for an intentionally
+ * unbounded cap.
  *
- * @returns A {@link TaskDefinition} to pass to `TaskQueue.make`.
+ * **Gotchas**
+ *
+ * Without `idempotencyKey`, every call derives a random key. Identical payloads
+ * are therefore distinct offers unless the caller supplies a stable key or an
+ * explicit task identifier.
+ *
+ * **Example: Define an idempotent task with bounded retries**
+ *
+ * ```ts
+ * import { Schema } from "effect"
+ * import { Task } from "@effectmq/core"
+ *
+ * const sendInvoice = Task.make({
+ *   name: "send-invoice",
+ *   schemaId: "send-invoice/v1",
+ *   payload: { invoiceId: Schema.String },
+ *   success: Schema.Void,
+ *   error: Schema.Struct({ reason: Schema.String }),
+ *   idempotencyKey: ({ invoiceId }) => invoiceId,
+ *   maxRetries: 3
+ * })
+ * ```
+ *
+ * @category Constructors
+ * @since 0.1.0
  */
 export const make: {
   <

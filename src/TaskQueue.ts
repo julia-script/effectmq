@@ -1,5 +1,5 @@
 /**
- * The high-level, typed queue API over {@link TaskEngine}. A `TaskQueue` pairs
+ * The high-level, typed queue API over `TaskEngine`. A `TaskQueue` pairs
  * a queue name with a {@link Task} definition; use {@link offer} to enqueue
  * work and {@link complete} to process a task end-to-end (take, run the handler,
  * and report the outcome, applying the definition's retry policy on failure).
@@ -28,7 +28,15 @@ import { nextRunAt } from "./utils.js";
 
 const TypeId = "~effectmq/TaskQueue" as const;
 
-/** A named queue bound to a typed {@link Task.TaskDefinition}. */
+/**
+ * A queue name bound to one typed {@link Task.TaskDefinition}.
+ *
+ * This is a pure descriptor; it does not allocate Redis state or start a
+ * worker. Queue state is created by the first operation that needs it.
+ *
+ * @category Models
+ * @since 0.1.0
+ */
 export interface TaskQueue<
   Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
@@ -39,7 +47,12 @@ export interface TaskQueue<
   readonly name: string;
   readonly task: Task.TaskDefinition<Payload, Success, Error, R>;
 }
-/** Create a {@link TaskQueue} from a queue `name` and a task definition. */
+/**
+ * Creates a typed queue descriptor from a stable name and task definition.
+ *
+ * @category Constructors
+ * @since 0.1.0
+ */
 export const make = <
   Payload extends Schema.Top,
   Success extends Schema.Top = Schema.Void,
@@ -132,6 +145,16 @@ const takeUnsafe = Effect.fnUntraced(function* <
   return attempt;
 });
 
+/**
+ * Controls the identity, timing, retry cap, and terminal retention of one offer.
+ *
+ * `delay` is measured in milliseconds. Completion policies default to
+ * `delete`, duplicate offers default to `return-existing`, and
+ * `maxStalledCount` defaults to one.
+ *
+ * @category Configuration
+ * @since 0.1.0
+ */
 export interface TaskOptions {
   /** Explicit task identity override, used by durable scheduler tick tasks. */
   readonly taskId?: string;
@@ -150,6 +173,9 @@ export interface TaskOptions {
  * Redis connection loss made it impossible to determine whether an offer was
  * committed. Retry with the same queue payload/idempotency identity; the
  * default duplicate behavior will return the committed generation unchanged.
+ *
+ * @category Errors
+ * @since 0.3.0
  */
 export class IndeterminateWriteError extends Data.TaggedError(
   "IndeterminateWriteError",
@@ -159,7 +185,12 @@ export class IndeterminateWriteError extends Data.TaggedError(
   readonly cause: TaskEngine.TaskEngineError;
 }> {}
 
-/** Explicit result retention was requested outside a managed task handler. */
+/**
+ * Indicates that current-task result retention was requested outside a handler.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class RetentionContextRequired extends Data.TaggedError(
   "RetentionContextRequired",
 )<{
@@ -201,7 +232,16 @@ const relationshipLimit = (
 declare const TaskHandleSuccess: unique symbol;
 declare const TaskHandleError: unique symbol;
 
-/** A durable, schema-aware reference to exactly one offered task generation. */
+/**
+ * A durable, schema-aware reference to exactly one offered task generation.
+ *
+ * Persist the entire handle when a later process will call {@link wait}. Its
+ * protocol and schema identities prevent a different decoder from silently
+ * interpreting the stored result.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface TaskHandle<Success, Error> {
   readonly _tag: "TaskHandle";
   readonly queue: string;
@@ -215,25 +255,61 @@ export interface TaskHandle<Success, Error> {
   readonly [TaskHandleError]?: (_: Error) => Error;
 }
 
+/**
+ * Carries the typed terminal failure observed by {@link wait}.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class TaskFailed<Failure> extends Data.TaggedError("TaskFailed")<{
   readonly handle: TaskHandle<unknown, Failure>;
   readonly failure: Failure;
 }> {}
 
+/**
+ * Indicates that neither a task record nor a result exists for a handle.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class TaskNotFound extends Data.TaggedError("TaskNotFound")<{
   readonly handle: TaskHandle<unknown, unknown>;
 }> {}
 
+/**
+ * Indicates that a handle's exact generation no longer has a retained result.
+ *
+ * `latestGeneration` distinguishes expiry or removal from replacement by a
+ * newer generation.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class ResultExpired extends Data.TaggedError("ResultExpired")<{
   readonly handle: TaskHandle<unknown, unknown>;
   readonly latestGeneration: number;
 }> {}
 
+/**
+ * Indicates that the caller's wait deadline elapsed without canceling the task.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class CallerTimeout extends Data.TaggedError("CallerTimeout")<{
   readonly handle: TaskHandle<unknown, unknown>;
   readonly timeout: Duration.Input;
 }> {}
 
+/**
+ * The generation-safe result of offering a task.
+ *
+ * `TaskExisting` means the configured identity already had a stored generation;
+ * its state is returned unchanged. `TaskCreated` identifies a new generation.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export type OfferOutcome<
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -244,7 +320,9 @@ export type OfferOutcome<
   readonly handle: TaskHandle<Success["Type"], Error["Type"]>;
 };
 /**
- * Enqueue `payload` onto the queue. The payload is encoded via the task's
+ * Enqueues a typed payload and returns its exact generation handle.
+ *
+ * The payload is encoded via the task's
  * payload schema and the task id is derived from the definition's
  * idempotency key. Honors `delay` and the success/failure policy options.
  *
@@ -252,6 +330,36 @@ export type OfferOutcome<
  * provenance. Nested offers remain execution-independent by default. Request
  * `retainResultUntil: "current-task-settles"` only when the spawned task's
  * terminal record must remain readable until the current task settles.
+ *
+ * **Gotchas**
+ *
+ * If this operation fails with {@link IndeterminateWriteError}, retry the same
+ * payload and identity with the default duplicate policy. Creating a new
+ * identity could enqueue the work twice.
+ *
+ * **Example: Offer and retain a handle**
+ *
+ * ```ts
+ * import { Effect, Schema } from "effect"
+ * import { Task, TaskEngine, TaskQueue } from "@effectmq/core"
+ *
+ * const resize = Task.make({
+ *   name: "resize-image",
+ *   payload: { imageId: Schema.String },
+ *   success: Schema.String,
+ *   error: Schema.String,
+ *   idempotencyKey: ({ imageId }) => imageId
+ * })
+ * const images = TaskQueue.make("images", resize)
+ *
+ * const enqueue = TaskQueue.offer(images, { imageId: "img-42" }).pipe(
+ *   Effect.map(({ handle }) => handle),
+ *   Effect.provide(TaskEngine.layer())
+ * )
+ * ```
+ *
+ * @category Operations
+ * @since 0.1.0
  */
 export const offer = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
@@ -355,6 +463,16 @@ export const offer = Effect.fnUntraced(function* <
   } satisfies OfferOutcome<Payload, Success, Error>;
 });
 
+/**
+ * Renews a low-level task attempt using its exact lease token.
+ *
+ * Managed handlers receive heartbeat supervision automatically. This operation
+ * is intended for custom worker integrations that already hold an acquired
+ * attempt and are prepared to handle {@link TaskEngine.LeaseLost}.
+ *
+ * @category Operations
+ * @since 0.1.0
+ */
 export const extendLock = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -378,6 +496,15 @@ export const extendLock = Effect.fnUntraced(function* <
   );
 });
 
+/**
+ * Voluntarily releases a low-level attempt back to runnable work.
+ *
+ * The exact lease token is required. Releasing does not record a stalled
+ * failure; lease expiry recovery does.
+ *
+ * @category Operations
+ * @since 0.1.0
+ */
 export const release = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -465,6 +592,17 @@ const fail = Effect.fnUntraced(function* <
   );
 });
 
+/**
+ * Processes one acquired task and returns its typed success or failure.
+ *
+ * Handler failure is persisted through the task's retry and terminal policy;
+ * it is not re-emitted as the processing operation's infrastructure failure.
+ * Handlers may execute more than once after lease loss and must make external
+ * side effects idempotent.
+ *
+ * @category Models
+ * @since 0.1.0
+ */
 export type TaskHandler<
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -474,6 +612,16 @@ export type TaskHandler<
   task: Task.Task<Payload, Success, Error>,
 ) => Effect.Effect<Success["Type"], Error["Type"], R>;
 
+/**
+ * Configures acquisition leases and bounded heartbeat recovery.
+ *
+ * Defaults are a 30-second lease, a 10-second refresh interval, 250 ms between
+ * heartbeat retries, and at most three transport retries within the remaining
+ * lease safety window.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface ProcessingOptions {
   readonly lockTimeout?: Duration.Input;
   readonly lockRefresh?: Duration.Input;
@@ -545,10 +693,40 @@ const processAttempt = Effect.fnUntraced(function* <
 });
 
 /**
- * Take the next task and run it to completion: it locks the task, keeps the
- * lock alive with a background heartbeat, runs `handler`, then reports the
- * outcome to the engine.
- * @returns The task id
+ * Takes the next task, supervises its lease, and persists the handler outcome.
+ *
+ * This operation polls until work is available, then returns the processed task
+ * identifier. It is available in data-first and data-last forms. Handler
+ * failures are recorded on the task and may schedule a retry; only decoding,
+ * storage, Redis, or ownership failures remain in the Effect failure channel.
+ *
+ * **Gotchas**
+ *
+ * Use `Worker.run` for production worker loops. A handler can run more
+ * than once if its lease expires or ownership is lost.
+ *
+ * **Example: Process one task**
+ *
+ * ```ts
+ * import { Effect, Schema } from "effect"
+ * import { Task, TaskQueue } from "@effectmq/core"
+ *
+ * const greet = Task.make({
+ *   name: "greet",
+ *   payload: { name: Schema.String },
+ *   success: Schema.String,
+ *   error: Schema.String
+ * })
+ * const greetings = TaskQueue.make("greetings", greet)
+ *
+ * const processNext = TaskQueue.complete(
+ *   greetings,
+ *   ({ payload }) => Effect.succeed(`Hello, ${payload.name}!`)
+ * )
+ * ```
+ *
+ * @category Operations
+ * @since 0.1.0
  */
 export const complete: {
   <
@@ -620,6 +798,9 @@ export const complete: {
 /**
  * Try to acquire and process one currently available task without polling.
  * Returns `false` when the queue is empty. Intended for managed worker loops.
+ *
+ * @category Operations
+ * @since 0.3.0
  */
 export const completeOne = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
@@ -649,6 +830,15 @@ export const completeOne = Effect.fnUntraced(function* <
  * `task.failed` yields a typed error, and `task.completed` yields a typed
  * success value. `cursor` resumes from a prior event id (defaults to now, so
  * only future events are delivered).
+ *
+ * **Gotchas**
+ *
+ * Event retention is finite. A cursor into a trimmed interval fails with
+ * {@link TaskEngine.CursorExpired}; resume from its `earliest` cursor only when
+ * skipping the missing events is acceptable.
+ *
+ * @category Streaming
+ * @since 0.2.0
  */
 export const stream = <
   Payload extends Schema.Top,
@@ -738,11 +928,31 @@ export const stream = <
     );
   }).pipe(Stream.unwrap);
 
+/**
+ * Configures a caller-local deadline for {@link wait}.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface WaitOptions {
   readonly timeout?: Duration.Input;
 }
 
-/** Await the exact task generation named by a handle. */
+/**
+ * Awaits the exact task generation named by a durable handle.
+ *
+ * The operation checks retained state, subscribes to lifecycle events, and
+ * checks state again before awaiting an event. This closes the completion race
+ * around subscription while preserving a durable fast path for already-settled
+ * tasks.
+ *
+ * A terminal task failure becomes {@link TaskFailed}. Missing records, expired
+ * results, caller timeouts, incompatible storage metadata, and trimmed cursors
+ * remain distinct typed failures. A caller timeout does not cancel queue work.
+ *
+ * @category Operations
+ * @since 0.2.0
+ */
 export const wait = <
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -932,6 +1142,15 @@ export const wait = <
 /**
  * Offer a task and await its outcome through the same generation-safe handle
  * protocol as {@link wait}.
+ *
+ * **Gotchas**
+ *
+ * This convenience operation has no caller-timeout option. Use {@link offer}
+ * followed by {@link wait} when the waiting fiber needs its own deadline or the
+ * handle must be persisted elsewhere.
+ *
+ * @category Operations
+ * @since 0.2.0
  */
 export const execute = Effect.fnUntraced(function* <
   Payload extends Schema.Top,

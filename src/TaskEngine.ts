@@ -33,13 +33,33 @@ import {
 
 const TypeId = "~effectmq/TaskEngine" as const;
 
+/**
+ * Configures Redis key namespacing, deterministic test time, and sweep bounds.
+ *
+ * `maintenanceBatchSize` defaults to 100 and cannot exceed
+ * {@link maxMaintenanceBatchSize}. The default key prefix is `~effectmq:v1`.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export type TaskEngineConfig = {
   debugMode?: boolean;
   prefix?: string;
   maintenanceBatchSize?: number;
 };
-/** Largest supported number of records processed by one atomic maintenance call. */
+/**
+ * Largest supported number of records processed by one atomic maintenance call.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export const maxMaintenanceBatchSize = 1_000;
+/**
+ * Wraps a Redis, script, encoding, or decoding failure at the engine boundary.
+ *
+ * @category Errors
+ * @since 0.1.0
+ */
 export class TaskEngineError extends Data.TaggedError("TaskEngineError")<{
   readonly message?: string;
   readonly cause: unknown;
@@ -49,32 +69,70 @@ export class TaskEngineError extends Data.TaggedError("TaskEngineError")<{
   }
 }
 
+/**
+ * Reports whether an offer created a generation or returned an existing one.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface TaskCreateResult {
   readonly status: "created" | "existing";
   readonly cursor: string;
   readonly task: EngineTask;
 }
 
-/** One acquired execution attempt and its opaque ownership credential. */
+/**
+ * One acquired execution attempt and its opaque ownership credential.
+ *
+ * The token belongs to this specific acquisition, not to the worker or task.
+ * Every ownership-sensitive transition must present it unchanged.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface TaskAttempt {
   readonly task: EngineTask;
   readonly leaseToken: string;
 }
 
+/**
+ * Indicates that an attempt no longer owns the task generation it tried to mutate.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class LeaseLost extends Data.TaggedError("LeaseLost")<{
   readonly prefix: string;
   readonly taskId: string;
   readonly cause: TaskEngineError;
 }> {}
 
+/**
+ * Redis Stream cursor bounds for one queue's retained lifecycle events.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface EventCursors {
   readonly first: string;
   readonly earliest: string;
   readonly latest: string;
 }
 
+/**
+ * A task index that can be inspected through `TaskEngine.listTasks`.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export type TaskList = "wait" | "scheduled" | "active" | "failed" | "success";
 
+/**
+ * One bounded page of task identifiers from an engine index.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export interface TaskListPage {
   /** Task ids in FIFO order for `wait`, otherwise ascending score then id. */
   readonly items: readonly string[];
@@ -82,6 +140,14 @@ export interface TaskListPage {
   readonly nextCursor?: string;
 }
 
+/**
+ * Indicates that event retention trimmed the stream position a reader requested.
+ *
+ * Resume from `earliest` when skipping the missing interval is acceptable.
+ *
+ * @category Errors
+ * @since 0.3.0
+ */
 export class CursorExpired extends Data.TaggedError("CursorExpired")<{
   readonly requested: string;
   readonly earliest: string;
@@ -110,52 +176,72 @@ const compareStreamIds = (left: string, right: string): number => {
 };
 
 /**
- * The task engine service. Provides the atomic queue operations (create, take,
- * write success/error, lock management) and schedule coordination, backed by
- * Redis. Obtain an implementation via {@link layer}.
+ * Low-level atomic queue, lease, retention, schedule, and event operations.
+ *
+ * Most applications should use `TaskQueue`, `Worker`, and `Scheduler`. Use the
+ * engine directly for administration, inspection, or custom runtimes that can
+ * uphold its generation and lease-token invariants.
+ *
+ * **Gotchas**
+ *
+ * A successful Redis write followed by a lost connection can be indeterminate.
+ * Ownership-sensitive operations fail with {@link LeaseLost} when their exact
+ * per-attempt token no longer owns the generation.
+ *
+ * @category Services
+ * @since 0.1.0
  */
 export class TaskEngine extends Context.Service<
   TaskEngine,
   {
     readonly [TypeId]: typeof TypeId;
+    /** Compatibility offer that returns only the created or existing task. */
     readonly createTask: (
       task: EngineTaskInsert,
     ) => Effect.Effect<EngineTask, TaskEngineError>;
+    /** Idempotently offers a task and reports whether its generation was new. */
     readonly offerTask: (
       task: EngineTaskInsert,
     ) => Effect.Effect<TaskCreateResult, TaskEngineError>;
+    /** Reads a task generation, or `null` when no task record remains. */
     readonly getTask: (
       prefix: string,
       id: string,
     ) => Effect.Effect<EngineTask | null, TaskEngineError>;
+    /** Reads the latest generation number for a task identity. */
     readonly getGeneration: (
       prefix: string,
       id: string,
     ) => Effect.Effect<number, TaskEngineError>;
+    /** Reads a retained terminal result for an exact generation. */
     readonly getResult: (
       prefix: string,
       id: string,
       generation: number,
     ) => Effect.Effect<EngineTerminalResult | null, TaskEngineError>;
+    /** Lists at most 1,000 task ids using an opaque pagination cursor. */
     readonly listTasks: (
       prefix: string,
       list: TaskList,
       options?: { readonly cursor?: string; readonly limit?: number },
     ) => Effect.Effect<TaskListPage, TaskEngineError>;
-    /** Run one bounded maintenance sweep for a queue. */
+    /** Runs one bounded promotion, lease-recovery, and retention sweep. */
     readonly maintain: (
       prefix: string,
     ) => Effect.Effect<Observability.QueueHealth, TaskEngineError>;
+    /** Reads the first, earliest-retained, and latest event stream cursors. */
     readonly eventCursors: (
       prefix: string,
     ) => Effect.Effect<EventCursors, TaskEngineError>;
 
+    /** Settles an owned attempt successfully using its exact lease token. */
     readonly writeSuccess: (
       prefix: string,
       id: string,
       leaseToken: string,
       result: unknown,
     ) => Effect.Effect<void, TaskEngineError | LeaseLost>;
+    /** Records an owned attempt failure and optionally schedules its retry. */
     readonly writeError: (
       prefix: string,
       id: string,
@@ -163,21 +249,25 @@ export class TaskEngine extends Context.Service<
       error: unknown,
       retryAt?: Duration.Input,
     ) => Effect.Effect<void, TaskEngineError | LeaseLost>;
+    /** Renews an owned attempt's lease for `lockTimeout` milliseconds. */
     readonly extendLock: (
       prefix: string,
       id: string,
       leaseToken: string,
       lockTimeout: number,
     ) => Effect.Effect<void, TaskEngineError | LeaseLost>;
+    /** Voluntarily releases an owned attempt and returns it to runnable work. */
     readonly removeLock: (
       prefix: string,
       id: string,
       leaseToken: string,
     ) => Effect.Effect<void, TaskEngineError | LeaseLost>;
+    /** Acquires the next runnable task with a fresh lease token. */
     readonly takeTask: (
       prefix: string,
       lockTimeout: number,
     ) => Effect.Effect<TaskAttempt | null, TaskEngineError>;
+    /** Removes an unretained task generation and all queue memberships. */
     readonly removeTask: (
       prefix: string,
       id: string,
@@ -188,10 +278,12 @@ export class TaskEngine extends Context.Service<
       id: string,
     ) => Effect.Effect<void, TaskEngineError>;
 
+    /** Initializes a durable schedule cursor without moving an existing cursor. */
     readonly setSchedule: (
       id: string,
       next: Date,
     ) => Effect.Effect<Date, TaskEngineError>;
+    /** Compare-and-advances a durable schedule cursor. */
     readonly consumeSchedule: (
       name: string,
       toConsume: Date,
@@ -217,6 +309,12 @@ export class TaskEngine extends Context.Service<
   }
 >()("TaskEngine") {}
 
+/**
+ * The service interface represented by the {@link TaskEngine} tag.
+ *
+ * @category Services
+ * @since 0.1.0
+ */
 export type TaskEngineService = TaskEngine["Service"];
 // must match MOCKTIME_KEY in src/lua/taskEngine.lua
 const MOCKTIME_KEY = "$$$effectmq/debug/mocktime";
@@ -224,6 +322,14 @@ const MOCKTIME_KEY = "$$$effectmq/debug/mocktime";
 /**
  * Override the engine's notion of "now" (only honored when the engine is built
  * with `debugMode`). Intended for deterministic tests of delays and schedules.
+ *
+ * **Gotchas**
+ *
+ * The mock clock is a Redis-global debug key, not a queue- or prefix-local
+ * clock. Never enable `debugMode` in production.
+ *
+ * @category Testing
+ * @since 0.1.0
  */
 export const setMockTime = (time: Duration.Input) =>
   Effect.gen(function* () {
@@ -231,7 +337,14 @@ export const setMockTime = (time: Duration.Input) =>
     yield* redis.send("SET", MOCKTIME_KEY, String(Duration.toMillis(time)));
   }).pipe(Effect.mapError(TaskEngineError.of("Failed to set mock time")));
 
-/** Advance the mock clock by `time` (debug-mode only). See {@link setMockTime}. */
+/**
+ * Advances the Redis-global mock clock by a duration.
+ *
+ * Only engines built with `debugMode` read this clock. See {@link setMockTime}.
+ *
+ * @category Testing
+ * @since 0.1.0
+ */
 export const stepMockTime = (time: Duration.Input) =>
   Effect.gen(function* () {
     const redis = yield* RedisPool;
@@ -274,16 +387,28 @@ const pack = (value: unknown) =>
 
 const decodeEvents = Schema.decodeUnknownEffect(Schema.Array(EventSchema));
 
+/**
+ * Joins Redis key namespace segments with a colon.
+ *
+ * Segments are not escaped; callers should avoid embedded colons when they
+ * need unambiguous composition.
+ *
+ * @category Utilities
+ * @since 0.1.0
+ */
 export const makePrefix = (...prefixes: string[]) => prefixes.join(":");
 
 /**
- * Build a {@link TaskEngine} implementation against the ambient
- * {@link RedisPool} service. The script is loaded lazily by exact content and
+ * Builds a {@link TaskEngine} implementation against a concrete Redis service.
+ *
+ * The script is loaded lazily by exact content and
  * invoked through cached `EVALSHA`, with one transparent `NOSCRIPT` recovery.
  * `debugMode` enables the mockable clock (see {@link setMockTime});
  * `prefix` namespaces all keys. Every acquisition creates a fresh opaque lease
  * token; callers must present it for every ownership-sensitive transition.
- * Usually consumed via {@link layer}.
+ *
+ * @category Constructors
+ * @since 0.3.0
  */
 export const makeWithRedis = (
   redis: RedisPoolService,
@@ -781,13 +906,23 @@ export const makeWithRedis = (
     });
   });
 
-/** Build a task engine from the ambient producer Redis pool. */
+/**
+ * Builds a task engine from the ambient producer {@link RedisPool} service.
+ *
+ * @category Constructors
+ * @since 0.1.0
+ */
 export const make = (config?: TaskEngineConfig) =>
   Effect.gen(function* () {
     const redis = yield* RedisPool;
     return yield* makeWithRedis(redis, config);
   });
 
-/** A `Layer` providing the {@link TaskEngine} service; requires a `RedisPool` service. */
+/**
+ * Provides {@link TaskEngine} from an ambient {@link RedisPool} service.
+ *
+ * @category Layers
+ * @since 0.1.0
+ */
 export const layer = (config?: TaskEngineConfig) =>
   Layer.effect(TaskEngine, make(config));

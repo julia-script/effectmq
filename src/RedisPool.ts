@@ -1,7 +1,7 @@
 /**
  * The Redis service `TaskEngine` depends on: a minimal command and cached
  * script surface over a (possibly pooled) Redis connection. Provide it with
- * {@link NodeRedisPool} or any custom implementation.
+ * `NodeRedisPool` or any custom implementation.
  *
  * @module
  */
@@ -9,13 +9,31 @@ import { Context, Effect, Metric, Ref } from "effect";
 import type * as Redis from "effect/unstable/persistence/Redis";
 import * as Observability from "./Observability.js";
 
+/**
+ * A text or binary argument accepted by the EffectMQ Redis boundary.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export type RedisArgument = string | Uint8Array;
 
+/**
+ * Sends one Redis command and preserves failures as Effect Redis errors.
+ *
+ * @category Models
+ * @since 0.3.0
+ */
 export type RedisSend = <A = unknown>(
   command: string,
   ...args: ReadonlyArray<RedisArgument>
 ) => Effect.Effect<A, Redis.RedisError>;
 
+/**
+ * Controls key partitioning and reply decoding for a Lua script invocation.
+ *
+ * @category Configuration
+ * @since 0.3.0
+ */
 export interface RedisScriptOptions {
   /** Number of leading script arguments Redis should expose through `KEYS`. */
   readonly numberOfKeys?: number;
@@ -23,6 +41,19 @@ export interface RedisScriptOptions {
   readonly binaryReply?: boolean;
 }
 
+/**
+ * The minimal Redis command and cached-script surface used by EffectMQ.
+ *
+ * **Details**
+ *
+ * `evalScript` loads exact Lua source with `SCRIPT LOAD`, caches its digest,
+ * invokes it with `EVALSHA`, and reloads once after a `NOSCRIPT` response.
+ * Binary arguments are supported by every operation; `sendBinary` and the
+ * `binaryReply` option additionally preserve binary replies.
+ *
+ * @category Services
+ * @since 0.3.0
+ */
 export interface RedisPoolService {
   readonly send: RedisSend;
   readonly sendBinary: RedisSend;
@@ -40,23 +71,51 @@ export interface RedisPoolService {
   ) => Effect.Effect<A, Redis.RedisError>;
 }
 
+/**
+ * Effect service tag for the producer-facing Redis command pool.
+ *
+ * Provide it with `NodeRedisPool.layer` or a custom service built by
+ * {@link make}.
+ *
+ * @category Services
+ * @since 0.2.0
+ */
 export class RedisPool extends Context.Service<RedisPool, RedisPoolService>()(
   "effectmq/RedisPool",
 ) {}
 
-/** Physically isolated command pools for producer, worker, and maintenance work. */
+/**
+ * Physically isolated Redis command services for each queue workload.
+ *
+ * Producer traffic cannot consume the connections reserved for worker
+ * acquisition or maintenance sweeps.
+ *
+ * @category Services
+ * @since 0.3.0
+ */
 export interface RedisConnectionRolesService {
   readonly producer: RedisPoolService;
   readonly worker: RedisPoolService;
   readonly maintenance: RedisPoolService;
 }
 
+/**
+ * Effect service tag for producer, worker, and maintenance Redis roles.
+ *
+ * @category Services
+ * @since 0.3.0
+ */
 export class RedisConnectionRoles extends Context.Service<
   RedisConnectionRoles,
   RedisConnectionRolesService
 >()("effectmq/RedisConnectionRoles") {}
 
-/** Build role routing, typically with three independently managed pools. */
+/**
+ * Creates role routing from three independently managed Redis services.
+ *
+ * @category Constructors
+ * @since 0.3.0
+ */
 export const makeConnectionRoles = (
   producer: RedisPoolService,
   worker: RedisPoolService,
@@ -66,7 +125,24 @@ export const makeConnectionRoles = (
 const isNoScript = (error: Redis.RedisError) =>
   String(error.cause).includes("NOSCRIPT");
 
-/** Build a RedisPool service from text and binary command senders. */
+/**
+ * Creates a {@link RedisPool} service from text and binary command senders.
+ *
+ * **When to use**
+ *
+ * Use this constructor when integrating a Redis client other than the bundled
+ * node-redis adapter. Most Node.js applications can provide
+ * `NodeRedisPool.layer` directly.
+ *
+ * **Gotchas**
+ *
+ * The two senders must share the same Redis server and command semantics. The
+ * binary sender must preserve bulk-string replies as `Uint8Array`-compatible
+ * values.
+ *
+ * @category Constructors
+ * @since 0.3.0
+ */
 export const make = Effect.fnUntraced(function* (
   send: RedisSend,
   sendBinary: RedisSend,

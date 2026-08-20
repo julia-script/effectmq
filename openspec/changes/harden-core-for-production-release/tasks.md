@@ -95,5 +95,5 @@
 - [x] 10.8 Build and pack the tarball, reject scratch/test/unintended files, and install it into representative ESM consumers that exercise every public export
 - [x] 10.9 Add a release-candidate soak using the maximum supported batch limits and verify metrics, memory, Redis latency, and shutdown behavior
 - [x] 10.10 Resolve npm's current `beta` dist-tag and update `effect`, every direct `@effect/*` dependency, the peer minimum, lockfile, documentation, and packed-consumer fixture; rerun all release gates
-- [ ] 10.11 Configure protected npm trusted publishing with provenance and require the exact-commit release gate before publication
-- [ ] 10.12 Publish the compatibility and performance evidence, cut the release candidate, complete the rollback rehearsal, and only then mark the release production-ready
+- [x] 10.11 Configure protected npm trusted publishing with provenance and require the exact-commit release gate before publication
+- [x] 10.12 Publish the compatibility and performance evidence, cut the release candidate, complete the rollback rehearsal, and only then mark the release production-ready

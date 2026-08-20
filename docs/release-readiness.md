@@ -1,8 +1,9 @@
 # 0.3.0-rc.0 release record
 
-Candidate status: locally cut and verified; not yet published or production
-promoted. Production readiness remains false until npm's trusted publisher is
-bound to the protected workflow and the exact candidate commit passes CI.
+Candidate status: published, provenance-verified, and production-ready as a
+release candidate. The `rc` tag points to `0.3.0-rc.0`; npm's `latest` tag
+intentionally remains on `0.2.0` until the observation period and an explicit
+stable promotion decision.
 
 Dependency baseline: `effect@4.0.0-beta.107` and
 `@effect/platform-node@4.0.0-beta.107`, resolved from npm's `beta` dist-tag on
@@ -11,9 +12,13 @@ Dependency baseline: `effect@4.0.0-beta.107` and
 ## Candidate artifact
 
 - Package: `@effectmq/core@0.3.0-rc.0`
-- Tarball: `effectmq-core-0.3.0-rc.0.tgz`
+- Git tag: `v0.3.0-rc.0`
+- Candidate commit: `4594e4bba32cc005b7a50efed1628cdac6f8c1d6`
+- Registry tarball: `https://registry.npmjs.org/@effectmq/core/-/core-0.3.0-rc.0.tgz`
 - Entries: 64
-- SHA-256: `ac7d6437deac3056151e11612aa9a37508dbfb79144d8476540e9d6b2657128a`
+- Registry integrity: `sha512-7KHgBH516Oh4mI+qKXpUbBoZHxN+knFxPuP30oe3pSuhE0YM3Boesi1qj14g7dW8WU5Le4kgPIR3faOk3kJcMQ==`
+- Registry SHA-1: `a6f0c774014af8739f48c131f30f89c42ba8cfc1`
+- Local candidate SHA-256: `ac7d6437deac3056151e11612aa9a37508dbfb79144d8476540e9d6b2657128a`
 - Local artifact: `/tmp/effectmq-0.3.0-rc.0/effectmq-core-0.3.0-rc.0.tgz`
 
 The package gate installed this tarball into clean JavaScript and TypeScript ESM
@@ -34,6 +39,10 @@ research, or editor file was present.
 | Performance | [Published matrix](./performance.md) |
 | Soak | [233,106 accepted/completed over five minutes, zero command errors](./soak.md) |
 | Rollback | Pre-upgrade snapshot restored; 9 candidate keys removed; 0 remained |
+| Exact candidate CI | [Run 32317781098](https://github.com/julia-script/effectmq/actions/runs/32317781098) passed every required job |
+| Protected publication | [Run 32317832772](https://github.com/julia-script/effectmq/actions/runs/32317832772) published through `npm-production` |
+| Registry canary | Clean npm install loaded the root and every documented subpath export on Node 26 |
+| Provenance | Signed SLSA v1 statement resolves the package digest to candidate commit `4594e4b` |
 
 Rollback was rehearsed against an isolated Redis namespace with
 `pnpm rehearse:rollback`. It stored and completed candidate work, changed a
@@ -57,12 +66,18 @@ workflow `release.yml`, with `npm publish` and `npm stage publish` permissions.
 The protected GitHub environment remains restricted to `main` and requires a
 reviewer.
 
-Still required before checking the final production boxes:
+The Release workflow accepted only the successful CI `workflow_run` for commit
+`4594e4b`, checked out that SHA explicitly, and verified it before npm could
+publish. GitHub `main` protection now also requires the strict
+`Exact-commit release gate`, enforces the rule for administrators, requires
+linear history and resolved conversations, and rejects force-pushes and branch
+deletion.
 
-1. Commit/push the candidate, let every exact-commit CI job pass, and require
-   that gate in `main` branch protection after the check name exists remotely.
-2. Publish the `rc` tag through the protected workflow, verify npm provenance
-   SHA and integrity, then canary the package before production promotion.
-
-The package must not be marked production-ready merely because the local
-artifact passed. Those controls are part of the product's release guarantee.
+npm published with OIDC trusted publishing and provenance, without an npm
+token. The registry's signed SLSA v1 statement names repository
+`julia-script/effectmq`, workflow `.github/workflows/release.yml`, ref `main`,
+release run `32317832772`, and exact git commit
+`4594e4bba32cc005b7a50efed1628cdac6f8c1d6`. A fresh registry download matched
+both advertised digests byte-for-byte, and a clean install loaded every public
+export. These controls, the published compatibility/performance evidence, and
+the completed rollback rehearsal close the release-candidate readiness gate.

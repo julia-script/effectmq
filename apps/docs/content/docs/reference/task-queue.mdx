@@ -1,0 +1,163 @@
+---
+title: TaskQueue reference
+description: Queue descriptors, offer and completion operations, durable handles, waiting, and events.
+---
+
+The `TaskQueue` namespace is the high-level queue API. It binds a stable queue
+name to one `TaskDefinition` and performs typed operations through `TaskEngine`.
+
+## `TaskQueue.make`
+
+```text
+make(name, taskDefinition): TaskQueue
+```
+
+Creates a pure queue descriptor. Redis state is created by the first operation
+that needs it.
+
+## `TaskQueue.offer`
+
+```text
+offer(queue, payload, options?): Effect<OfferOutcome, OfferError, OfferRequirements>
+```
+
+Encodes and enqueues a payload. Returns:
+
+```text
+{
+  _tag: "TaskCreated" | "TaskExisting"
+  task: Task
+  handle: TaskHandle
+}
+```
+
+Before encoding or Redis access, `offer` checks the task definition's retry,
+storage, and retention invariants. Invalid definition configuration is a
+defect, not an `OfferError`.
+
+### Offer options
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `taskId` | `string` | definition key | Explicit identity override. |
+| `delay` | `number` | `0` | Milliseconds before acquisition eligibility. |
+| `maxRetries` | `number` | definition cap | Per-generation handler retry override. |
+| `maxStalledCount` | `number` | `1` | Expired lease recoveries allowed before terminal stalled failure. |
+| `onSuccessPolicy` | `CompletionPolicy` | `"delete"` | Record/index policy after success. |
+| `onFailurePolicy` | `CompletionPolicy` | `"delete"` | Record/index policy after terminal failure. |
+| `retainResultUntil` | `"current-task-settles"` | unset | Adds a result-retention hold from the current managed handler. |
+| `onDuplicate` | `"return-existing" \| "new-generation"` | `"return-existing"` | Duplicate identity behavior. |
+
+Completion policies are `delete`, `keep`, `mark-as-success`, and
+`mark-as-failure`. `delete` removes the task record when no retention hold
+remains; the terminal result follows its separate result retention. `keep`
+retains the record without terminal-index membership. The two `mark` policies
+retain the record in the named terminal index.
+
+## `TaskHandle`
+
+A handle identifies exactly one durable generation:
+
+| Field | Type |
+| --- | --- |
+| `_tag` | `"TaskHandle"` |
+| `queue` | `string` |
+| `taskId` | `string` |
+| `generation` | `number` |
+| `cursor` | `string` |
+| `taskName` | `string` |
+| `schemaId` | `string` |
+| `protocolVersion` | `1` |
+
+The phantom success and error members retain the handle's result types.
+
+## `TaskQueue.complete`
+
+```text
+complete(queue, handler): Effect<string, CompleteError, CompleteRequirements>
+complete(handler)(queue): Effect<string, CompleteError, CompleteRequirements>
+```
+
+Polls until one task is available, supervises its lease, invokes the handler,
+persists the handler outcome, and returns the task id. A typed handler failure
+is stored and routed through retry/failure policy; it does not fail the
+completion Effect.
+
+Definition invariants are checked before acquisition. An invalid definition is
+a defect, not a `CompleteError`.
+
+The handler type is:
+
+```text
+(task: Task) => Effect<Success, TypedFailure, HandlerRequirements>
+```
+
+## `TaskQueue.completeOne`
+
+```text
+completeOne(queue, handler, processing?): Effect<boolean, CompleteError, CompleteRequirements>
+```
+
+Attempts one non-polling acquisition. Returns `false` when no task is currently
+available and `true` after an attempt is processed. Managed workers use this
+operation internally.
+
+### Processing options
+
+| Option | Default |
+| --- | ---: |
+| `lockTimeout` | 30 seconds |
+| `lockRefresh` | 10 seconds |
+| `heartbeatRetryDelay` | 250 milliseconds |
+| `heartbeatRetryCount` | 3 |
+
+The heartbeat retry count is reduced when necessary to fit inside the lease
+safety window.
+
+## `TaskQueue.wait`
+
+```text
+wait(queue, handle, options?): Effect<Success, WaitError, WaitRequirements>
+```
+
+Waits for the exact generation in the handle. It reads durable state,
+subscribes from the handle cursor, and rechecks state after subscription.
+
+`options.timeout` accepts `Duration.Input`. A timeout fails with
+`CallerTimeout` and does not cancel queue work.
+
+## `TaskQueue.execute`
+
+```text
+execute(queue, payload, offerOptions?): Effect<Success, ExecuteError, ExecuteRequirements>
+```
+
+Equivalent to `offer` followed by `wait` on the returned handle. It has no wait
+timeout option.
+
+## `TaskQueue.stream`
+
+```text
+stream(queue, { cursor?, pollInterval? }): Stream<Event, ...>
+```
+
+Defaults to the current stream position, so an omitted cursor observes future
+events only. `pollInterval` defaults to one second in the engine.
+
+| Event tag | Typed payload |
+| --- | --- |
+| `task.created` | New decoded task and execution state. |
+| `task.updated` | Existing and replacement decoded tasks plus state. |
+| `task.failed` | Typed failure, policy, retry time, failure kind, attempt, and terminal flag. |
+| `task.completed` | Typed success value and policy. |
+| `task.moved` | Previous/new list and state plus attempt counters. |
+
+All events contain `id`, `taskId`, `generation`, `protocolVersion`, and
+`schemaId`.
+
+## Requirements and failures
+
+`OfferRequirements`, `CompleteRequirements`, `WaitRequirements`, and
+`ExecuteRequirements` expose the exact Effect service unions for generic
+programs. `OfferError`, `CompleteError`, `WaitError`, and `ExecuteError` expose
+their exact failure unions. See the [error reference](/docs/reference/errors).

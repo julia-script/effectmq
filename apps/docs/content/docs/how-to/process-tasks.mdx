@@ -1,0 +1,82 @@
+---
+title: Process tasks with managed workers
+description: Run bounded worker concurrency with supervised leases and graceful draining.
+---
+
+This guide shows you how to run a production worker loop with bounded
+concurrency and graceful shutdown. It assumes you already know how to define a
+task and queue.
+
+## Create a managed worker
+
+Construct the worker from the same queue descriptor used by producers:
+
+```ts
+import { NodeRuntime } from "@effect/platform-node"
+import { Task, TaskEngine, TaskQueue, Worker } from "@effectmq/core"
+import { Effect, Schema } from "effect"
+
+const SendEmail = Task.make({
+  name: "send-email",
+  schemaId: "send-email/v1",
+  payload: { messageId: Schema.String, to: Schema.String },
+  success: Schema.String,
+  error: Schema.Struct({ reason: Schema.String }),
+  idempotencyKey: ({ messageId }) => messageId
+})
+const emails = TaskQueue.make("emails", SendEmail)
+
+const worker = Worker.make(
+  emails,
+  ({ payload }) => Effect.succeed(`sent:${payload.messageId}:${payload.to}`),
+  {
+    concurrency: 8,
+    pollInterval: "250 millis",
+    maintenanceInterval: "1 second",
+    drainTimeout: "30 seconds",
+    processing: {
+      lockTimeout: "30 seconds",
+      lockRefresh: "10 seconds",
+      heartbeatRetryDelay: "250 millis",
+      heartbeatRetryCount: 3
+    }
+  }
+)
+
+const workerProgram = Worker.run(worker)
+
+workerProgram.pipe(
+  Effect.provide(
+    TaskEngine.layer({ redis: { url: "redis://127.0.0.1:6379" } })
+  ),
+  NodeRuntime.runMain
+)
+```
+
+`Worker.run` remains active until its fiber is interrupted. It creates eight
+independent acquisition slots here, while maintenance uses its own Redis role.
+
+## Let the worker drain on shutdown
+
+Run the worker as the application's root Effect. `NodeRuntime.runMain`
+interrupts that root on process shutdown. The worker then stops new
+acquisitions, keeps heartbeats running for active handlers, and waits up to
+`drainTimeout` before interrupting the remainder.
+
+Set the deployment termination grace period longer than `drainTimeout` plus
+the Redis connection-close allowance. A handler interrupted after that bound
+is recovered through its expired lease.
+
+## Size concurrency
+
+Set `concurrency` to the number of handlers this process may run at once. Each
+slot acquires another task only after its current handler settles. Increase it
+from measured handler latency and downstream capacity, not from queue depth
+alone.
+
+Keep `lockRefresh` comfortably below `lockTimeout`. The heartbeat retry budget
+is automatically limited to the remaining lease safety window.
+
+The worker is ready when `Worker.run` is running under a layer that provides
+the TaskEngine live graph. Refer to the [Worker reference](/docs/reference/worker-and-scheduler)
+for defaults and required services.

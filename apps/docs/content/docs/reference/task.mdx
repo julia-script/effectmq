@@ -1,0 +1,106 @@
+---
+title: Task reference
+description: Task definitions, retry configuration, retention, storage limits, and identity.
+---
+
+The `Task` namespace defines one schema-bearing family of work. A task
+definition is a descriptor; it does not allocate Redis state.
+
+Import from the package root or the stable `@effectmq/core/Task` subpath.
+
+## `Task.make`
+
+```text
+Task.make(config): TaskDefinition
+```
+
+Creates a pure task definition. It does not evaluate an Effect, acquire
+services, or validate runtime invariants.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string` | required | Task-family name. |
+| `schemaId` | `string` | `name` | Stable identity of the payload, success, and failure schema family. |
+| `payload` | `Schema.Struct` or struct fields | required | Payload schema. Bare fields are wrapped with `Schema.Struct`. |
+| `success` | `Schema.Top` | required | Handler success schema. Use `Schema.Void` for no value. |
+| `error` | `Schema.Top` | required | Handler failure schema. Use `Schema.Never` for an infallible handler. |
+| `idempotencyKey` | `(payload) => string` | random UUID | Derives the logical task id. Supplying it removes the `Crypto` requirement from identity generation. |
+| `retry` | `Schedule` or retry options | none | Determines whether and when a typed handler failure is retried. |
+| `maxRetries` | `number \| null` | `5` | Independent retry cap. `null` means unbounded. |
+| `storageLimits` | `Partial<StorageLimits>` | storage defaults | Per-definition persisted-value and collection limits. |
+| `retention` | `Partial<RetentionPolicy>` | retention defaults | Per-definition terminal retention windows. |
+
+Retry options accept `while`, `until`, `times`, and `schedule`. Predicates may
+return a boolean or an Effect. The schedule and predicates receive the typed
+handler failure. Retry stops when any configured condition stops or when
+`maxRetries` is reached.
+
+The first queue or worker operation that consumes the definition checks retry,
+storage, and retention integer invariants. Invalid programmer-authored
+configuration terminates that operation with a defect before Redis is touched;
+it is not a recoverable typed failure. An omitted idempotency callback can
+later fail with `TaskIdentityGenerationError` if UUID generation fails.
+
+## `TaskDefinition`
+
+```text
+TaskDefinition<Payload, Success, Error, RetryR, IdentityR>
+```
+
+| Property | Description |
+| --- | --- |
+| `name` | Task-family name. |
+| `schemaId` | Stable schema identity stored with values and handles. |
+| `payloadSchema` | Resolved payload schema. |
+| `successSchema` | Terminal success schema. |
+| `errorSchema` | Typed handler failure schema. |
+| `retrySchedule` | Normalized Effect Schedule, when configured. |
+| `maxRetries` | Effective definition-level retry cap. |
+| `storageLimits` | Fully resolved storage limits. |
+| `retention` | Fully resolved retention policy. |
+| `idempotencyKey` | Effectful task-id generator. |
+
+## Retention defaults
+
+`Task.defaultRetentionPolicy` contains millisecond durations:
+
+| Field | Default |
+| --- | ---: |
+| `taskRecordMs` | 7 days |
+| `resultMs` | 1 day |
+| `terminalIndexMs` | 7 days |
+| `deadLetterMs` | 30 days |
+| `eventMs` | 7 days |
+
+Each resource expires independently during bounded maintenance. A terminal
+result can expire before its task record.
+
+## Storage defaults
+
+`StorageProtocol.defaultStorageLimits` supplies:
+
+| Field | Default |
+| --- | ---: |
+| `maxValueBytes` | 1 MiB |
+| `maxErrorEntries` | 100 |
+| `maxRelationships` | 1,000 |
+| `maxEventEntries` | 10,000 |
+
+`maxEventEntries` must be at least 1. Other storage limits and all retention
+durations must be non-negative safe integers.
+
+## `Task.resolvePayloadSchema`
+
+```text
+resolvePayloadSchema(schemaOrFields): Schema.Struct
+```
+
+Returns an existing struct schema unchanged or wraps bare struct fields with
+`Schema.Struct`.
+
+## `Task.Task`
+
+Alias for the decoded `TaskRecord.Task` model delivered to handlers. Its fields
+include identity, payload, optional success, error history, timestamps,
+attempt/stall counters, completion policies, and resolved retention limits.
+See [TaskQueue reference](/docs/reference/task-queue) for handler use.

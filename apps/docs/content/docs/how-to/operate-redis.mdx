@@ -1,0 +1,86 @@
+---
+title: Operate Redis for EffectMQ
+description: Configure topology, persistence, readiness, shutdown, and failover.
+---
+
+This guide shows you how to run the Redis dependency used by EffectMQ in a
+production service.
+
+## Configure bounded standalone pools
+
+Provide the standard live graph with explicit timeouts and pool bounds:
+
+```ts
+import { TaskEngine } from "@effectmq/core"
+
+const AppLive = TaskEngine.layer({
+  engine: {
+    prefix: "my-service:effectmq:v1",
+    maintenanceBatchSize: 100
+  },
+  redis: {
+    topology: "standalone",
+    url: process.env.REDIS_URL,
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD,
+    socket: { connectTimeout: 5_000 },
+    commandOptions: { timeout: 2_000 },
+    pool: {
+      minimum: 1,
+      maximum: 16,
+      acquireTimeout: 2_000,
+      cleanupDelay: 5_000
+    }
+  }
+})
+```
+
+Use `rediss://` or node-redis TLS socket options for encrypted connections.
+Keep secrets outside source and logs.
+
+## Expose readiness
+
+Readiness actively pings the producer, worker, and maintenance roles:
+
+```ts
+import { NodeRedisPool } from "@effectmq/core"
+import { Effect } from "effect"
+
+const redisReady = Effect.gen(function* () {
+  const health = yield* NodeRedisPool.RedisConnectionHealth
+  return yield* health.readiness
+})
+```
+
+Use `health.snapshot` for a passive, secret-free status view. Remove an
+instance from ready traffic when a role is degraded; keep liveness independent
+long enough for reconnect.
+
+## Configure Redis durability
+
+Set `maxmemory-policy noeviction`. Choose AOF and replica settings from the
+amount of accepted work the service may lose. For the common latency/durability
+balance, use `appendonly yes` and `appendfsync everysec`, then monitor replica
+lag and persistence failures. Restore backups into an isolated Redis instance
+and inspect them before a disaster requires the procedure.
+
+## Shut down in dependency order
+
+Stop new producers, stop schedulers, interrupt managed workers, allow their
+configured drain interval, and finally close the application Effect scope.
+Scoped Redis pools remove listeners and close after in-flight commands drain.
+
+## Rehearse failover
+
+For Sentinel deployments, run at least three Sentinel processes across
+independent failure domains and test primary loss under producer and worker
+load. Confirm that all three EffectMQ Redis roles reconnect and that
+indeterminate producer writes are retried with the same task identity.
+
+Redis Cluster is not a supported topology. EffectMQ queue transitions use
+multi-key atomic scripts, so Cluster configuration fails during layer startup.
+
+The deployment is ready when all three role probes pass, Redis cannot evict
+queue keys, persistence meets the loss objective, and shutdown gives workers
+their drain interval. See the [Redis runtime reference](/docs/reference/redis-and-runtime)
+for exact configuration defaults.

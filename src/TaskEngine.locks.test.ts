@@ -1,5 +1,5 @@
-import { Effect, Schedule, Schema } from "effect";
 import { expect, layer } from "@effect/vitest";
+import { Effect, Schedule, Schema } from "effect";
 import { RedisPool, Task, TaskEngine, TaskQueue } from "./index.js";
 import { getLists, TestLayer } from "./testing/redisLayer.js";
 import {
@@ -190,7 +190,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         Effect.gen(function* () {
           const engine = yield* TaskEngine.TaskEngine;
           const redis = yield* RedisPool.RedisPool;
-          const def = yield* Task.make({
+          const def = Task.make({
             name: "locks-recover",
             payload: { userId: Schema.String },
             success: Schema.String,

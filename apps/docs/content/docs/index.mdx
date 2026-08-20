@@ -1,4 +1,59 @@
 ---
-title: effectmq
-description: Documentation for effectmq.
+title: EffectMQ documentation
+description: Build typed, Redis-backed task queues with Effect.
 ---
+
+EffectMQ is a Redis-backed task queue for Effect applications. Payloads,
+success values, and handler failures are described with Effect Schema and stay
+typed from the producer through the worker to the caller waiting for a result.
+
+EffectMQ provides fenced, at-least-once task execution. It handles durable task
+state, retries, delays, cron materialization, result retention, and lifecycle
+events. Your application controls handler concurrency and makes external side
+effects idempotent.
+
+## The four parts
+
+EffectMQ separates descriptions from runtime operations:
+
+1. **Define a task** with `Task.make`. This pure value owns the payload,
+   success, and failure schemas plus retry and retention policy.
+2. **Define a queue** with `TaskQueue.make`. This pure value binds a queue name
+   to the task definition.
+3. **Offer work** with `TaskQueue.offer`. This Effect encodes a payload and
+   persists it through the engine.
+4. **Work the queue** with `Worker.run` or `TaskQueue.complete`. These Effects
+   acquire tasks, run the handler, and persist outcomes.
+
+Task and queue definitions can live at module scope. Only offering, processing,
+waiting, scheduling, and Redis wiring need an Effect runtime.
+
+## Start here
+
+- [Build your first queue](/docs/tutorials/getting-started) is a complete,
+  runnable lesson with Redis, a producer, and a managed worker.
+- [Process tasks with managed workers](/docs/how-to/process-tasks) shows how to
+  configure concurrency, lease supervision, and graceful shutdown.
+- [Understand the delivery model](/docs/explanation/delivery-model) explains
+  what fenced at-least-once execution guarantees and what it cannot guarantee.
+
+## Solve a problem
+
+- [Retry, delay, and deduplicate work](/docs/how-to/retry-delay-and-deduplicate)
+- [Wait for results and consume events](/docs/how-to/wait-for-results)
+- [Schedule recurring tasks](/docs/how-to/schedule-tasks)
+- [Make handler side effects idempotent](/docs/how-to/make-handlers-idempotent)
+- [Operate Redis for EffectMQ](/docs/how-to/operate-redis)
+
+## Look up an API
+
+- [Task reference](/docs/reference/task)
+- [TaskQueue reference](/docs/reference/task-queue)
+- [Worker and Scheduler reference](/docs/reference/worker-and-scheduler)
+- [Redis and runtime reference](/docs/reference/redis-and-runtime)
+- [Error reference](/docs/reference/errors)
+
+## Requirements
+
+EffectMQ requires Node.js 22.19 or newer and uses Effect 4 beta. Redis
+standalone and Redis Sentinel are supported. Redis Cluster is not supported.

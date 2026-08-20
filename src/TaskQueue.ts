@@ -19,15 +19,16 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import type { EngineTerminalResult } from "./EngineRecord.js";
 import { nextRunAt } from "./RetrySchedule.js";
+import * as StorageProtocol from "./StorageProtocol.js";
+import type * as Task from "./Task.js";
+import * as TaskContext from "./TaskContext.js";
+import * as TaskEngine from "./TaskEngine.js";
+import * as TaskInvariant from "./TaskInvariant.js";
 import {
   type CompletionPolicy,
   decodeTask,
   TaskErrorSchema,
 } from "./TaskRecord.js";
-import * as StorageProtocol from "./StorageProtocol.js";
-import type * as Task from "./Task.js";
-import * as TaskContext from "./TaskContext.js";
-import * as TaskEngine from "./TaskEngine.js";
 
 const TypeId = "~effectmq/TaskQueue" as const;
 
@@ -409,15 +410,15 @@ export type OfferOutcome<
  * import { Effect, Schema } from "effect"
  * import { Task, TaskEngine, TaskQueue } from "@effectmq/core"
  *
+ * const resize = Task.make({
+ *   name: "resize-image",
+ *   payload: { imageId: Schema.String },
+ *   success: Schema.String,
+ *   error: Schema.String,
+ *   idempotencyKey: ({ imageId }) => imageId
+ * })
+ * const images = TaskQueue.make("images", resize)
  * const enqueue = Effect.gen(function* () {
- *   const resize = yield* Task.make({
- *     name: "resize-image",
- *     payload: { imageId: Schema.String },
- *     success: Schema.String,
- *     error: Schema.String,
- *     idempotencyKey: ({ imageId }) => imageId
- *   })
- *   const images = TaskQueue.make("images", resize)
  *   return yield* TaskQueue.offer(images, { imageId: "img-42" }).pipe(
  *     Effect.map(({ handle }) => handle)
  *   )
@@ -442,6 +443,7 @@ export const offer = Effect.fnUntraced(function* <
   OfferError,
   OfferRequirements<Payload, Success, Error, IdentityR>
 > {
+  yield* TaskInvariant.validate(queue.task);
   const encodePayload = Schema.encodeEffect(queue.task.payloadSchema);
   const id = options?.taskId ?? (yield* queue.task.idempotencyKey(payload));
   const engine = yield* TaskEngine.TaskEngine;
@@ -762,14 +764,14 @@ const processAttempt = Effect.fnUntraced(function* <
  * import { Effect, Schema } from "effect"
  * import { Task, TaskQueue } from "@effectmq/core"
  *
+ * const greet = Task.make({
+ *   name: "greet",
+ *   payload: { name: Schema.String },
+ *   success: Schema.String,
+ *   error: Schema.String
+ * })
+ * const greetings = TaskQueue.make("greetings", greet)
  * const processNext = Effect.gen(function* () {
- *   const greet = yield* Task.make({
- *     name: "greet",
- *     payload: { name: Schema.String },
- *     success: Schema.String,
- *     error: Schema.String
- *   })
- *   const greetings = TaskQueue.make("greetings", greet)
  *   return yield* TaskQueue.complete(
  *     greetings,
  *     ({ payload }) => Effect.succeed(`Hello, ${payload.name}!`)
@@ -829,6 +831,7 @@ export const complete: {
     CompleteError,
     CompleteRequirements<Payload, Success, Error, TR, R>
   > {
+    yield* TaskInvariant.validate(self.task);
     const attempt = yield* takeUnsafe(self);
     return yield* processAttempt(self, attempt, handler);
   }),
@@ -857,6 +860,7 @@ export const completeOne = Effect.fnUntraced(function* <
   CompleteError,
   CompleteRequirements<Payload, Success, Error, TR, R>
 > {
+  yield* TaskInvariant.validate(self.task);
   const attempt = yield* takeAvailable(self, {
     poll: false,
     lockTimeout: options?.lockTimeout,

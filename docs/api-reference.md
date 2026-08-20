@@ -6,11 +6,14 @@ page describes the intended entry points and their contracts.
 
 ## `Task`
 
-- `Task.make(config)` effectfully validates and defines payload, success, and typed-failure schemas,
-  stable `schemaId`, idempotency key, retry schedule/cap, storage limits, and
-  retention.
+- `Task.make(config)` synchronously defines payload, success, and typed-failure
+  schemas, stable `schemaId`, idempotency key, retry schedule/cap, storage
+  limits, and retention. It does not evaluate an Effect or validate runtime
+  invariants.
 - `defaultRetentionPolicy` is 7 days for task records and terminal indexes,
   1 day for results, 30 days for dead-letter entries, and 7 days for events.
+- Queue and worker operations check definition invariants at first use. Invalid
+  programmer-authored task configuration is a defect, not a typed failure.
 
 ## `TaskQueue`
 
@@ -39,7 +42,9 @@ duration, heartbeat interval, and bounded heartbeat transport retry.
 
 ## `Scheduler`
 
-- `make(config)` validates configuration in a typed error channel and creates a long-running durable materializer Effect.
+- `make(config)` synchronously creates a long-running durable materializer
+  Effect descriptor. Invalid definition configuration is a defect when the
+  scheduler first runs.
 - `materializeDue(config, now?)` performs one deterministic bounded observation,
   useful for tests and externally driven scheduler loops.
 - Missed policy is `skip`, `coalesce`, or bounded `backfill`.

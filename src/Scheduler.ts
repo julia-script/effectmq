@@ -2,7 +2,6 @@
 import * as Clock from "effect/Clock";
 import * as Cron from "effect/Cron";
 import type * as Crypto from "effect/Crypto";
-import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Effectable from "effect/Effectable";
@@ -10,6 +9,7 @@ import * as Schedule from "effect/Schedule";
 import type * as Schema from "effect/Schema";
 import type * as StorageProtocol from "./StorageProtocol.js";
 import * as TaskEngine from "./TaskEngine.js";
+import * as TaskInvariant from "./TaskInvariant.js";
 import * as TaskQueue from "./TaskQueue.js";
 
 const TypeId = "~effectmq/Scheduler" as const;
@@ -45,39 +45,25 @@ export type MissedTickPolicy =
   | { readonly _tag: "coalesce" }
   | { readonly _tag: "backfill"; readonly maxBackfill: number };
 
-/** Predictable validation failure for a scheduler definition. */
-export class SchedulerConfigurationError extends Data.TaggedError(
-  "SchedulerConfigurationError",
-)<{
-  readonly field: "maxBackfill";
-  readonly constraint: string;
-  readonly actual: unknown;
-}> {}
-
-const validateConfig = <
+const validateConfig = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
   QueueR,
   QueueIdentityR,
->(
-  config: SchedulerConfig<Payload, Success, Error, QueueR, QueueIdentityR>,
-): Effect.Effect<void, SchedulerConfigurationError> => {
+>(config: SchedulerConfig<Payload, Success, Error, QueueR, QueueIdentityR>) {
   if (
     config.missed._tag === "backfill" &&
     (!Number.isSafeInteger(config.missed.maxBackfill) ||
       config.missed.maxBackfill < 1)
   ) {
-    return Effect.fail(
-      new SchedulerConfigurationError({
-        field: "maxBackfill",
-        constraint: "a positive safe integer",
-        actual: config.missed.maxBackfill,
-      }),
+    return yield* Effect.die(
+      new Error(
+        `Invalid scheduler definition "${config.name}": maxBackfill must be a positive safe integer; received ${String(config.missed.maxBackfill)}`,
+      ),
     );
   }
-  return Effect.void;
-};
+});
 
 /**
  * Configures durable cron tick materialization into a task queue.
@@ -116,7 +102,6 @@ export interface SchedulerConfig<
 }
 
 type SchedulerFailure =
-  | SchedulerConfigurationError
   | TaskQueue.OfferError
   | StorageProtocol.StorageProtocolError
   | TaskEngine.TaskEngineError
@@ -197,6 +182,7 @@ export const materializeDue = Effect.fnUntraced(function* <
   now?: Date,
 ) {
   yield* validateConfig(config);
+  yield* TaskInvariant.validate(config.queue.task);
   const observedAt = now ?? new Date(yield* Clock.currentTimeMillis);
 
   const engine = yield* TaskEngine.TaskEngine;
@@ -255,27 +241,29 @@ export const materializeDue = Effect.fnUntraced(function* <
  * sleeps until the next cron tick, with a minimum polling delay of 100 ms, and
  * repeats indefinitely.
  *
+ * Construction is pure and does not validate the missed-tick policy. The
+ * first materialization checks its invariants and treats invalid
+ * programmer-authored configuration as a defect before reading time or Redis.
+ *
  * **Example: Materialize a coalesced daily task**
  *
  * ```ts
- * import { Cron, Effect, Schema } from "effect"
+ * import { Cron, Schema } from "effect"
  * import { Scheduler, Task, TaskQueue } from "@effectmq/core"
  *
- * const daily = Effect.gen(function* () {
- *   const report = yield* Task.make({
- *     name: "report",
- *     payload: { scheduledAt: Schema.String },
- *     success: Schema.Void,
- *     error: Schema.String
- *   })
- *   const reports = TaskQueue.make("reports", report)
- *   return yield* Scheduler.make({
- *     name: "daily-report",
- *     cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
- *     queue: reports,
- *     payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
- *     missed: { _tag: "coalesce" }
- *   })
+ * const report = Task.make({
+ *   name: "report",
+ *   payload: { scheduledAt: Schema.String },
+ *   success: Schema.Void,
+ *   error: Schema.String
+ * })
+ * const reports = TaskQueue.make("reports", report)
+ * const daily = Scheduler.make({
+ *   name: "daily-report",
+ *   cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
+ *   queue: reports,
+ *   payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
+ *   missed: { _tag: "coalesce" }
  * })
  * ```
  *
@@ -290,33 +278,28 @@ export const make = <
   QueueIdentityR = Crypto.Crypto,
 >(
   config: SchedulerConfig<Payload, Success, Error, QueueR, QueueIdentityR>,
-): Effect.Effect<
-  Scheduler<Payload, Success, Error, QueueIdentityR>,
-  SchedulerConfigurationError
-> =>
-  Effect.gen(function* () {
-    yield* validateConfig(config);
-    const execute = Effect.gen(function* () {
-      let next = yield* materializeDue(config);
-      yield* Effect.gen(function* () {
-        const sleepFor = Math.max(
-          100,
-          next.getTime() - (yield* Clock.currentTimeMillis),
-        );
-        yield* Effect.sleep(Duration.millis(sleepFor));
-        next = yield* materializeDue(config);
-      }).pipe(Effect.repeat(Schedule.forever));
-    });
-    return {
-      ...Effectable.Prototype({
-        label: "effectmq/Scheduler",
-        evaluate() {
-          return execute;
-        },
-      }),
-      [TypeId]: TypeId,
-      name: config.name,
-      cron: config.cron,
-      timeZone: config.cron.tz,
-    } as Scheduler<Payload, Success, Error, QueueIdentityR>;
+): Scheduler<Payload, Success, Error, QueueIdentityR> => {
+  const execute = Effect.gen(function* () {
+    let next = yield* materializeDue(config);
+    yield* Effect.gen(function* () {
+      const sleepFor = Math.max(
+        100,
+        next.getTime() - (yield* Clock.currentTimeMillis),
+      );
+      yield* Effect.sleep(Duration.millis(sleepFor));
+      next = yield* materializeDue(config);
+    }).pipe(Effect.repeat(Schedule.forever));
   });
+  return {
+    ...Effectable.Prototype({
+      label: "effectmq/Scheduler",
+      evaluate() {
+        return execute;
+      },
+    }),
+    [TypeId]: TypeId,
+    name: config.name,
+    cron: config.cron,
+    timeZone: config.cron.tz,
+  } as Scheduler<Payload, Success, Error, QueueIdentityR>;
+};

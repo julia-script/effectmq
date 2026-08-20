@@ -1,0 +1,59 @@
+---
+title: Queue or durable workflow?
+description: Choose between independent at-least-once jobs and replayable multi-step execution.
+---
+
+This page is about choosing an execution model. It compares EffectMQ's task
+queue with Effect's unstable Workflow facilities. It does not compare every
+feature or prescribe a production workflow backend.
+
+## A queue preserves work
+
+EffectMQ stores a payload, lets a worker acquire an attempt, and records one
+terminal outcome. Retries rerun the handler. The durable unit is the task, not
+each line or intermediate step inside the handler.
+
+That model fits independent jobs such as sending an email, generating a
+thumbnail, indexing a document, or running one model inference. The important
+question is whether the job remains eligible after a process dies. Intermediate
+local computation usually has no durable meaning of its own.
+
+## A workflow preserves a process
+
+Effect Workflow models a multi-step process whose durable activities, timers,
+signals, and results can be replayed or resumed. The workflow body coordinates
+those durable primitives. The important question is where the process resumes
+after interruption and which completed steps must not be repeated.
+
+That model fits an order lifecycle, approval process, long-running saga, or
+multi-stage provisioning operation. The relationships and waiting points are
+part of the durable business state, not incidental implementation details.
+
+## The boundary is not duration
+
+A task may take hours and still be a queue job if restarting the handler is the
+correct recovery behavior. A workflow may finish in seconds but still need
+durable step identity because repeating an earlier activity would be wrong.
+
+The deciding boundary is the recovery unit:
+
+| Question | Queue | Workflow |
+| --- | --- | --- |
+| What is durable? | One task and terminal outcome | A process and its durable steps |
+| Recovery | Re-run an eligible handler attempt | Replay/resume from durable history |
+| Dependencies between jobs | Application-owned | Part of workflow orchestration |
+| External signals and durable waits | Application-owned | First-class workflow primitives |
+| Handler/activity duplication | Must be made idempotent | Durable activities still require correct replay/idempotency discipline |
+
+## Composition is possible
+
+The models are not mutually exclusive. A workflow can delegate a coarse unit
+of independent work to a queue, and a queue handler can start a workflow when
+the payload really describes a process. The seam should follow the durable
+meaning: use the workflow for coordination history and the queue for
+independently recoverable work distribution.
+
+In this project's opinion, choosing the shallower durability model that fully
+matches the business requirement is easier to operate. A queue avoids workflow
+history and orchestration when there is no process to resume. A workflow earns
+that extra machinery when the process itself must survive.

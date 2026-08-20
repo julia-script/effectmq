@@ -1,0 +1,67 @@
+---
+title: Task identity and generations
+description: How logical ids, generations, durable handles, and indeterminate writes fit together.
+---
+
+This page is about the identity model that lets EffectMQ deduplicate offers
+without confusing an old result with a later execution. It does not describe
+the mechanics of configuring retries or retention.
+
+## A task id names logical work
+
+A task definition derives an idempotency key from its payload, unless the
+producer supplies an explicit task id or uses the default random identity. The
+queue name and task id together name logical work.
+
+Stable identity turns producer retries into reconciliation. If the producer
+offers the same queue/id again with `return-existing`, Redis returns the stored
+generation without replacing its payload, state, retry history, lease, or
+outcome.
+
+This is stronger than merely refusing a duplicate insert: the producer gets an
+authoritative handle for the generation that already exists.
+
+## A generation names one execution history
+
+Logical work can be deliberately run again after settlement. EffectMQ models
+that as a new generation under the same queue/id. The generation number keeps
+the two execution histories and terminal results distinct.
+
+A task handle therefore contains both `taskId` and `generation`. It also
+contains the event cursor recorded by the offer, the schema identity, and the
+storage protocol version. Those fields let `wait` reject the wrong decoder and
+observe the exact generation even if a newer one now exists.
+
+Persisting only the task id collapses that distinction. A later caller could
+mistake generation 2's result for the generation 1 result it originally
+requested.
+
+## Indeterminate writes are an identity problem
+
+A connection can fail after Redis commits a mutating script but before the
+producer receives the reply. From the producer's point of view, the write is
+indeterminate: either the generation exists or it does not.
+
+Stable identity makes both possibilities converge. Repeating the same offer
+with `return-existing` creates the generation if the first write did not
+commit, or returns it unchanged if the first write did commit.
+
+Changing the id, or choosing `new-generation`, destroys that convergence and
+can create additional work. `new-generation` represents an application
+decision to run settled logical work again; it is not a transport-recovery
+mechanism.
+
+## Schema identity is part of result identity
+
+The same task id is not enough to prove that stored bytes have the expected
+meaning. EffectMQ stores `schemaId` with task values and copies it into handles.
+A mismatched queue definition fails with `SchemaIdentityMismatch` instead of
+decoding bytes through an unrelated schema.
+
+This makes a schema-id change an explicit compatibility event. The application
+either retains a decoder for the old identity or migrates the stored values;
+silently reusing the name with incompatible schemas is rejected.
+
+Task identity therefore has three layers: queue/id names logical work,
+generation names one execution history, and schema/protocol identity names the
+meaning of its durable values.

@@ -1,0 +1,81 @@
+---
+title: Error reference
+description: Typed producer, worker, waiting, storage, and Redis failures.
+---
+
+EffectMQ exposes predictable failures in Effect error channels. Handler-domain
+failures are distinct from infrastructure and protocol failures.
+
+## Task definition and identity
+
+| Tag | Fields | Meaning |
+| --- | --- | --- |
+| `TaskIdentityGenerationError` | `taskName`, `cause` | The idempotency callback or Crypto UUID generation failed. |
+
+Invalid task retry, storage, retention, and scheduler backfill configuration is
+a programmer defect detected by the first consuming operation. Definition
+invariants do not appear in typed error unions.
+
+## Offering
+
+| Tag | Fields | Meaning |
+| --- | --- | --- |
+| `IndeterminateWriteError` | `queue`, `taskId`, `cause` | Redis may have committed the offer before the connection failed. |
+| `RetentionContextRequired` | `queue`, `taskId` | Current-task result retention was requested outside a managed handler. |
+
+`OfferError` also includes storage, engine, and Schema errors.
+
+## Completion and leases
+
+| Tag | Fields | Meaning |
+| --- | --- | --- |
+| `LeaseLost` | `prefix`, `taskId`, `cause` | The attempt no longer owns the generation. |
+| `TaskEngineError` | `reason`, `cause` | Redis transport, script, reply, relationship, commit, or lease boundary failure. |
+
+`TaskEngineError.reason._tag` is one of `TransportFailure`, `ScriptFailure`,
+`InvalidReply`, `RelationshipLimit`, `IndeterminateCommit`, or `LeaseLost`.
+
+## Waiting
+
+| Tag | Fields | Meaning |
+| --- | --- | --- |
+| `TaskFailed` | `handle`, `failure` | The exact generation settled with the typed handler or built-in failure. |
+| `TaskNotFound` | `handle` | No task record, result, or known generation exists. |
+| `ResultExpired` | `handle`, `latestGeneration` | The handle's retained result is unavailable. |
+| `CallerTimeout` | `handle`, `timeout` | The caller-local deadline elapsed; task execution continues. |
+| `CursorExpired` | `requested`, `earliest` | Event retention trimmed the requested position. |
+
+Built-in terminal task failures are tagged `~effectmq/Error/Stalled` and
+`~effectmq/Error/Canceled`.
+
+## Storage protocol
+
+| Tag | Meaning |
+| --- | --- |
+| `UnsupportedStorageValue` | The value includes an unsupported type, unsafe number, class instance, or cycle. |
+| `StorageLimitExceeded` | Encoded payload, success, or failure exceeds `maxValueBytes`. |
+| `StorageCountLimitExceeded` | A task-retention relationship collection reached its limit. |
+| `CorruptStorageValue` | Stored data has an invalid envelope or semantic shape. |
+| `StorageEncodingError` | MessagePack or base64 encoding failed. |
+| `StorageDecodingError` | Byte, base64, or MessagePack decoding failed. |
+| `UnsupportedProtocolVersion` | The envelope version is not readable by this release. |
+| `SchemaIdentityMismatch` | The stored value or handle belongs to another schema identity. |
+
+## Live configuration
+
+| Tag | Meaning |
+| --- | --- |
+| `TaskEngineConfigurationError` | `maintenanceBatchSize` is outside 1–1,000. |
+| `InvalidRedisConfiguration` | Standalone pool bounds or timeouts are invalid. |
+| `UnsupportedRedisTopology` | Redis Cluster was configured or detected. |
+
+## Recovery matrix
+
+| Failure | Recovery |
+| --- | --- |
+| `IndeterminateWriteError` | Retry the same queue and task identity with `return-existing`. |
+| `CallerTimeout` | Continue waiting later with the same handle if the result retention window permits. |
+| `CursorExpired` | Reconcile durable state, then resume from an acceptable cursor. |
+| `ResultExpired` | Read the result from an application-owned durable store if longer retention is required. |
+| `LeaseLost` | Stop treating the attempt as owner; do not acknowledge it again. |
+| `SchemaIdentityMismatch` | Restore the matching schema/version or migrate stored data explicitly. |

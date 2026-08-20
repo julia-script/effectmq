@@ -52,7 +52,7 @@ const run = Effect.scoped(
       return yield* Effect.die("Redis roles are not ready");
     }
     const runId = crypto.randomUUID();
-    const task = yield* Task.make({
+    const task = Task.make({
       name: "soak-task",
       schemaId: "effectmq/soak/v1",
       payload: { id: Schema.String, body: Schema.String },

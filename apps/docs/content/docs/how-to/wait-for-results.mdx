@@ -1,0 +1,94 @@
+---
+title: Wait for results and consume events
+description: Await an exact task generation or consume a queue's lifecycle stream.
+---
+
+This guide shows you how to await one task outcome and how to consume lifecycle
+events for a whole queue.
+
+## Persist the handle returned by offer
+
+`offer` returns the task record and a handle for its exact generation:
+
+```ts docs-check=wait
+import { Task, TaskQueue } from "@effectmq/core"
+import { Duration, Effect, Schema, Stream } from "effect"
+
+const SendEmail = Task.make({
+  name: "send-email",
+  payload: { messageId: Schema.String, to: Schema.String },
+  success: Schema.String,
+  error: Schema.Never,
+  idempotencyKey: ({ messageId }) => messageId
+})
+const emails = TaskQueue.make("emails", SendEmail)
+
+const saveHandle = (handle: TaskQueue.TaskHandle<string, never>) =>
+  Effect.log("Persist task handle", handle)
+const persistCursor = (cursor: string) => Effect.log("Persist cursor", cursor)
+
+const offerAndSave = Effect.gen(function* () {
+  const { handle } = yield* TaskQueue.offer(emails, {
+    messageId: "msg-42",
+    to: "ada@example.com"
+  })
+
+  yield* saveHandle(handle)
+  return handle
+})
+```
+
+Persist the whole handle, including its cursor, schema identity, protocol
+version, and generation. Reconstructing it from only the task id loses the
+information needed for a generation-safe wait.
+
+## Wait with a caller-local timeout
+
+Pass the persisted handle back to the same typed queue descriptor:
+
+```ts docs-check=wait
+const waitForResult = (handle: TaskQueue.TaskHandle<string, never>) =>
+  TaskQueue.wait(emails, handle, { timeout: "20 seconds" })
+```
+
+`CallerTimeout` ends only this wait. It does not cancel the queued task. Handle
+`TaskFailed`, `TaskNotFound`, `ResultExpired`, and `CursorExpired` separately
+when the application needs different recovery behavior.
+
+If the caller does not need to persist a handle or set a wait timeout, use the
+offer-and-wait shorthand:
+
+```ts docs-check=wait
+const executeMessage = TaskQueue.execute(emails, {
+  messageId: "msg-43",
+  to: "grace@example.com"
+})
+```
+
+## Consume lifecycle events
+
+Start from a retained cursor when building a resumable consumer:
+
+```ts docs-check=wait
+const consume = (cursor: string) =>
+  TaskQueue.stream(emails, {
+    cursor,
+    pollInterval: Duration.millis(250)
+  }).pipe(
+    Stream.runForEach((event) =>
+      Effect.gen(function* () {
+        yield* persistCursor(event.id)
+        yield* Effect.log(event._tag, event.taskId, event.generation)
+      })
+    )
+  )
+```
+
+Persist `event.id` only after the consumer's effect succeeds. Event retention
+is finite; if `CursorExpired` occurs, reconcile the durable task state before
+resuming from the reported earliest cursor.
+
+The integration is complete when the caller can recover its saved handle and
+observe either the exact terminal value or a specific typed wait failure. See
+the [TaskQueue reference](/docs/reference/task-queue) for event payloads and
+error unions.

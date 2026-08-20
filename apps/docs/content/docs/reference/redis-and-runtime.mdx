@@ -1,0 +1,132 @@
+---
+title: Redis and runtime reference
+description: Live layers, topology configuration, health services, engine configuration, and metrics.
+---
+
+## `TaskEngine.layer`
+
+```text
+TaskEngine.layer({ engine?, redis? }): Layer<LiveServices, LiveError>
+```
+
+Provides `TaskEngine`, `RedisPool`, `RedisConnectionRoles`,
+`RedisConnectionHealth`, Effect Redis, and Crypto. It is the standard Node.js
+live graph.
+
+Engine configuration:
+
+| Field | Default | Constraint |
+| --- | ---: | --- |
+| `debugMode` | `false` | Boolean. |
+| `prefix` | `~effectmq:v1` | String Redis key prefix. |
+| `maintenanceBatchSize` | `100` | Safe integer from 1 through 1,000. |
+
+## `TaskEngine.layerNoDeps`
+
+```text
+TaskEngine.layerNoDeps(config?): Layer<TaskEngine, TaskEngineConfigurationError, RedisPool>
+```
+
+Requires an ambient custom `RedisPool`. It does not provide connection roles,
+health, Effect Redis, or Crypto.
+
+## `NodeRedisPool.layer`
+
+```text
+NodeRedisPool.layer(config?): Layer<RedisServices, RedisError | ConfigurationError>
+```
+
+Creates scoped producer, worker, and maintenance connections. All three roles
+must connect before the layer is available.
+
+### Standalone configuration
+
+Standalone config accepts node-redis `RedisClientOptions` except
+`clientSideCache` and unrestricted `RESP`. `RESP` is limited to `2 | 3`.
+
+Bounded pool options:
+
+| Field | Default | Constraint |
+| --- | ---: | --- |
+| `minimum` | `1` | Integer at least 1. |
+| `maximum` | `100` | Integer from `minimum` through 1,000. |
+| `acquireTimeout` | `3_000` ms | Finite and non-negative. |
+| `cleanupDelay` | `3_000` ms | Finite and non-negative. |
+
+### Sentinel configuration
+
+Sentinel config is `{ topology: "sentinel", sentinel: RedisSentinelOptions }`.
+The options are passed to node-redis Sentinel. EffectMQ creates isolated
+producer, worker, and maintenance services against the discovered primary.
+
+### Cluster configuration
+
+`{ topology: "cluster" }` always fails with `UnsupportedRedisTopology`.
+Connecting a standalone configuration to a Redis server reporting Cluster mode
+fails with the same error.
+
+## `RedisConnectionHealth`
+
+The service contains:
+
+```text
+snapshot: Effect<RedisHealthSnapshot>
+readiness: Effect<boolean>
+```
+
+`snapshot` is passive. `readiness` sends `PING` through every role and converts
+expected Redis command failures to `false`; defects and interruption remain
+observable.
+
+Snapshots contain topology, aggregate readiness, and per-role state,
+`commandErrors`, `reconnects`, and `lastChangeAt`. They contain no URLs,
+credentials, or raw errors.
+
+## `RedisPool`
+
+`RedisPoolService` is the custom-client boundary:
+
+```text
+send(command, ...args): Effect<unknown, RedisError>
+sendBinary(command, ...args): Effect<unknown, RedisError>
+evalScript(source, options, ...args): Effect<unknown, RedisError>
+```
+
+`RedisPool.make(send, sendBinary)` supplies content-addressed script loading,
+digest caching, one `NOSCRIPT` reload, binary arguments, and Redis metrics.
+`RedisPool.makeConnectionRoles` groups three independently managed services.
+
+## `StorageProtocol`
+
+The public storage protocol writes and reads version `1` envelopes.
+
+```text
+encodeValue(schemaId, kind, value, limits?): Effect<string, StorageError>
+decodeValue(encoded, expectedSchemaId, expectedKind): Effect<unknown, StorageError>
+```
+
+Supported values are `null`, strings, booleans, finite safe numbers,
+`Uint8Array`, arrays, and plain objects composed recursively from those values.
+The byte limit applies before base64 encoding.
+
+## `Observability`
+
+Exported gauges:
+
+- `queueDepth`;
+- `oldestTaskAgeMs`;
+- `maintenanceSweepLagMs`;
+- `dueBacklog`;
+- `expiredLeaseBacklog`;
+- `retentionBacklog`.
+
+Exported counters:
+
+- `redisErrors`;
+- `scriptReloads`;
+- `redisReconnects`;
+- `ownershipLosses`;
+- `retentionFailures`.
+
+`recordQueueHealth(queue, health)` updates all queue-attributed gauges from one
+bounded maintenance result.

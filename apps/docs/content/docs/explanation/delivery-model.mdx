@@ -1,0 +1,79 @@
+---
+title: The delivery model
+description: Why EffectMQ combines at-least-once execution with fenced ownership.
+---
+
+This page is about the boundary of EffectMQ's delivery guarantee: what a lease
+protects, why a handler may still execute more than once, and how recovery fits
+into that model. It does not cover worker configuration or retry options.
+
+## At-least-once is about unfinished work
+
+Once Redis accepts a task, EffectMQ keeps it eligible for processing until a
+worker records a terminal outcome or retention removes the durable state. A
+worker crash does not turn an active task into forgotten work. Its lease
+expires, bounded maintenance observes the expiry, and the task becomes eligible
+again.
+
+That recovery property implies possible repetition. A handler can perform an
+external side effect and then lose its process or Redis connection before the
+success acknowledgement commits. Redis still sees unfinished work, so another
+attempt runs.
+
+No queue can retract the email, payment, webhook, or database commit performed
+in that gap. Exactly-once delivery across Redis and an unrelated external
+system would require a shared transaction protocol. EffectMQ does not claim
+one.
+
+## Fencing protects the queue state
+
+Every acquisition creates a unique lease token. The token identifies one
+attempt, not a worker and not the task forever. Renewing, succeeding, failing,
+or releasing ownership requires the current token.
+
+Suppose attempt A pauses long enough for its lease to expire. Maintenance
+recovers the task and attempt B acquires it with a new token. If A wakes up and
+tries to report success, Redis rejects the stale token with `LeaseLost`. A
+slow, partitioned worker therefore cannot overwrite the newer owner's queue
+state.
+
+Fencing prevents stale acknowledgements. It does not undo side effects attempt
+A already performed. The two guarantees are complementary:
+
+- fencing keeps the durable queue state coherent;
+- downstream idempotency keeps repeated execution from repeating the business
+  effect.
+
+## Heartbeats bound uncertainty
+
+Managed handlers run beside a heartbeat. The heartbeat refreshes ownership
+before the lease deadline and retries transport failures only within a bounded
+safety window. If ownership can no longer be established safely, the attempt
+is interrupted instead of continuing indefinitely without a valid lease.
+
+Redis server time determines lease deadlines, so application clock skew does
+not decide ownership. `lockTimeout` still represents a trade-off: a longer
+lease tolerates longer pauses but delays crash recovery; a shorter lease
+recovers faster but requires tighter heartbeat and latency bounds.
+
+## Handler failure and stalled execution differ
+
+A typed handler failure participates in the task's retry schedule and
+`maxRetries`. An expired lease increments `stalledAttemptCount` instead. After
+`maxStalledCount`, recovery terminates the task with the built-in
+`~effectmq/Error/Stalled` failure.
+
+Separating the counters matters operationally. Repeated domain rejection and
+repeated worker loss are different incidents even when both end in a failed
+task.
+
+## Scheduling preserves the same guarantee
+
+A scheduler does not execute a handler. It materializes a deterministic queue
+task for a nominal cron tick, and a normal worker processes that task. Multiple
+schedulers may safely re-offer the same tick, but the resulting handler remains
+at-least-once for the same reasons as any other queue task.
+
+The useful mental model is: Redis preserves eligible work, lease tokens fence
+who may mutate its state, and the application owns idempotency at external
+boundaries.

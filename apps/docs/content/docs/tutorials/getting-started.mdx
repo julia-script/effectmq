@@ -1,0 +1,180 @@
+---
+title: Build your first queue
+description: Create a typed task, run a managed worker, enqueue work, and wait for its result.
+---
+
+In this tutorial, we will build a small greeting queue. A producer will enqueue
+the name `Ada`, a managed worker will turn it into a greeting, and the producer
+will wait for the typed result.
+
+At the end, the terminal will show output like this:
+
+```text
+Offered Ada as TaskCreated
+Worker received Ada
+Result: Hello, Ada!
+```
+
+## Prerequisites
+
+Start with:
+
+- Node.js 22.19 or newer;
+- pnpm 10;
+- Docker running locally;
+- an empty directory named `effectmq-hello`.
+
+## Start Redis
+
+Create the project directory and start one Redis server:
+
+```bash
+mkdir effectmq-hello
+cd effectmq-hello
+docker run --name effectmq-tutorial-redis --publish 6379:6379 --detach redis:8-alpine
+```
+
+Confirm that Redis is ready:
+
+```bash
+docker exec effectmq-tutorial-redis redis-cli ping
+```
+
+The command prints:
+
+```text
+PONG
+```
+
+## Create the project
+
+Create `package.json`:
+
+```json
+{
+  "name": "effectmq-hello",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@effect/platform-node": "4.0.0-beta.107",
+    "@effectmq/core": "0.3.0-rc.0",
+    "effect": "4.0.0-beta.107",
+    "tsx": "4.22.4"
+  }
+}
+```
+
+Install the dependencies and create the source directory:
+
+```bash
+pnpm install
+mkdir src
+```
+
+The installation finishes with `Done` and creates `node_modules`.
+
+## Define the task and queue
+
+Create `src/main.ts`:
+
+```ts
+import { NodeRuntime } from "@effect/platform-node"
+import { Task, TaskEngine, TaskQueue, Worker } from "@effectmq/core"
+import { Console, Effect, Schema } from "effect"
+
+const Greet = Task.make({
+  name: "greet",
+  schemaId: "greet/v1",
+  payload: { name: Schema.String },
+  success: Schema.String,
+  error: Schema.Never,
+  idempotencyKey: ({ name }) => name
+})
+
+const greetings = TaskQueue.make("tutorial-greetings", Greet)
+
+const worker = Worker.make(
+  greetings,
+  ({ payload }) =>
+    Effect.gen(function* () {
+      yield* Console.log(`Worker received ${payload.name}`)
+      return `Hello, ${payload.name}!`
+    }),
+  { pollInterval: "50 millis" }
+)
+
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    yield* Worker.run(worker).pipe(Effect.forkScoped)
+
+    const offered = yield* TaskQueue.offer(
+      greetings,
+      { name: "Ada" },
+      { onSuccessPolicy: "keep" }
+    )
+    yield* Console.log(`Offered Ada as ${offered._tag}`)
+
+    const greeting = yield* TaskQueue.wait(greetings, offered.handle, {
+      timeout: "10 seconds"
+    })
+    yield* Console.log(`Result: ${greeting}`)
+  })
+)
+
+program.pipe(
+  Effect.provide(
+    TaskEngine.layer({
+      redis: { url: "redis://127.0.0.1:6379" }
+    })
+  ),
+  NodeRuntime.runMain
+)
+```
+
+Notice that `Task.make`, `TaskQueue.make`, and `Worker.make` run before
+`program` is defined. They create descriptions and do not need an Effect
+runtime. `Worker.run`, `TaskQueue.offer`, and `TaskQueue.wait` are the runtime
+operations.
+
+Run the application:
+
+```bash
+pnpm start
+```
+
+The output should contain:
+
+```text
+Offered Ada as TaskCreated
+Worker received Ada
+Result: Hello, Ada!
+```
+
+Notice that the producer receives a `TaskHandle` from `offer` and passes that
+handle to `wait`. The handle identifies the exact task generation whose result
+the caller expects.
+
+Run `pnpm start` once more. The stable idempotency key causes the producer to
+find the retained generation:
+
+```text
+Offered Ada as TaskExisting
+Result: Hello, Ada!
+```
+
+The handler does not run again. You have now defined a typed task, bound it to
+a queue, processed it with a managed worker, and observed its durable result.
+
+## Stop Redis
+
+Remove the tutorial Redis container:
+
+```bash
+docker rm --force effectmq-tutorial-redis
+```
+
+Next, [process tasks with managed workers](/docs/how-to/process-tasks), or read
+about [task identity and generations](/docs/explanation/task-identity).

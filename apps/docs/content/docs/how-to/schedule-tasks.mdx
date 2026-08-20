@@ -1,0 +1,72 @@
+---
+title: Schedule recurring tasks
+description: Materialize durable cron ticks and process them with an ordinary worker.
+---
+
+This guide shows you how to materialize a recurring cron tick into an ordinary
+queue task and process it with a managed worker.
+
+## Define the scheduled task
+
+Create one queue whose payload records the nominal schedule time:
+
+```ts
+import { NodeRuntime } from "@effect/platform-node"
+import { Scheduler, Task, TaskEngine, TaskQueue, Worker } from "@effectmq/core"
+import { Cron, Effect, Schema } from "effect"
+
+const GenerateReport = Task.make({
+  name: "generate-report",
+  schemaId: "generate-report/v1",
+  payload: { scheduledAt: Schema.String },
+  success: Schema.Void,
+  error: Schema.Struct({ reason: Schema.String }),
+  idempotencyKey: ({ scheduledAt }) => scheduledAt
+})
+const reports = TaskQueue.make("reports", GenerateReport)
+
+const scheduler = Scheduler.make({
+  name: "nightly-report",
+  cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
+  queue: reports,
+  payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
+  missed: { _tag: "coalesce" }
+})
+
+const worker = Worker.make(reports, ({ payload }) =>
+  Effect.log(`Generating report for ${payload.scheduledAt}`)
+)
+
+const program = Effect.gen(function* () {
+  yield* scheduler.pipe(Effect.forkChild)
+  return yield* Worker.run(worker)
+})
+
+program.pipe(
+  Effect.provide(
+    TaskEngine.layer({ redis: { url: "redis://127.0.0.1:6379" } })
+  ),
+  NodeRuntime.runMain
+)
+```
+
+Run the scheduler and worker as separate deployment roles when they need
+independent scaling. Both use the same stable task and queue definitions.
+
+## Choose downtime behavior
+
+Set one bounded missed-tick policy:
+
+- `{ _tag: "skip" }` advances past missed work;
+- `{ _tag: "coalesce" }` emits one task for the most recent due tick;
+- `{ _tag: "backfill", maxBackfill: 24 }` emits up to 24 recent ticks in
+  chronological order.
+
+The scheduler offers a deterministic task id before advancing its durable
+cursor. Running two scheduler instances is safe and improves availability.
+
+The setup is complete when the scheduler cursor advances and the target worker
+processes tasks whose `scheduledAt` values match nominal cron ticks. Refer to
+the [Scheduler reference](/docs/reference/worker-and-scheduler) for exact
+configuration and the [delivery model](/docs/explanation/delivery-model) for
+the resulting guarantees.

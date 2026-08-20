@@ -7,8 +7,24 @@ diagnostics, but does not join, cancel, fail, or otherwise control either task.
 The only behavioral relationship is explicit result retention:
 
 ```ts
-yield* TaskQueue.offer(childQueue, payload, {
-  retainResultUntil: "current-task-settles"
+import { Task, TaskQueue } from "@effectmq/core"
+import { Effect, Schema } from "effect"
+
+const ChildTask = Task.make({
+  name: "child-task",
+  payload: { childId: Schema.String },
+  success: Schema.Void,
+  error: Schema.Never,
+  idempotencyKey: ({ childId }) => childId
+})
+const childQueue = TaskQueue.make("children", ChildTask)
+
+const retainChild = Effect.gen(function* () {
+  yield* TaskQueue.offer(
+    childQueue,
+    { childId: "child-42" },
+    { retainResultUntil: "current-task-settles" }
+  )
 })
 ```
 

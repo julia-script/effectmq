@@ -21,19 +21,20 @@ import { Effect, Schema } from "effect";
 import { NodeRuntime } from "@effect/platform-node";
 import { Task, TaskEngine, TaskQueue } from "@effectmq/core";
 
-const program = Effect.gen(function* () {
-  const SendEmail = yield* Task.make({
-    name: "send-email",
-    payload: { to: Schema.String, subject: Schema.String },
-    success: Schema.String,
-    error: Schema.Never,
-  });
-  const emails = TaskQueue.make("emails", SendEmail);
+const SendEmail = Task.make({
+  name: "send-email",
+  payload: { to: Schema.String, subject: Schema.String },
+  success: Schema.String,
+  error: Schema.Never,
+});
 
+const emails = TaskQueue.make("emails", SendEmail);
+
+const program = Effect.gen(function* () {
   yield* TaskQueue.offer(emails, { to: "ada@example.com", subject: "Welcome" });
 
   yield* TaskQueue.complete(emails, (task) =>
-    sendViaProvider(task.payload), // returns the provider message id
+    Effect.succeed(`provider:${task.payload.to}`),
   );
 });
 
@@ -81,39 +82,38 @@ The tested platform matrix is in the [support policy](./docs/support-policy.md),
 
 A task is a *schema*, not a function. You declare what goes in (`payload`), what a success looks like, and what a failure looks like. The `idempotencyKey` decides what "the same task" means: offer the same key twice and you get one task, not two.
 
-A tagged error makes failures pattern-matchable downstream, so reach for `Schema.TaggedErrorClass` rather than a bare struct.
+A tagged error makes failures pattern-matchable downstream, so reach for `Schema.TaggedError` rather than a bare struct.
 
-```ts
-import { Effect, Schedule, Schema } from "effect";
-import { Task, TaskQueue } from "@effectmq/core";
+```ts docs-check=email
+import { Effect, Schedule, Schema, Semaphore, Stream } from "effect";
+import { Task, TaskQueue, type TaskHandler } from "@effectmq/core";
 
-class EmailRejected extends Schema.TaggedErrorClass<EmailRejected>()(
+class EmailRejected extends Schema.TaggedError<EmailRejected>()(
   "EmailRejected",
   { reason: Schema.String },
 ) {}
 
-const queues = Effect.gen(function* () {
-  const SendEmail = yield* Task.make({
-    name: "send-email",
-    payload: { to: Schema.String, subject: Schema.String },
-    success: Schema.String,
-    error: EmailRejected,
-    idempotencyKey: (p) => `email:${p.to}:${p.subject}`,
-    retry: Schedule.exponential("1 second"),
-  });
-  return TaskQueue.make("emails", SendEmail);
+const SendEmail = Task.make({
+  name: "send-email",
+  payload: { to: Schema.String, subject: Schema.String },
+  success: Schema.String,
+  error: EmailRejected,
+  idempotencyKey: (p) => `email:${p.to}:${p.subject}`,
+  retry: Schedule.exponential("1 second"),
 });
+
+const emails = TaskQueue.make("emails", SendEmail);
+
+const sendViaProvider = (payload: { readonly to: string }) =>
+  Effect.succeed(`provider:${payload.to}`);
 ```
 
 ## Offer work, then do it
 
 `offer` enqueues a payload. `complete` takes the next task, runs your handler, reports the outcome back to the engine, and returns the task's id (a failing handler is routed per the queue's failure policy). The task your handler receives is fully decoded: `task.payload` is the real object, not a JSON string.
 
-```ts
-import { Effect } from "effect";
-
-const program = Effect.gen(function* () {
-  const emails = yield* queues;
+```ts docs-check=email
+const offerAndCompleteProgram = Effect.gen(function* () {
   yield* TaskQueue.offer(emails, {
     to: "ada@example.com",
     subject: "Welcome",
@@ -137,10 +137,7 @@ One `complete` processes one task. To process *many*, set your workers up accord
 
 Handlers are just functions and workers are just Effects, so both are values you can name once and reuse. Type a handler with `TaskHandler` to declare it next to the task definition, before any queue exists; bind it to a queue with `complete` and you have a worker effect you can run, repeat, or fork like any other:
 
-```ts
-import { Effect, Schedule } from "effect";
-import { TaskQueue, type TaskHandler } from "@effectmq/core";
-
+```ts docs-check=email
 // Declared against the task definition — no queue in sight yet.
 const handleSendEmail: TaskHandler<
   typeof SendEmail.payloadSchema,
@@ -151,7 +148,7 @@ const handleSendEmail: TaskHandler<
 // Bound to a queue: an Effect that takes one task and runs it to completion.
 const sendEmailWorker = TaskQueue.complete(emails, handleSendEmail);
 
-const program = Effect.gen(function* () {
+const repeatedWorkerProgram = Effect.gen(function* () {
   yield* sendEmailWorker; // process one task...
   yield* sendEmailWorker.pipe(Effect.repeat(Schedule.forever)); // ...or loop forever
 });
@@ -163,9 +160,7 @@ const program = Effect.gen(function* () {
 
 The engine publishes a lifecycle event to a per-queue Redis Stream every time a task changes state. `TaskQueue.stream` hands you those events as an Effect `Stream`, decoded against your queue's schemas: `task.created` and `task.updated` carry fully-typed tasks, `task.failed` carries your typed error, `task.completed` carries your typed success value, and `task.moved` reports the list transition.
 
-```ts
-import { Effect, Stream } from "effect";
-
+```ts docs-check=email
 const watch = TaskQueue.stream(emails).pipe(
   Stream.runForEach((event) => Effect.log(event._tag, event.taskId)),
 );
@@ -173,16 +168,21 @@ const watch = TaskQueue.stream(emails).pipe(
 
 Because it's just a stream of terminal events, you can also *wait on a specific task*. `wait` blocks until a task id reaches a terminal state, resolving with its success value or failing with its typed error. `execute` is the offer-and-wait shortcut: enqueue a payload and get its outcome back in one call.
 
-```ts
+```ts docs-check=email
 // Offer + await the result in one call.
-const messageId = yield* TaskQueue.execute(emails, {
+const executeMessage = TaskQueue.execute(emails, {
   to: "ada@example.com",
   subject: "Welcome",
 }); // resolves with the success value, or fails with EmailRejected
 
 // Or await a task you already offered.
-const task = yield* TaskQueue.offer(emails, payload);
-const result = yield* TaskQueue.wait(emails, task.handle);
+const offerAndWait = Effect.gen(function* () {
+  const task = yield* TaskQueue.offer(emails, {
+    to: "grace@example.com",
+    subject: "Welcome",
+  });
+  return yield* TaskQueue.wait(emails, task.handle);
+});
 ```
 
 `wait` reads durable state, subscribes from the handle's authoritative Redis cursor, and rechecks state after subscription, so completion before or during subscription is observed. Streams poll Redis (default every second); persist a retained cursor when building a resumable event consumer.
@@ -195,9 +195,7 @@ Differently than other queue libraries, `effectmq` doesn't have builtin concurre
 
 Effect gives you the fine control you need from your workers,  so `complete` does exactly one task, and *you* decide how many run at once, with the same tools you use everywhere else:
 
-```ts
-import { Effect, Schedule, Semaphore } from "effect";
-
+```ts docs-check=email
 // Concurrency example with semaphore
 const worker = Effect.gen(function* () {
   // At most 5 tasks in flight at any moment.
@@ -205,7 +203,7 @@ const worker = Effect.gen(function* () {
 
   yield* Semaphore.withPermit(
     semaphore,
-    TaskQueue.complete(emails, (task) => handle(task)),
+    TaskQueue.complete(emails, handleSendEmail),
   ).pipe(
     Effect.forkScoped,            // each worker is its own fiber
     Effect.repeat(Schedule.forever), // ...that keeps pulling work
@@ -242,29 +240,26 @@ re-offer it. A managed worker executes the task with the queue's normal leases,
 retries, and **at-least-once** delivery semantics.
 
 ```ts
-import { Cron, Schema } from "effect";
+import { Cron, Effect, Schema } from "effect";
 import { Scheduler, Task, TaskQueue, Worker } from "@effectmq/core";
 
-const scheduledReports = Effect.gen(function* () {
-  const reportTask = yield* Task.make({
-    name: "nightly-report-task",
-    payload: { scheduledAt: Schema.String },
-    success: Schema.Void,
-    error: Schema.String,
-  });
-  const reportQueue = TaskQueue.make("nightly-reports", reportTask);
-  const schedule = yield* Scheduler.make({
-    name: "nightly-report",
-    cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
-    queue: reportQueue,
-    payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
-    missed: { _tag: "coalesce" },
-  });
-  return {
-    schedule,
-    worker: Worker.make(reportQueue, () => buildAndSendReport()),
-  };
+const reportTask = Task.make({
+  name: "nightly-report-task",
+  payload: { scheduledAt: Schema.String },
+  success: Schema.Void,
+  error: Schema.String,
 });
+const reportQueue = TaskQueue.make("nightly-reports", reportTask);
+const schedule = Scheduler.make({
+  name: "nightly-report",
+  cron: Cron.parseUnsafe("0 2 * * *", "UTC"),
+  queue: reportQueue,
+  payload: (tick) => ({ scheduledAt: tick.scheduledAt.toISOString() }),
+  missed: { _tag: "coalesce" },
+});
+const worker = Worker.make(reportQueue, ({ payload }) =>
+  Effect.log(`Building report for ${payload.scheduledAt}`),
+);
 ```
 
 ---

@@ -41,7 +41,9 @@ logs. For Sentinel, TLS and ACL settings for Redis nodes belong in
 `nodeClientOptions`; Sentinel credentials belong in `sentinelClientOptions`.
 
 ```ts
-const RedisLive = NodeRedisPool.layer({
+import { NodeRedisPool } from "@effectmq/core"
+
+const SentinelRedisLive = NodeRedisPool.layer({
   topology: "sentinel",
   sentinel: {
     name: "effectmq-primary",

@@ -2,6 +2,70 @@
 @import "fumadocs-ui/css/neutral.css";
 @import "fumadocs-ui/css/preset.css";
 
+@theme {
+  --font-sans: "Space Grotesk", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+:root {
+  --accent: #c6f94f;
+  /* Light theme: same character as the landing palette, readable on white. */
+  --color-fd-background: hsl(240, 6%, 97%);
+  --color-fd-foreground: hsl(240, 8%, 8%);
+  --color-fd-muted: hsl(240, 6%, 93%);
+  --color-fd-muted-foreground: hsl(240, 5%, 42%);
+  --color-fd-card: hsl(240, 6%, 95%);
+  --color-fd-card-foreground: hsl(240, 8%, 8%);
+  --color-fd-border: hsla(240, 8%, 60%, 0.35);
+  --color-fd-primary: hsl(78, 85%, 26%);
+  --color-fd-primary-foreground: hsl(240, 8%, 98%);
+  --color-fd-ring: hsl(78, 85%, 30%);
+}
+
+/* Dark theme: the landing page palette. */
+.dark {
+  --color-fd-background: #0b0b0e;
+  --color-fd-foreground: #ededf2;
+  --color-fd-muted: #101016;
+  --color-fd-muted-foreground: #8b8b98;
+  --color-fd-popover: #0e0e13;
+  --color-fd-popover-foreground: #b9b9c4;
+  --color-fd-card: #101016;
+  --color-fd-card-foreground: #ededf2;
+  --color-fd-border: #23232b;
+  --color-fd-primary: var(--accent);
+  --color-fd-primary-foreground: #0b0b0e;
+  --color-fd-secondary: #101016;
+  --color-fd-secondary-foreground: #ededf2;
+  --color-fd-accent: #1a1a22;
+  --color-fd-accent-foreground: #ededf2;
+  --color-fd-ring: var(--accent);
+}
+
+.dark #nd-sidebar {
+  --color-fd-muted: #101016;
+  --color-fd-secondary: #15151c;
+  --color-fd-muted-foreground: #8b8b98;
+}
+
+.dark ::selection {
+  background: var(--accent);
+  color: #0b0b0e;
+}
+
 html {
   scrollbar-gutter: stable;
+}
+
+.docs-wordmark {
+  font: 700 16px var(--font-mono);
+  letter-spacing: -0.02em;
+}
+
+.docs-wordmark-accent {
+  color: var(--accent);
+}
+
+:root:not(.dark) .docs-wordmark-accent {
+  color: var(--color-fd-primary);
 }

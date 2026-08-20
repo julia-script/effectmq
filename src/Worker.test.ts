@@ -1,16 +1,19 @@
-import { Deferred, Effect, Fiber, Schedule, Schema } from "effect";
 import { expect, layer } from "@effect/vitest";
+import { Deferred, Effect, Fiber, Schedule, Schema } from "effect";
 import { RedisPool, Task, TaskEngine, TaskQueue, Worker } from "./index.js";
 import { TestLayer } from "./testing/redisLayer.js";
 
 const makeQueue = (name: string) =>
-  Task.make({
+  TaskQueue.make(
     name,
-    payload: { id: Schema.String },
-    success: Schema.String,
-    error: Schema.Struct({ reason: Schema.String }),
-    idempotencyKey: (payload) => payload.id,
-  }).pipe(Effect.map((definition) => TaskQueue.make(name, definition)));
+    Task.make({
+      name,
+      payload: { id: Schema.String },
+      success: Schema.String,
+      error: Schema.Struct({ reason: Schema.String }),
+      idempotencyKey: (payload) => payload.id,
+    }),
+  );
 
 const waitUntilRemoved = (
   engine: TaskEngine.TaskEngineService,
@@ -27,11 +30,36 @@ const waitUntilRemoved = (
 layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
   "Worker (real Redis time)",
   (it) => {
+    it.effect("invalid task configuration defects before worker startup", () =>
+      Effect.gen(function* () {
+        const definition = Task.make({
+          name: "invalid-worker-task",
+          payload: { id: Schema.String },
+          success: Schema.String,
+          error: Schema.Never,
+          maxRetries: -1,
+        });
+        const queue = TaskQueue.make(definition.name, definition);
+        const worker = Worker.make(queue, () => Effect.succeed("unused"));
+        const cause = yield* Worker.run(worker).pipe(
+          Effect.sandbox,
+          Effect.flip,
+        );
+        const defect = cause.reasons.find((reason) => reason._tag === "Die");
+        expect(defect).toMatchObject({
+          _tag: "Die",
+          defect: expect.objectContaining({
+            message: expect.stringContaining("maxRetries"),
+          }),
+        });
+      }),
+    );
+
     it.effect("uses isolated worker and maintenance Redis roles", () =>
       Effect.gen(function* () {
         const engine = yield* TaskEngine.TaskEngine;
         const base = yield* RedisPool.RedisPool;
-        const queue = yield* makeQueue("worker-roles");
+        const queue = makeQueue("worker-roles");
         yield* TaskQueue.offer(queue, { id: "one" });
 
         const calls = { producer: 0, worker: 0, maintenance: 0 };
@@ -79,7 +107,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       () =>
         Effect.gen(function* () {
           const engine = yield* TaskEngine.TaskEngine;
-          const queue = yield* makeQueue("worker-drain");
+          const queue = makeQueue("worker-drain");
           yield* TaskQueue.offer(queue, { id: "drain" });
           const started = yield* Deferred.make<void>();
           const finish = yield* Deferred.make<void>();

@@ -43,11 +43,12 @@ at-least-once handler execution.
 - **WHEN** the worker loses its lease after beginning a scheduled handler
 - **THEN** the same tick task may execute again under normal retry semantics
 
-### Requirement: Invalid schedule definitions fail predictably
+### Requirement: Schedule definitions are pure and runtime invariants defect
 
-Schedule construction SHALL validate missed-tick policy and backfill bounds before materialization. Predictably invalid definitions SHALL fail with a typed scheduler-configuration error and SHALL NOT throw or die.
+Schedule construction SHALL synchronously return a reusable definition without evaluating an Effect or validating the missed-tick policy. Before materialization reads time, accesses Redis, or offers a task, it SHALL validate the scheduler's runtime invariants. Invalid programmer-authored definition configuration SHALL terminate materialization with a defect and SHALL NOT appear in the typed scheduler failure channel.
 
 #### Scenario: Maximum backfill is invalid
 - **WHEN** a schedule declares a maximum backfill outside the supported range
-- **THEN** construction fails with a scheduler-configuration error identifying the field and accepted range
+- **THEN** construction returns the scheduler definition without throwing
+- **AND** the first materialization attempt terminates with a defect identifying the invalid field
 - **AND** no due tick is evaluated or offered

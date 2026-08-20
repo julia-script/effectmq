@@ -11,7 +11,18 @@ cursor only after the offer. A normal `Worker` executes the task with the
 queue's leases, retries, failure policy, and at-least-once delivery.
 
 ```ts
-const schedule = yield* Scheduler.make({
+import { Scheduler, Task, TaskQueue } from "@effectmq/core"
+import { Cron, Schema } from "effect"
+
+const reportTask = Task.make({
+  name: "nightly-report-task",
+  payload: { scheduledAt: Schema.String },
+  success: Schema.Void,
+  error: Schema.Never
+})
+const reports = TaskQueue.make("nightly-reports", reportTask)
+
+const schedule = Scheduler.make({
   name: "nightly-report",
   cron: Cron.parseUnsafe("0 2 * * *", "America/Sao_Paulo"),
   queue: reports,
@@ -19,6 +30,9 @@ const schedule = yield* Scheduler.make({
   missed: { _tag: "backfill", maxBackfill: 7 }
 })
 ```
+
+Construction is pure. An invalid `maxBackfill` is reported as a defect when
+the scheduler first materializes work, before it reads or writes Redis state.
 
 Use an explicit IANA time zone. Nominal tick identity includes the resulting
 instant, so daylight-saving gaps and overlaps follow Effect Cron's time-zone

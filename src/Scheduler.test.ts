@@ -1,6 +1,6 @@
+import { expect, it, layer } from "@effect/vitest";
 import { Cron, Effect, Schedule, Schema } from "effect";
 import * as Clock from "effect/Clock";
-import { expect, it, layer } from "@effect/vitest";
 import {
   Scheduler,
   StorageProtocol,
@@ -34,14 +34,12 @@ const makeQueue = (name: string, retry = false) => {
         maxRetries: 1,
       })
     : Task.make({ ...options, idempotencyKey: options.idempotencyKey });
-  return task.pipe(
-    Effect.map((definition) => TaskQueue.make(name, definition)),
-  );
+  return TaskQueue.make(name, task);
 };
 
 const config = (
   name: string,
-  queue: Effect.Success<ReturnType<typeof makeQueue>>,
+  queue: ReturnType<typeof makeQueue>,
   missed: Scheduler.MissedTickPolicy = { _tag: "coalesce" },
 ) => ({
   name,
@@ -55,31 +53,44 @@ const config = (
   }),
 });
 
-it.effect("invalid backfill configuration fails in the typed channel", () =>
-  Effect.gen(function* () {
-    const queue = yield* makeQueue("invalid-backfill");
-    const error = yield* Scheduler.make(
-      config("invalid-backfill", queue, {
-        _tag: "backfill",
-        maxBackfill: 0,
-      }),
-    ).pipe(Effect.flip);
-    expect(error).toMatchObject({
-      _tag: "SchedulerConfigurationError",
-      field: "maxBackfill",
-      actual: 0,
-    });
-  }),
-);
+it("scheduler construction is pure and postpones invariant checks", () => {
+  const queue = makeQueue("invalid-backfill");
+  const scheduler = Scheduler.make(
+    config("invalid-backfill", queue, {
+      _tag: "backfill",
+      maxBackfill: 0,
+    }),
+  );
+  expect(scheduler.name).toBe("invalid-backfill");
+});
 
 layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
   "durable Scheduler (real Redis time)",
   (it) => {
+    it.effect("invalid backfill configuration is a defect at first use", () =>
+      Effect.gen(function* () {
+        const queue = makeQueue("invalid-backfill-runtime");
+        const cause = yield* Scheduler.materializeDue(
+          config("invalid-backfill-runtime", queue, {
+            _tag: "backfill",
+            maxBackfill: 0,
+          }),
+        ).pipe(Effect.sandbox, Effect.flip);
+        const defect = cause.reasons.find((reason) => reason._tag === "Die");
+        expect(defect).toMatchObject({
+          _tag: "Die",
+          defect: expect.objectContaining({
+            message: expect.stringContaining("maxBackfill"),
+          }),
+        });
+      }),
+    );
+
     it.effect("reads Clock when a materialization Effect executes", () =>
       Effect.gen(function* () {
         const engine = yield* TaskEngine.TaskEngine;
         const liveClock = yield* Clock.Clock;
-        const queue = yield* makeQueue("execution-clock-queue");
+        const queue = makeQueue("execution-clock-queue");
         const definition = config("execution-clock", queue);
         const tick = new Date("2026-01-01T00:01:00.000Z");
         const now = new Date("2026-01-01T00:01:30.000Z");
@@ -105,7 +116,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       () =>
         Effect.gen(function* () {
           const engine = yield* TaskEngine.TaskEngine;
-          const queue = yield* makeQueue("scheduled-race-queue");
+          const queue = makeQueue("scheduled-race-queue");
           const definition = config("scheduled-race", queue);
           const now = new Date("2026-01-01T00:01:30.000Z");
           const tick = new Date("2026-01-01T00:01:00.000Z");
@@ -135,7 +146,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       () =>
         Effect.gen(function* () {
           const engine = yield* TaskEngine.TaskEngine;
-          const queue = yield* makeQueue("scheduled-crash-queue");
+          const queue = makeQueue("scheduled-crash-queue");
           const definition = config("scheduled-crash", queue);
           const tick = new Date("2026-01-01T00:02:00.000Z");
           const now = new Date("2026-01-01T00:02:30.000Z");
@@ -168,7 +179,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
     it.effect("a crash before offer leaves the due cursor available", () =>
       Effect.gen(function* () {
         const engine = yield* TaskEngine.TaskEngine;
-        const queue = yield* makeQueue("scheduled-before-offer-queue");
+        const queue = makeQueue("scheduled-before-offer-queue");
         const definition = config("scheduled-before-offer", queue);
         const tick = new Date("2026-01-01T00:03:00.000Z");
         const now = new Date("2026-01-01T00:03:30.000Z");
@@ -193,7 +204,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
           const firstMissed = new Date("2026-01-01T00:00:00.000Z");
           yield* TaskEngine.setMockTime(now.getTime());
 
-          const skipQueue = yield* makeQueue("scheduled-skip-queue");
+          const skipQueue = makeQueue("scheduled-skip-queue");
           const skip = config("scheduled-skip", skipQueue, { _tag: "skip" });
           yield* engine.setSchedule(skip.name, firstMissed);
           yield* Scheduler.materializeDue(skip, now);
@@ -201,7 +212,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
             (yield* engine.listTasks(skipQueue.name, "wait")).items,
           ).toEqual([]);
 
-          const coalesceQueue = yield* makeQueue("scheduled-coalesce-queue");
+          const coalesceQueue = makeQueue("scheduled-coalesce-queue");
           const coalesce = config("scheduled-coalesce", coalesceQueue);
           yield* engine.setSchedule(coalesce.name, firstMissed);
           yield* Scheduler.materializeDue(coalesce, now);
@@ -225,7 +236,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
             missedFrom: firstMissed.toISOString(),
           });
 
-          const backfillQueue = yield* makeQueue("scheduled-backfill-queue");
+          const backfillQueue = makeQueue("scheduled-backfill-queue");
           const backfill = config("scheduled-backfill", backfillQueue, {
             _tag: "backfill",
             maxBackfill: 2,
@@ -246,7 +257,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       () =>
         Effect.gen(function* () {
           const engine = yield* TaskEngine.TaskEngine;
-          const queue = yield* makeQueue("scheduled-retry-queue", true);
+          const queue = makeQueue("scheduled-retry-queue", true);
           const definition = config("scheduled-retry", queue);
           const now = new Date(
             Math.floor(Date.now() / 60_000) * 60_000 + 30_000,
@@ -286,7 +297,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
     it.effect("a lost scheduled-task lease can execute the handler again", () =>
       Effect.gen(function* () {
         const engine = yield* TaskEngine.TaskEngine;
-        const queue = yield* makeQueue("scheduled-at-least-once-queue");
+        const queue = makeQueue("scheduled-at-least-once-queue");
         const definition = config("scheduled-at-least-once", queue);
         const now = new Date("2026-01-01T00:08:30.000Z");
         const tick = new Date("2026-01-01T00:08:00.000Z");

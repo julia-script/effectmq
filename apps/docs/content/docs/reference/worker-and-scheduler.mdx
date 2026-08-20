@@ -1,0 +1,99 @@
+---
+title: Worker and Scheduler reference
+description: Managed worker loops and durable cron materialization.
+---
+
+## `Worker.make`
+
+```text
+Worker.make(queue, handler, options?): Worker
+```
+
+Creates a descriptor without starting fibers or acquiring Redis connections.
+
+| Option | Type | Default |
+| --- | --- | ---: |
+| `concurrency` | `number` | `1` |
+| `pollInterval` | `Duration.Input` | 1 second |
+| `maintenanceInterval` | `Duration.Input` | 1 second |
+| `drainTimeout` | `Duration.Input` | 30 seconds |
+| `processing` | `TaskQueue.ProcessingOptions` | processing defaults |
+
+Concurrency is normalized with `Math.max(1, Math.floor(value))`.
+
+## `Worker.run`
+
+```text
+Worker.run(worker): Effect<never, never, WorkerRequirements>
+```
+
+Runs acquisition slots and bounded maintenance until interrupted. Attempt and
+maintenance failures are logged and their loops continue. Interruption stops
+new acquisitions, waits for active handlers up to `drainTimeout`, then
+interrupts the remainder.
+
+The worker checks its task definition before acquiring Redis roles or starting
+fibers. Invalid programmer-authored configuration is a defect.
+
+The required environment includes `RedisConnectionRoles`, `Crypto`, queue
+retry services, handler services, payload decoding services, and terminal
+encoding services.
+
+## `Scheduler.make`
+
+```text
+Scheduler.make(config): Scheduler
+```
+
+Creates a pure long-running Effect descriptor without evaluating it. Scheduler
+invariants are checked when the descriptor or `materializeDue` is executed.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string` | required | Stable Redis schedule-cursor identity. |
+| `cron` | `Cron.Cron` | required | Cron expression and optional IANA time zone. |
+| `queue` | `TaskQueue` | required | Target queue. |
+| `payload` | `(tick: Tick) => Payload` | required | Payload constructor. |
+| `missed` | `MissedTickPolicy` | required | Downtime selection policy. |
+| `startAt` | `Date` | next future tick | Initial cursor for a new schedule. |
+| `taskOptions` | restricted `TaskOptions` | offer defaults | Cannot set `taskId`, `onDuplicate`, or `retainResultUntil`. |
+
+`Scheduler` is itself an `Effect<void, SchedulerFailure, OfferRequirements>`.
+It sleeps at least 100 milliseconds between observations.
+
+## `MissedTickPolicy`
+
+| Tag | Behavior |
+| --- | --- |
+| `skip` | Materializes no missed tasks and advances to the next future tick. |
+| `coalesce` | Materializes one task for the most recent due tick. |
+| `backfill` | Materializes up to `maxBackfill` recent due ticks in chronological order. |
+
+`maxBackfill` must be a positive safe integer. An invalid value is a defect at
+the first scheduler operation, not a typed scheduler failure.
+
+## `Tick`
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `scheduleName` | `string` | Stable scheduler name. |
+| `scheduledAt` | `Date` | Nominal cron instant used in task identity. |
+| `missedFrom` | `Date` | Earliest tick represented by this task. |
+| `missedTo` | `Date` | Latest tick represented by this task. |
+
+For ordinary and backfilled tasks, `missedFrom` and `missedTo` equal
+`scheduledAt`. A coalesced task spans the missed interval.
+
+## `Scheduler.materializeDue`
+
+```text
+materializeDue(config, now?): Effect<Date, SchedulerFailure, ...>
+```
+
+Performs one bounded scheduler observation and returns the next cursor. The
+optional `now` supports deterministic tests; otherwise Effect's `Clock` is read
+when the Effect executes.
+
+Each task id is `<schedule-name>/<scheduledAt.toISOString()>`. The task is
+offered before the cursor advances, and duplicate tick offers use
+`return-existing`.

@@ -1,0 +1,67 @@
+---
+title: Make handler side effects idempotent
+description: Use stable attempt-independent keys when calling external systems.
+---
+
+This guide shows you how to prevent repeated handler execution from repeating
+an externally visible side effect.
+
+## Derive a key from the task generation
+
+Use the queue name, task id, and generation as the downstream idempotency key.
+Do not include the attempt number: retries of the same generation must reuse
+the same key.
+
+```ts
+import { Task, TaskQueue } from "@effectmq/core"
+import { Effect, Schema } from "effect"
+
+const ChargeError = Schema.Struct({ reason: Schema.String })
+
+const ChargeTask = Task.make({
+  name: "charge-card",
+  payload: { chargeId: Schema.String, amount: Schema.Number },
+  success: Schema.String,
+  error: ChargeError,
+  idempotencyKey: ({ chargeId }) => chargeId
+})
+
+const chargeHandler: TaskQueue.TaskHandler<
+  typeof ChargeTask.payloadSchema,
+  typeof ChargeTask.successSchema,
+  typeof ChargeTask.errorSchema
+> = (task) =>
+  Effect.tryPromise({
+    try: async () => {
+      const response = await fetch("https://payments.example/charges", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": `charges:${task.id}:${task.generation}`
+        },
+        body: JSON.stringify(task.payload)
+      })
+      if (!response.ok) throw new Error(`payment status ${response.status}`)
+      return Schema.decodeUnknownSync(Schema.String)(await response.text())
+    },
+    catch: (cause) => ({ reason: String(cause) })
+  })
+```
+
+The downstream service must durably associate that key with the first outcome.
+If it accepts the side effect and the EffectMQ acknowledgement is lost, the
+next handler attempt receives the same stored outcome instead of creating a
+second charge.
+
+## Apply the same rule to local writes
+
+For a database write, put the generation key in a unique column and commit the
+business mutation and key record in one transaction. Treat a unique-key
+conflict as a replay and return the previously stored outcome.
+
+Do not use an in-memory set, worker process id, lease token, or attempt counter.
+Those values either disappear on restart or change between executions.
+
+The handler is safe when executing it twice for the same task generation
+produces one externally visible effect and the same typed result. See
+[why duplicate execution remains possible](/docs/explanation/delivery-model).

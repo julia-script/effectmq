@@ -1,0 +1,55 @@
+---
+title: Task relationships and result retention
+description: Why nested offers record provenance without becoming parent-child execution.
+---
+
+This page is about the limited relationships EffectMQ records between tasks.
+It explains creator provenance and result-retention holds. It does not describe
+a workflow, dependency graph, or cancellation model because EffectMQ does not
+provide those semantics.
+
+## Nested offers record provenance
+
+When a managed handler offers another task, EffectMQ records the current task
+identity as immutable creator provenance. That information answers a diagnostic
+question—where did this work come from?—without changing how either task runs.
+
+The creator does not wait for the offered task. A creator failure does not
+cancel it, and its success does not complete the creator. Retries and removal
+remain independent in both directions.
+
+This deliberate weakness keeps an offer compositional. Enqueueing work inside
+a handler does not silently create a distributed transaction or a saga.
+
+## Retention holds protect result availability
+
+Sometimes the creator must read the offered task's result before it settles.
+The `retainResultUntil: "current-task-settles"` option creates a durable hold
+from the current generation to the offered generation.
+
+The hold affects disposal only. The retained task becomes terminal immediately,
+emits its terminal event, and remains visible to waiters. Its record/result is
+kept until the holder settles or is removed, after which bounded maintenance
+releases the relationship.
+
+Several holders may retain the same result. Replaying the same relationship is
+idempotent, and collection limits prevent one task from creating unbounded
+Redis work.
+
+## A hold is not execution control
+
+A result-retention relationship does not:
+
+- wait for another task before settlement;
+- propagate success, failure, retry, cancellation, or removal;
+- prevent duplicate handler execution;
+- keep a worker process alive;
+- define a parent-child lifecycle.
+
+Those behaviors require an application-level orchestration model or a durable
+workflow. Treating retention as orchestration would make failure propagation
+and recovery implicit, which is precisely what EffectMQ avoids.
+
+The useful mental model is a library loan: creator provenance records who
+requested the item, while a retention hold delays disposal until the borrower
+is finished. Neither relationship controls how the item is produced.

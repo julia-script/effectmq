@@ -1,28 +1,26 @@
+import { expect, layer } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Schedule, Schema, Stream } from "effect";
 import { Packr } from "msgpackr";
-import { expect, layer } from "@effect/vitest";
 import { RedisPool, Task, TaskEngine, TaskQueue } from "./index.js";
 import { TestLayer } from "./testing/redisLayer.js";
 
 // A typed queue with a deterministic id (idempotencyKey) so we can address a
 // specific task's events by id.
 const makeQueue = (name: string, retention?: Partial<Task.RetentionPolicy>) => {
-  return Task.make({
+  const definition = Task.make({
     name,
     payload: { userId: Schema.String, amount: Schema.Number },
     success: Schema.String,
     error: Schema.Struct({ reason: Schema.String }),
     retention,
     idempotencyKey: (p) => p.userId,
-  }).pipe(Effect.map((definition) => TaskQueue.make(name, definition)));
+  });
+  return TaskQueue.make(name, definition);
 };
 
 // Read events from the very start of the queue's stream until an event with one
 // of `stopTags` is seen, returning everything collected up to and including it.
-const collectUntil = (
-  queue: Effect.Success<ReturnType<typeof makeQueue>>,
-  stopTag: string,
-) =>
+const collectUntil = (queue: ReturnType<typeof makeQueue>, stopTag: string) =>
   TaskQueue.stream(queue, { cursor: "0" }).pipe(
     Stream.takeUntil((e) => e._tag === stopTag),
     Stream.runCollect,
@@ -35,7 +33,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       "a duplicate offer returns the existing generation without an update event",
       () =>
         Effect.gen(function* () {
-          const queue = yield* makeQueue("ev-create-update");
+          const queue = makeQueue("ev-create-update");
 
           const collector = yield* collectUntil(queue, "task.moved").pipe(
             Effect.forkChild,
@@ -79,7 +77,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       "success emits task.completed, failure emits task.failed with willRetry",
       () =>
         Effect.gen(function* () {
-          const okQueue = yield* makeQueue("ev-completed");
+          const okQueue = makeQueue("ev-completed");
           const okCollector = yield* collectUntil(
             okQueue,
             "task.completed",
@@ -95,7 +93,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
             expect(completed.payload.success).toBe("done");
           }
 
-          const failQueue = yield* makeQueue("ev-failed");
+          const failQueue = makeQueue("ev-failed");
           const failCollector = yield* collectUntil(
             failQueue,
             "task.failed",
@@ -123,7 +121,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
 
     it.effect("wait resolves with the typed success value", () =>
       Effect.gen(function* () {
-        const queue = yield* makeQueue("ev-wait-ok");
+        const queue = makeQueue("ev-wait-ok");
         const task = yield* TaskQueue.offer(queue, { userId: "w1", amount: 5 });
 
         // Drive the task to completion in the background.
@@ -140,7 +138,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       "wait observes completion after its subscription has started",
       () =>
         Effect.gen(function* () {
-          const queue = yield* makeQueue("ev-wait-subscription-race");
+          const queue = makeQueue("ev-wait-subscription-race");
           const offered = yield* TaskQueue.offer(queue, {
             userId: "subscribed",
             amount: 5,
@@ -163,7 +161,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
 
     it.effect("wait fails with the typed error on terminal failure", () =>
       Effect.gen(function* () {
-        const queue = yield* makeQueue("ev-wait-fail");
+        const queue = makeQueue("ev-wait-fail");
         const task = yield* TaskQueue.offer(
           queue,
           { userId: "w2", amount: 5 },
@@ -188,7 +186,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       "wait resolves from durable state when a retained task already completed",
       () =>
         Effect.gen(function* () {
-          const queue = yield* makeQueue("ev-wait-already-complete");
+          const queue = makeQueue("ev-wait-already-complete");
           const offered = yield* TaskQueue.offer(
             queue,
             { userId: "done", amount: 1 },
@@ -204,7 +202,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       "wait reads a delete-policy result until its independent retention expires",
       () =>
         Effect.gen(function* () {
-          const queue = yield* makeQueue("ev-wait-expired", { resultMs: 100 });
+          const queue = makeQueue("ev-wait-expired", { resultMs: 100 });
           const engine = yield* TaskEngine.TaskEngine;
           yield* TaskEngine.setMockTime(10_000_000);
           const offered = yield* TaskQueue.offer(queue, {
@@ -238,7 +236,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
 
     it.effect("wait has a typed caller timeout", () =>
       Effect.gen(function* () {
-        const queue = yield* makeQueue("ev-wait-timeout");
+        const queue = makeQueue("ev-wait-timeout");
         const offered = yield* TaskQueue.offer(
           queue,
           { userId: "pending", amount: 1 },
@@ -255,7 +253,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       "stream reports the earliest cursor when retained events were trimmed",
       () =>
         Effect.gen(function* () {
-          const queue = yield* makeQueue("ev-cursor-expired");
+          const queue = makeQueue("ev-cursor-expired");
           const engine = yield* TaskEngine.TaskEngine;
           const redis = yield* RedisPool.RedisPool;
           yield* TaskQueue.offer(queue, { userId: "trimmed", amount: 1 });
@@ -283,7 +281,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
 
     it.effect("configured event retention trims the stream approximately", () =>
       Effect.gen(function* () {
-        const definition = yield* Task.make({
+        const definition = Task.make({
           name: "ev-configured-trim",
           payload: { userId: Schema.String, amount: Schema.Number },
           success: Schema.String,
@@ -319,7 +317,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       "a corrupt event value fails the stream with a typed storage error",
       () =>
         Effect.gen(function* () {
-          const queue = yield* makeQueue("ev-corrupt-value");
+          const queue = makeQueue("ev-corrupt-value");
           const engine = yield* TaskEngine.TaskEngine;
           const redis = yield* RedisPool.RedisPool;
           yield* TaskQueue.offer(queue, { userId: "corrupt", amount: 1 });
@@ -364,7 +362,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       "execute offers and resolves with the handler's success value",
       () =>
         Effect.gen(function* () {
-          const queue = yield* makeQueue("ev-execute");
+          const queue = makeQueue("ev-execute");
 
           // A worker that keeps pulling — including a fast handler that completes
           // near-instantly, which execute must not miss.

@@ -15,6 +15,7 @@ import * as Schedule from "effect/Schedule";
 import type * as Schema from "effect/Schema";
 import { RedisConnectionRoles } from "./RedisPool.js";
 import * as TaskEngine from "./TaskEngine.js";
+import * as TaskInvariant from "./TaskInvariant.js";
 import * as TaskQueue from "./TaskQueue.js";
 
 const TypeId = "~effectmq/Worker" as const;
@@ -76,20 +77,18 @@ export interface Worker<
  * import { Effect, Schema } from "effect"
  * import { Task, TaskQueue, Worker } from "@effectmq/core"
  *
- * const worker = Effect.gen(function* () {
- *   const email = yield* Task.make({
- *     name: "email",
- *     payload: { address: Schema.String },
- *     success: Schema.Void,
- *     error: Schema.String
- *   })
- *   const emails = TaskQueue.make("emails", email)
- *   return Worker.make(
- *     emails,
- *     ({ payload }) => Effect.log(`Emailing ${payload.address}`),
- *     { concurrency: 2 }
- *   )
+ * const email = Task.make({
+ *   name: "email",
+ *   payload: { address: Schema.String },
+ *   success: Schema.Void,
+ *   error: Schema.String
  * })
+ * const emails = TaskQueue.make("emails", email)
+ * const worker = Worker.make(
+ *   emails,
+ *   ({ payload }) => Effect.log(`Emailing ${payload.address}`),
+ *   { concurrency: 2 }
+ * )
  * ```
  *
  * @category Constructors
@@ -152,6 +151,7 @@ export const run = Effect.fnUntraced(function* <
   | Success["EncodingServices"]
   | Error["EncodingServices"]
 > {
+  yield* TaskInvariant.validate(worker.queue.task);
   return yield* Effect.scoped(
     Effect.gen(function* () {
       const roles = yield* RedisConnectionRoles;

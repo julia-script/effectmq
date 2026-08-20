@@ -1,20 +1,21 @@
+import { describe, expect, layer } from "@effect/vitest";
 import { Deferred, Effect, Schedule, Schema } from "effect";
 import * as PersistenceRedis from "effect/unstable/persistence/Redis";
-import { describe, expect, layer } from "@effect/vitest";
-import { RedisPool, Task, TaskEngine, TaskQueue } from "./index.js";
 import type { EngineTask } from "./EngineRecord.js";
+import { RedisPool, Task, TaskEngine, TaskQueue } from "./index.js";
 import { getLists, TestLayer } from "./testing/redisLayer.js";
 import { takeTask } from "./testing/TaskAttemptHarness.js";
 
 // A typed queue with a deterministic id so wait-list assertions are exact.
 const makeQueue = (name: string) => {
-  return Task.make({
+  const definition = Task.make({
     name,
     payload: { userId: Schema.String, amount: Schema.Number },
     success: Schema.String,
     error: Schema.Struct({ reason: Schema.String }),
     idempotencyKey: (p) => p.userId,
-  }).pipe(Effect.map((definition) => TaskQueue.make(name, definition)));
+  });
+  return TaskQueue.make(name, definition);
 };
 
 // A queue whose task defines a retry schedule; `maxRetries` caps the attempts.
@@ -22,7 +23,7 @@ const makeRetryQueue = (
   name: string,
   opts?: { maxRetries?: number | null },
 ) => {
-  return Task.make({
+  const definition = Task.make({
     name,
     payload: { userId: Schema.String },
     success: Schema.String,
@@ -30,25 +31,56 @@ const makeRetryQueue = (
     idempotencyKey: (p) => p.userId,
     retry: Schedule.spaced("10 seconds"),
     ...(opts?.maxRetries !== undefined ? { maxRetries: opts.maxRetries } : {}),
-  }).pipe(Effect.map((definition) => TaskQueue.make(name, definition)));
+  });
+  return TaskQueue.make(name, definition);
 };
 
 layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
   "TaskQueue integration (real Redis time)",
   (it) => {
     describe("TaskQueue", () => {
-      it.effect("task storage limits reject invalid configuration", () =>
+      it.effect("invalid task configuration is a defect at first use", () =>
         Effect.gen(function* () {
-          const error = yield* Task.make({
+          const definition = Task.make({
             name: "invalid-storage-limit",
             payload: { value: Schema.String },
             success: Schema.Void,
             error: Schema.Never,
             storageLimits: { maxErrorEntries: -1 },
-          }).pipe(Effect.flip);
-          expect(error).toMatchObject({
-            _tag: "TaskConfigurationError",
-            field: "maxErrorEntries",
+          });
+          const queue = TaskQueue.make(definition.name, definition);
+          const cause = yield* TaskQueue.offer(queue, {
+            value: "value",
+          }).pipe(Effect.sandbox, Effect.flip);
+          const defect = cause.reasons.find((reason) => reason._tag === "Die");
+          expect(defect).toMatchObject({
+            _tag: "Die",
+            defect: expect.objectContaining({
+              message: expect.stringContaining("maxErrorEntries"),
+            }),
+          });
+        }),
+      );
+
+      it.effect("invalid retry configuration is a defect before Redis", () =>
+        Effect.gen(function* () {
+          const definition = Task.make({
+            name: "invalid-retry-limit",
+            payload: { value: Schema.String },
+            success: Schema.Void,
+            error: Schema.Never,
+            maxRetries: -1,
+          });
+          const queue = TaskQueue.make(definition.name, definition);
+          const cause = yield* TaskQueue.offer(queue, {
+            value: "value",
+          }).pipe(Effect.sandbox, Effect.flip);
+          const defect = cause.reasons.find((reason) => reason._tag === "Die");
+          expect(defect).toMatchObject({
+            _tag: "Die",
+            defect: expect.objectContaining({
+              message: expect.stringContaining("maxRetries"),
+            }),
           });
         }),
       );
@@ -57,7 +89,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "a task's configured byte limit is enforced while offering",
         () =>
           Effect.gen(function* () {
-            const definition = yield* Task.make({
+            const definition = Task.make({
               name: "tq-payload-limit",
               payload: { value: Schema.String },
               success: Schema.Void,
@@ -79,7 +111,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
 
       it.effect("outcome byte limits fail before writing terminal state", () =>
         Effect.gen(function* () {
-          const successDefinition = yield* Task.make({
+          const successDefinition = Task.make({
             name: "tq-success-limit",
             payload: {},
             success: Schema.String,
@@ -106,7 +138,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
               ?.outcome,
           ).toBeUndefined();
 
-          const failureDefinition = yield* Task.make({
+          const failureDefinition = Task.make({
             name: "tq-failure-limit",
             payload: {},
             success: Schema.Never,
@@ -138,7 +170,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "connection loss during offer reports an indeterminate write",
         () =>
           Effect.gen(function* () {
-            const queue = yield* makeQueue("tq-indeterminate");
+            const queue = makeQueue("tq-indeterminate");
             const send: RedisPool.RedisSend = () =>
               Effect.fail(
                 new PersistenceRedis.RedisError({
@@ -174,7 +206,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         () =>
           Effect.gen(function* () {
             const base = yield* TaskEngine.TaskEngine;
-            const queue = yield* makeQueue("tq-semantic-recovery");
+            const queue = makeQueue("tq-semantic-recovery");
             const failure = (
               reason: TaskEngine.TaskEngineErrorReason,
             ): TaskEngine.TaskEngineService =>
@@ -230,7 +262,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "offer places a task with the deterministic id on the wait list",
         () =>
           Effect.gen(function* () {
-            const queue = yield* makeQueue("tq-offer");
+            const queue = makeQueue("tq-offer");
             const offered = yield* TaskQueue.offer(queue, {
               userId: "u1",
               amount: 10,
@@ -254,7 +286,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "v1 envelopes preserve opaque payloads, successes, and failures",
         () =>
           Effect.gen(function* () {
-            const definition = yield* Task.make({
+            const definition = Task.make({
               name: "tq-storage-v1",
               schemaId: "example/storage-v1",
               payload: { id: Schema.String, value: Schema.Unknown },
@@ -302,7 +334,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "complete runs the handler, delivers the typed payload, and reports success",
         () =>
           Effect.gen(function* () {
-            const queue = yield* makeQueue("tq-complete-ok");
+            const queue = makeQueue("tq-complete-ok");
             yield* TaskQueue.offer(queue, { userId: "u2", amount: 42 });
 
             let seenPayload: { userId: string; amount: number } | undefined;
@@ -326,7 +358,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         () =>
           Effect.gen(function* () {
             const engine = yield* TaskEngine.TaskEngine;
-            const queue = yield* makeQueue("tq-heartbeat-lease-lost");
+            const queue = makeQueue("tq-heartbeat-lease-lost");
             yield* TaskQueue.offer(queue, { userId: "owned", amount: 1 });
 
             const handlerStarted = yield* Deferred.make<void>();
@@ -376,7 +408,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         () =>
           Effect.gen(function* () {
             const engine = yield* TaskEngine.TaskEngine;
-            const queue = yield* makeQueue("tq-heartbeat-retry");
+            const queue = makeQueue("tq-heartbeat-retry");
             yield* TaskQueue.offer(queue, { userId: "retry", amount: 1 });
             let renewals = 0;
             const heartbeatRecovered = yield* Deferred.make<void>();
@@ -430,7 +462,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       it.effect("a duplicate offer does not mutate a leased generation", () =>
         Effect.gen(function* () {
           const engine = yield* TaskEngine.TaskEngine;
-          const queue = yield* makeQueue("tq-duplicate-leased");
+          const queue = makeQueue("tq-duplicate-leased");
           const created = yield* TaskQueue.offer(queue, {
             userId: "leased",
             amount: 1,
@@ -456,7 +488,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "duplicate offers preserve delayed and retry-scheduled generations",
         () =>
           Effect.gen(function* () {
-            const delayedQueue = yield* makeQueue("tq-duplicate-delayed");
+            const delayedQueue = makeQueue("tq-duplicate-delayed");
             yield* TaskQueue.offer(
               delayedQueue,
               { userId: "delayed", amount: 1 },
@@ -476,7 +508,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
               wait: [],
             });
 
-            const retryQueue = yield* makeRetryQueue("tq-duplicate-retry");
+            const retryQueue = makeRetryQueue("tq-duplicate-retry");
             yield* TaskQueue.offer(retryQueue, { userId: "retry" });
             yield* TaskQueue.complete(retryQueue, () =>
               Effect.fail({ reason: "first" }),
@@ -499,7 +531,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "an explicit new generation starts clean after terminal settlement",
         () =>
           Effect.gen(function* () {
-            const queue = yield* makeQueue("tq-new-generation");
+            const queue = makeQueue("tq-new-generation");
             const created = yield* TaskQueue.offer(
               queue,
               { userId: "repeat", amount: 1 },
@@ -546,7 +578,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "complete routes a handler failure to the engine and reports false",
         () =>
           Effect.gen(function* () {
-            const queue = yield* makeQueue("tq-complete-fail");
+            const queue = makeQueue("tq-complete-fail");
             yield* TaskQueue.offer(
               queue,
               { userId: "u3", amount: 7 },
@@ -569,7 +601,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "a failing task with a retry schedule lands on the scheduled list",
         () =>
           Effect.gen(function* () {
-            const queue = yield* makeRetryQueue("tq-retry-schedule");
+            const queue = makeRetryQueue("tq-retry-schedule");
             yield* TaskQueue.offer(queue, { userId: "s1" });
 
             yield* TaskQueue.complete(queue, () =>
@@ -586,7 +618,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       it.effect("maxRetries cap of 0 skips retries even with a schedule", () =>
         Effect.gen(function* () {
           // cap at 0 → the first failure can't retry (0 errors is not < 0)
-          const queue = yield* makeRetryQueue("tq-retry-cap", {
+          const queue = makeRetryQueue("tq-retry-cap", {
             maxRetries: 0,
           });
           yield* TaskQueue.offer(
@@ -608,7 +640,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       it.effect("per-offer maxRetries overrides the definition cap", () =>
         Effect.gen(function* () {
           // definition would allow 5 retries, but the offer caps at 0 → no retry
-          const queue = yield* makeRetryQueue("tq-retry-override", {
+          const queue = makeRetryQueue("tq-retry-override", {
             maxRetries: 5,
           });
           yield* TaskQueue.offer(
@@ -634,8 +666,8 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         () =>
           Effect.gen(function* () {
             const engine = yield* TaskEngine.TaskEngine;
-            const parent = yield* makeQueue("tq-ctx-parent");
-            const child = yield* makeQueue("tq-ctx-child");
+            const parent = makeQueue("tq-ctx-parent");
+            const child = makeQueue("tq-ctx-child");
             yield* TaskQueue.offer(parent, { userId: "p1", amount: 1 });
 
             let during:
@@ -672,8 +704,8 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         () =>
           Effect.gen(function* () {
             const engine = yield* TaskEngine.TaskEngine;
-            const creator = yield* makeQueue("tq-ctx-failure-creator");
-            const spawned = yield* makeQueue("tq-ctx-failure-spawned");
+            const creator = makeQueue("tq-ctx-failure-creator");
+            const spawned = makeQueue("tq-ctx-failure-spawned");
             yield* TaskQueue.offer(creator, { userId: "creator", amount: 1 });
 
             yield* TaskQueue.complete(creator, () =>
@@ -699,8 +731,8 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
           Effect.gen(function* () {
             const engine = yield* TaskEngine.TaskEngine;
             const redis = yield* RedisPool.RedisPool;
-            const parent = yield* makeQueue("tq-ctx-det-parent");
-            const child = yield* makeQueue("tq-ctx-det-child");
+            const parent = makeQueue("tq-ctx-det-parent");
+            const child = makeQueue("tq-ctx-det-child");
             yield* TaskQueue.offer(parent, { userId: "p1", amount: 1 });
 
             let during:
@@ -744,7 +776,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
       it.effect("offering outside a handler records no holder or creator", () =>
         Effect.gen(function* () {
           const engine = yield* TaskEngine.TaskEngine;
-          const queue = yield* makeQueue("tq-ctx-none");
+          const queue = makeQueue("tq-ctx-none");
           yield* TaskQueue.offer(queue, { userId: "u1", amount: 1 });
 
           const task = yield* engine.getTask(queue.name, "u1");
@@ -756,7 +788,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "explicit current-task retention is rejected outside a handler",
         () =>
           Effect.gen(function* () {
-            const queue = yield* makeQueue("tq-ctx-retention-required");
+            const queue = makeQueue("tq-ctx-retention-required");
             const error = yield* TaskQueue.offer(
               queue,
               { userId: "u1", amount: 1 },
@@ -771,7 +803,7 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
         "retention relationships stop at the holder's configured cap",
         () =>
           Effect.gen(function* () {
-            const parentDefinition = yield* Task.make({
+            const parentDefinition = Task.make({
               name: "tq-ctx-limit-parent",
               payload: { userId: Schema.String, amount: Schema.Number },
               success: Schema.String,
@@ -783,8 +815,8 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
               parentDefinition.name,
               parentDefinition,
             );
-            const first = yield* makeQueue("tq-ctx-limit-first");
-            const second = yield* makeQueue("tq-ctx-limit-second");
+            const first = makeQueue("tq-ctx-limit-first");
+            const second = makeQueue("tq-ctx-limit-second");
             yield* TaskQueue.offer(parent, { userId: "parent", amount: 1 });
 
             let limitError: unknown;

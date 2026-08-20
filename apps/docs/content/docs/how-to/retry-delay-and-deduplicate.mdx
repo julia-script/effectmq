@@ -1,0 +1,86 @@
+---
+title: Retry, delay, and deduplicate work
+description: Configure retry timing, delayed eligibility, and stable task identities.
+---
+
+This guide shows you how to control when work becomes eligible, which handler
+failures retry, and what happens when the same logical task is offered twice.
+
+## Give the task a stable identity
+
+Derive the idempotency key from the application identity of the work:
+
+```ts docs-check=retry
+import { Task, TaskQueue } from "@effectmq/core"
+import { Effect, Schedule, Schema } from "effect"
+
+const SendInvoice = Task.make({
+  name: "send-invoice",
+  schemaId: "send-invoice/v1",
+  payload: { invoiceId: Schema.String, email: Schema.String },
+  success: Schema.String,
+  error: Schema.Struct({ retryable: Schema.Boolean, reason: Schema.String }),
+  idempotencyKey: ({ invoiceId }) => invoiceId,
+  maxRetries: 4,
+  retry: {
+    while: (error) => error.retryable,
+    schedule: Schedule.exponential("1 second")
+  }
+})
+
+const invoiceQueue = TaskQueue.make("invoices", SendInvoice)
+
+const payload = { invoiceId: "inv-42", email: "ada@example.com" }
+```
+
+The retry schedule receives each typed handler failure. `maxRetries` is a
+separate upper bound; here no generation receives more than four handler
+retries even if the schedule continues.
+
+## Delay the first attempt
+
+Pass a millisecond delay when offering the task:
+
+```ts docs-check=retry
+const delayedOffer = TaskQueue.offer(
+  invoiceQueue,
+  payload,
+  { delay: 30_000 }
+)
+```
+
+The task is durable immediately but is not eligible for acquisition until the
+delay elapses. A running worker's maintenance loop promotes due work.
+
+## Handle duplicate offers
+
+The default `onDuplicate: "return-existing"` leaves the stored generation
+unchanged:
+
+```ts docs-check=retry
+const inspectDuplicate = Effect.gen(function* () {
+  const first = yield* TaskQueue.offer(invoiceQueue, payload)
+  const replay = yield* TaskQueue.offer(invoiceQueue, payload)
+
+  if (replay._tag === "TaskExisting") {
+    console.log(replay.handle.generation === first.handle.generation)
+  }
+})
+```
+
+Use `onDuplicate: "new-generation"` only when the existing generation has
+settled and the same logical identity must run again:
+
+```ts docs-check=retry
+const nextGeneration = TaskQueue.offer(invoiceQueue, payload, {
+  onDuplicate: "new-generation"
+})
+```
+
+Do not select a new generation while recovering an `IndeterminateWriteError`.
+Retry the same payload and identity with the default duplicate policy so the
+retry either creates the missing generation or returns the committed one.
+
+You are done when replays return `TaskExisting`, deliberate reruns return a
+higher generation, and retry timing matches the configured schedule. See
+[task identity](/docs/explanation/task-identity) for the generation model.

@@ -25,12 +25,21 @@ Decoding a stored task SHALL expose the decoding services required by the payloa
 - **WHEN** a task payload schema depends on a decoding service
 - **THEN** the stored-task decoder cannot be executed until that service is provided
 
-### Requirement: Predictably invalid construction is typed
-Public construction of tasks, schedulers, and engine configuration SHALL validate caller-supplied values in an Effect and fail with a semantic configuration error. It SHALL NOT throw synchronously or terminate with a defect for a predictably invalid value.
+### Requirement: Definition constructors are pure
+Public construction of task, queue, worker, and scheduler definitions SHALL synchronously return reusable descriptions. Definition constructors SHALL NOT return an Effect, require runtime services, throw for invalid definition configuration, or perform runtime invariant validation.
 
-#### Scenario: Invalid task retry configuration
-- **WHEN** a caller constructs a task with an invalid retry or timeout value
-- **THEN** construction fails with a task-configuration error identifying the invalid field and constraint
+#### Scenario: Definitions live at module scope
+- **WHEN** a caller constructs a task, binds it to a queue, and creates a worker or scheduler
+- **THEN** every definition is available without entering an Effect or providing a runtime
+
+#### Scenario: Invalid task configuration is first consumed
+- **WHEN** a pure task definition contains an invalid retry, storage, or retention value
+- **THEN** construction still returns the definition without throwing
+- **AND** the first queue or worker operation that consumes the invalid value terminates with a defect before external work begins
+- **AND** the programmer invariant does not appear in the operation's typed error channel
+
+### Requirement: Runtime infrastructure configuration is typed
+Public construction of runtime infrastructure, including engine layers, SHALL validate caller-supplied operational configuration in an Effect and fail with a semantic configuration error. It SHALL NOT throw synchronously or terminate with a defect for predictably invalid external or runtime configuration.
 
 #### Scenario: Invalid engine limit
 - **WHEN** an engine layer is built with an invalid size or batch limit

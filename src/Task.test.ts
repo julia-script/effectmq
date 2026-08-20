@@ -11,22 +11,14 @@ const config = {
   error: Schema.String,
 };
 
-it.effect("invalid task configuration fails in the typed channel", () =>
-  Effect.gen(function* () {
-    const error = yield* Task.make({ ...config, maxRetries: -1 }).pipe(
-      Effect.flip,
-    );
-    expect(error).toMatchObject({
-      _tag: "TaskConfigurationError",
-      field: "maxRetries",
-      actual: -1,
-    });
-  }),
-);
+it("definition construction is pure and postpones invariant checks", () => {
+  const task = Task.make({ ...config, maxRetries: -1 });
+  expect(task.maxRetries).toBe(-1);
+});
 
 it.effect("default identities come from the provided Crypto service", () =>
   Effect.gen(function* () {
-    const task = yield* Task.make(config);
+    const task = Task.make(config);
     const deterministicCrypto = Crypto.make({
       randomBytes: (size) => new Uint8Array(size),
       digest: (_algorithm, bytes) => Effect.succeed(bytes),
@@ -44,7 +36,7 @@ it.effect("default identities come from the provided Crypto service", () =>
 
 it.effect("custom identity callback exceptions remain typed", () =>
   Effect.gen(function* () {
-    const task = yield* Task.make({
+    const task = Task.make({
       ...config,
       idempotencyKey: () => {
         throw new Error("identity failed");

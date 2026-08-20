@@ -1,3 +1,6 @@
+packages:
+  - apps/*
+
 allowBuilds:
   cpu-features: true
   esbuild: true

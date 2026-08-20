@@ -2,7 +2,10 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { dirname, resolve } from "node:path";
 
-const documentationFiles = readdirSync("docs", { recursive: true })
+const documentationFiles = readdirSync("docs", {
+  recursive: true,
+  encoding: "utf8",
+})
   .filter((file) => file.endsWith(".md"))
   .map((file) => join("docs", file))
   .sort();

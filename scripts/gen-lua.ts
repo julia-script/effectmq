@@ -3,10 +3,15 @@
  * default-exports the Lua source as a string, so scripts can be imported
  * like any other module. Run via `pnpm gen:lua`.
  */
-import { globSync, readFileSync, writeFileSync } from "node:fs";
-import { basename } from "node:path";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 
-for (const file of globSync("src/**/*.lua")) {
+const luaFiles = readdirSync("src", { recursive: true })
+  .filter((file) => file.endsWith(".lua"))
+  .map((file) => join("src", file))
+  .sort();
+
+for (const file of luaFiles) {
   const source = readFileSync(file, "utf8");
   const out = file.replace(/\.lua$/, ".ts");
   writeFileSync(

@@ -11,11 +11,13 @@ import {
 const durationMs = Number(process.env.EFFECTMQ_SOAK_DURATION_MS ?? 300_000);
 const concurrency = Number(process.env.EFFECTMQ_SOAK_CONCURRENCY ?? 16);
 const payloadBytes = Number(process.env.EFFECTMQ_SOAK_PAYLOAD_BYTES ?? 4_096);
+const warmupTasks = Number(process.env.EFFECTMQ_SOAK_WARMUP_TASKS ?? 1_000);
 const redisUrl = process.env.EFFECTMQ_REDIS_URL ?? "redis://127.0.0.1:6379";
 for (const [name, value] of Object.entries({
   durationMs,
   concurrency,
   payloadBytes,
+  warmupTasks,
 })) {
   if (!Number.isSafeInteger(value) || value < 1)
     throw new Error(`Invalid ${name}`);
@@ -88,12 +90,35 @@ const run = Effect.scoped(
       },
     );
 
-    const memoryBefore = yield* redis.send<string>("INFO", "memory");
-    const processMemoryBefore = memorySnapshot();
     const pingSamples: number[] = [];
     const offerSamples: number[] = [];
     const workerFiber = yield* Worker.run(worker).pipe(Effect.forkChild);
     const body = "x".repeat(payloadBytes);
+
+    // Establish connection pools, worker fibers, codecs, script caches, and
+    // Effect runtime hot paths before measuring steady-state memory. Without
+    // this boundary a short CI smoke run mostly measures process startup,
+    // while the five-minute release soak measures the actual queue plateau.
+    for (let index = 0; index < warmupTasks; index++) {
+      yield* TaskQueue.offer(queue, { id: `warmup-${index}`, body });
+    }
+    const warmupDeadline = Date.now() + 30_000;
+    while (
+      (yield* Ref.get(completed)) < warmupTasks &&
+      Date.now() < warmupDeadline
+    ) {
+      yield* Effect.sleep("10 millis");
+    }
+    const warmed = yield* Ref.get(completed);
+    if (warmed !== warmupTasks) {
+      return yield* Effect.die(
+        `worker warm-up timed out: offered ${warmupTasks}, completed ${warmed}`,
+      );
+    }
+    yield* Ref.set(completed, 0);
+    const memoryBefore = yield* redis.send<string>("INFO", "memory");
+    const processMemoryBefore = memorySnapshot();
+
     const startedAt = Date.now();
     let offered = 0;
     while (Date.now() - startedAt < durationMs) {
@@ -176,7 +201,13 @@ const run = Effect.scoped(
     return {
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
-      parameters: { durationMs, concurrency, payloadBytes, maxBatch: batch },
+      parameters: {
+        durationMs,
+        concurrency,
+        payloadBytes,
+        warmupTasks,
+        maxBatch: batch,
+      },
       workload: {
         offered,
         completed: completedCount,

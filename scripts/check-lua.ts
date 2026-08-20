@@ -1,8 +1,13 @@
-import { globSync, readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
+import { basename, join } from "node:path";
 
 const stale: string[] = [];
-for (const file of globSync("src/**/*.lua")) {
+const luaFiles = readdirSync("src", { recursive: true })
+  .filter((file) => file.endsWith(".lua"))
+  .map((file) => join("src", file))
+  .sort();
+
+for (const file of luaFiles) {
   const source = readFileSync(file, "utf8");
   const generated = file.replace(/\.lua$/, ".ts");
   const expected = `// generated from ${basename(file)} — do not edit\nexport default ${JSON.stringify(source)};\n`;

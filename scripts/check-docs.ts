@@ -1,7 +1,12 @@
-import { existsSync, globSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { dirname, resolve } from "node:path";
 
-const files = ["README.md", ...globSync("docs/**/*.md")].filter(
+const documentationFiles = readdirSync("docs", { recursive: true })
+  .filter((file) => file.endsWith(".md"))
+  .map((file) => join("docs", file))
+  .sort();
+const files = ["README.md", ...documentationFiles].filter(
   (file) => !file.startsWith("docs/research/"),
 );
 const errors: string[] = [];

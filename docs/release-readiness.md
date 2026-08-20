@@ -32,7 +32,7 @@ research, or editor file was present.
 | Generated model sequences | 32 deterministic lifecycles passed |
 | Package consumer | 64 intended entries; JS load and TS check passed |
 | Performance | [Published matrix](./performance.md) |
-| Soak | [239,757 accepted/completed over five minutes, zero command errors](./soak.md) |
+| Soak | [233,106 accepted/completed over five minutes, zero command errors](./soak.md) |
 | Rollback | Pre-upgrade snapshot restored; 9 candidate keys removed; 0 remained |
 
 Rollback was rehearsed against an isolated Redis namespace with

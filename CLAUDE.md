@@ -14,15 +14,14 @@ pnpm build                        # tsc -> dist/ (tests and src/testing are excl
 pnpm typecheck                    # strict production + complete test typecheck
 pnpm typecheck:src                # production sources only
 pnpm typecheck:test               # all tests and src/testing support
-pnpm exec biome check src/        # lint (what CI runs)
+pnpm lint                         # Biome lint across the repository
+pnpm check                        # formatting, lint, types, architecture, Lua, docs, release
 pnpm lint:fix                     # biome check --write --unsafe
 pnpm test                         # vitest run (integration tests, needs Docker — see below)
 pnpm test:watch                   # vitest watch mode
 pnpm vitest run src/TaskQueue.test.ts        # single test file
 pnpm vitest run -t "test name substring"     # single test by name
 ```
-
-Note: the `pnpm lint` script runs `turbo run lint`, but turbo is not a dependency — it's stale. Use `pnpm exec biome check src/` (matches CI).
 
 ### Tests need Docker
 
@@ -41,7 +40,7 @@ Flat `src/` with a strict layering, top to bottom:
 - **`TaskQueue.ts`** — the high-level API users live in: `make` (bind a queue name to a task definition), `offer` (enqueue), `complete` (take → run handler → report outcome, applying the task's retry schedule on failure), `stream` (typed lifecycle events), `wait` / `execute` (await a task's terminal result). Decodes engine tasks/events against the task's schemas.
 - **`Scheduler.ts`** — cron-driven durable task materialization. Competing processes idempotently offer the same tick task; managed workers execute it with at-least-once delivery.
 - **`Task.ts`** — `Task.make`: the schema-bearing task definition (payload/success/error schemas, `idempotencyKey` — which *is* the task id, so same key = same task — `retry` as an Effect `Schedule`, `maxRetries` default 5, `null` = unbounded).
-- **`TaskEngine.ts`** (the big one, ~1000 lines) — the low-level `Context.Service` implementing queue primitives as **atomic Lua scripts** (inline `/*lua*/` strings, built by `buildScripts`): create/take/writeSuccess/writeError, lock extend/remove, delayed + cron schedule state. Tasks move between Redis lists: `wait`, `scheduled`, `active`, `failed`, `success`. Every state change publishes to a per-queue Redis Stream (`<prefix>:<name>:events`, via `XADD`); `stream` polls it with `XREAD` (default 1s). Consumers rarely call the engine directly — go through `TaskQueue`/`Scheduler`.
+- **`TaskEngine.ts`** (the big one, ~1000 lines) — the low-level `Context.Service` implementing queue primitives through the atomic script generated from `src/lua/taskEngine.lua`: create/take/writeSuccess/writeError, lock extend/remove, delayed + cron schedule state. Tasks move between Redis indexes named `wait`, `scheduled`, `active`, `failed`, and `success`. Every state change publishes to a per-queue Redis Stream (`<prefix>:<name>:events`, via `XADD`); `stream` uses a blocking `XREAD` with a default two-second poll interval. Consumers rarely call the engine directly — go through `TaskQueue`/`Scheduler`.
 - **`RedisPool.ts`** — the minimal service the engine depends on: just `send` + `eval`. Any Redis client can implement it.
 - **`NodeRedisPool.ts`** — the bundled `RedisPool` implementation using node-redis `createClientPool` (lazy connect, closed on layer scope end). Tests provide `RedisPool` via ioredis + testcontainers instead (`src/testing/redisLayer.ts`) — proof the service boundary works.
 - **`TaskRecord.ts`** — public typed task record schemas and storage codecs.
@@ -50,7 +49,10 @@ Flat `src/` with a strict layering, top to bottom:
 
 Wiring: `TaskEngine.layer()` is the complete zero-requirement Node live graph and intentionally retains Redis operational services. `TaskEngine.layerNoDeps()` is the custom-client layer that requires `RedisPool`.
 
-The library deliberately has **no built-in concurrency/rate limiting** — one `complete` processes one task, and callers compose concurrency from Effect primitives (fibers, semaphores, schedules). Don't add worker-pool machinery.
+`Worker` provides built-in bounded local concurrency, lease supervision,
+maintenance, and graceful draining. It does not provide distributed/global
+concurrency or rate limiting; compose those policies explicitly at the
+application boundary.
 
 ## Conventions
 

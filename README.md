@@ -85,8 +85,8 @@ A task is a *schema*, not a function. You declare what goes in (`payload`), what
 A tagged error makes failures pattern-matchable downstream, so reach for `Schema.TaggedError` rather than a bare struct.
 
 ```ts docs-check=email
-import { Effect, Schedule, Schema, Semaphore, Stream } from "effect";
-import { Task, TaskQueue, type TaskHandler } from "@effectmq/core";
+import { Effect, Schedule, Schema, Stream } from "effect";
+import { Task, TaskQueue, type TaskHandler, Worker } from "@effectmq/core";
 
 class EmailRejected extends Schema.TaggedError<EmailRejected>()(
   "EmailRejected",
@@ -158,7 +158,7 @@ const repeatedWorkerProgram = Effect.gen(function* () {
 
 ## Streaming & events
 
-The engine publishes a lifecycle event to a per-queue Redis Stream every time a task changes state. `TaskQueue.stream` hands you those events as an Effect `Stream`, decoded against your queue's schemas: `task.created` and `task.updated` carry fully-typed tasks, `task.failed` carries your typed error, `task.completed` carries your typed success value, and `task.moved` reports the list transition.
+The engine publishes a lifecycle event to a per-queue Redis Stream every time a task changes state. `TaskQueue.stream` hands you those events as an Effect `Stream`, decoded against your queue's schemas: `task.created` and `task.updated` carry fully-typed tasks, `task.failed` carries your typed error or a built-in stalled/canceled error, `task.completed` carries your typed success value, and `task.moved` reports the list transition.
 
 ```ts docs-check=email
 const watch = TaskQueue.stream(emails).pipe(
@@ -185,33 +185,26 @@ const offerAndWait = Effect.gen(function* () {
 });
 ```
 
-`wait` reads durable state, subscribes from the handle's authoritative Redis cursor, and rechecks state after subscription, so completion before or during subscription is observed. Streams poll Redis (default every second); persist a retained cursor when building a resumable event consumer.
+`wait` reads durable state, subscribes from the handle's authoritative Redis cursor, and rechecks state after subscription, so completion before or during subscription is observed. Streams use a blocking Redis read (default two-second block); persist a retained cursor when building a resumable event consumer.
 
 ---
 
 ## On concurrency
 
-Differently than other queue libraries, `effectmq` doesn't have builtin concurrency, rate limiting, backpressure. It doesn't need to, it works perfectly with the Effect primitives you are used to.
-
-Effect gives you the fine control you need from your workers,  so `complete` does exactly one task, and *you* decide how many run at once, with the same tools you use everywhere else:
+`complete` processes exactly one task. For a long-running process, `Worker`
+provides bounded local concurrency, lease supervision, maintenance, and graceful
+draining:
 
 ```ts docs-check=email
-// Concurrency example with semaphore
-const worker = Effect.gen(function* () {
-  // At most 5 tasks in flight at any moment.
-  const semaphore = yield* Semaphore.make(5);
-
-  yield* Semaphore.withPermit(
-    semaphore,
-    TaskQueue.complete(emails, handleSendEmail),
-  ).pipe(
-    Effect.forkScoped,            // each worker is its own fiber
-    Effect.repeat(Schedule.forever), // ...that keeps pulling work
-  );
-});
+const worker = Worker.make(emails, handleSendEmail, { concurrency: 5 });
+const program = Worker.run(worker);
 ```
 
-Want a rate limit instead of a raw permit count? Compose one from a `Semaphore` and a `Schedule`. Want retries with jitter? `Schedule`. Want to fan out? Run more worker processes. None of it is our invention, all of it composes. The queue's job is to preserve eligible work and fence the current attempt; handlers remain at-least-once and must make external side effects idempotent.
+The built-in worker does not impose distributed/global concurrency or rate
+limits. Compose those policies from Effect primitives or external coordination,
+and run more worker processes to fan out. The queue preserves eligible work and
+fences the current attempt; handlers remain at-least-once and must make external
+side effects idempotent.
 
 ---
 

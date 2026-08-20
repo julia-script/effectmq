@@ -10,7 +10,8 @@
     "includes": [
       "**",
       "!node_modules",
-      "!.next",
+      "!**/.next",
+      "!**/.vercel",
       "!dist",
       "!build",
       "!src/scratchpad",

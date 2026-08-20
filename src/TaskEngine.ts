@@ -8,6 +8,8 @@
  *
  * @module
  */
+
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
@@ -18,7 +20,6 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   type EngineTask,
   type EngineTaskInsert,
@@ -89,6 +90,12 @@ const validateConfig = (
  * @since 0.1.0
  */
 export type TaskEngineErrorReason =
+  | {
+      readonly _tag: "InvalidInput";
+      readonly operation: string;
+      readonly field: string;
+      readonly constraint: string;
+    }
   | { readonly _tag: "TransportFailure"; readonly operation: string }
   | { readonly _tag: "ScriptFailure"; readonly operation: string }
   | {
@@ -209,6 +216,11 @@ export class CursorExpired extends Data.TaggedError("CursorExpired")<{
   readonly earliest: string;
 }> {}
 
+/** Indicates that a stream cursor is neither `$`, `0`, nor a Redis stream id. */
+export class InvalidCursor extends Data.TaggedError("InvalidCursor")<{
+  readonly cursor: string;
+}> {}
+
 const diagnosticText = (cause: unknown, depth = 0): string => {
   if (depth >= 6) return String(cause);
   if (typeof cause !== "object" || cause === null) return String(cause);
@@ -253,12 +265,51 @@ const classifyRedisFailure = (
 const isLeaseLost = (error: TaskEngineError) =>
   error.reason._tag === "LeaseLost";
 
-const compareStreamIds = (left: string, right: string): number => {
-  const [leftTime = "0", leftSequence = "0"] = left.split("-");
-  const [rightTime = "0", rightSequence = "0"] = right.split("-");
-  const timeDifference = BigInt(leftTime) - BigInt(rightTime);
+const validatePositiveSafeInteger = (
+  operation: string,
+  field: string,
+  value: number,
+) =>
+  Number.isSafeInteger(value) && value > 0
+    ? Effect.void
+    : Effect.fail(
+        new TaskEngineError({
+          reason: {
+            _tag: "InvalidInput",
+            operation,
+            field,
+            constraint: "a positive safe integer",
+          },
+          cause: value,
+        }),
+      );
+
+type ParsedStreamId = readonly [time: bigint, sequence: bigint];
+
+const parseStreamId = (value: string): ParsedStreamId | undefined => {
+  const match = /^(\d+)(?:-(\d+))?$/.exec(value);
+  if (
+    match === null ||
+    match[1].length > 20 ||
+    (match[2] !== undefined && match[2].length > 20)
+  ) {
+    return undefined;
+  }
+  const time = BigInt(match[1]);
+  const sequence = BigInt(match[2] ?? "0");
+  const maxComponent = (1n << 64n) - 1n;
+  return time <= maxComponent && sequence <= maxComponent
+    ? [time, sequence]
+    : undefined;
+};
+
+const compareStreamIds = (
+  [leftTime, leftSequence]: ParsedStreamId,
+  [rightTime, rightSequence]: ParsedStreamId,
+): number => {
+  const timeDifference = leftTime - rightTime;
   if (timeDifference !== 0n) return timeDifference < 0n ? -1 : 1;
-  const sequenceDifference = BigInt(leftSequence) - BigInt(rightSequence);
+  const sequenceDifference = leftSequence - rightSequence;
   return sequenceDifference === 0n ? 0 : sequenceDifference < 0n ? -1 : 1;
 };
 
@@ -391,7 +442,7 @@ export class TaskEngine extends Context.Service<
       },
     ) => Stream.Stream<
       Event,
-      TaskEngineError | CursorExpired | Schema.SchemaError
+      TaskEngineError | CursorExpired | InvalidCursor | Schema.SchemaError
     >;
   }
 >()("@effectmq/core/TaskEngine") {}
@@ -668,6 +719,56 @@ export const makeWithRedis = (
       );
 
     const offerTask = Effect.fnUntraced(function* (task: EngineTaskInsert) {
+      const numericFields: ReadonlyArray<
+        readonly [keyof EngineTaskInsert, number, boolean]
+      > = [
+        ["delay", task.delay, false],
+        ["maxRetries", task.maxRetries, true],
+        ["maxStalledCount", task.maxStalledCount ?? 1, true],
+        ["maxErrorEntries", task.maxErrorEntries ?? 100, true],
+        ["maxRelationships", task.maxRelationships ?? 1_000, true],
+        ["maxEventEntries", task.maxEventEntries ?? 10_000, true],
+        [
+          "taskRecordRetentionMs",
+          task.taskRecordRetentionMs ?? 604_800_000,
+          true,
+        ],
+        ["resultRetentionMs", task.resultRetentionMs ?? 86_400_000, true],
+        [
+          "terminalIndexRetentionMs",
+          task.terminalIndexRetentionMs ?? 604_800_000,
+          true,
+        ],
+        [
+          "deadLetterRetentionMs",
+          task.deadLetterRetentionMs ?? 2_592_000_000,
+          true,
+        ],
+        ["eventRetentionMs", task.eventRetentionMs ?? 604_800_000, true],
+      ];
+      for (const [field, value, integer] of numericFields) {
+        const minimum =
+          field === "maxRetries" ? -1 : field === "maxEventEntries" ? 1 : 0;
+        if (
+          !Number.isFinite(value) ||
+          Math.abs(value) > Number.MAX_SAFE_INTEGER ||
+          value < minimum ||
+          (integer && !Number.isSafeInteger(value))
+        ) {
+          return yield* new TaskEngineError({
+            reason: {
+              _tag: "InvalidInput",
+              operation: "effectmq_createTask",
+              field,
+              constraint:
+                field === "delay"
+                  ? "a finite safe number greater than or equal to 0"
+                  : `a safe integer greater than or equal to ${minimum}`,
+            },
+            cause: value,
+          });
+        }
+      }
       const retentionHolder = task.retentionHolder
         ? yield* pack({
             ...task.retentionHolder,
@@ -776,13 +877,41 @@ export const makeWithRedis = (
         error: unknown,
         retryAt?: Duration.Input,
       ) {
+        const retryAtMillis = yield* Effect.try({
+          try: () => (retryAt === undefined ? -1 : Duration.toMillis(retryAt)),
+          catch: (cause) =>
+            new TaskEngineError({
+              reason: {
+                _tag: "InvalidInput",
+                operation: "effectmq_writeError",
+                field: "retryAt",
+                constraint: "a valid finite safe timestamp",
+              },
+              cause,
+            }),
+        });
+        if (
+          !Number.isFinite(retryAtMillis) ||
+          Math.abs(retryAtMillis) > Number.MAX_SAFE_INTEGER ||
+          retryAtMillis < -1
+        ) {
+          return yield* new TaskEngineError({
+            reason: {
+              _tag: "InvalidInput",
+              operation: "effectmq_writeError",
+              field: "retryAt",
+              constraint: "a finite safe timestamp or the terminal sentinel",
+            },
+            cause: retryAtMillis,
+          });
+        }
         yield* withLeaseFence(
           writeErrorFn(
             withPrefix(prefix),
             leaseToken,
             id,
             yield* pack(error),
-            String(retryAt ? Duration.toMillis(retryAt) : -1),
+            String(retryAtMillis),
           ),
           prefix,
           id,
@@ -890,6 +1019,11 @@ export const makeWithRedis = (
         prefix: string,
         lockTimeout: number,
       ) {
+        yield* validatePositiveSafeInteger(
+          "effectmq_takeTask",
+          "lockTimeout",
+          lockTimeout,
+        );
         const crypto = yield* Crypto.Crypto;
         const leaseToken = yield* crypto.randomUUIDv4.pipe(
           Effect.map((uuid) => `lease/${uuid}`),
@@ -929,12 +1063,25 @@ export const makeWithRedis = (
       forceRemoveTask: (prefix, id) =>
         forceRemoveTaskFn(withPrefix(prefix), id).pipe(Effect.asVoid),
 
-      extendLock: (prefix, id, leaseToken, lockTimeout) =>
-        withLeaseFence(
-          extendLockFn(withPrefix(prefix), leaseToken, id, String(lockTimeout)),
-          prefix,
-          id,
-        ).pipe(Effect.asVoid),
+      extendLock: Effect.fnUntraced(
+        function* (prefix, id, leaseToken, lockTimeout) {
+          yield* validatePositiveSafeInteger(
+            "effectmq_extendLock",
+            "lockTimeout",
+            lockTimeout,
+          );
+          return yield* withLeaseFence(
+            extendLockFn(
+              withPrefix(prefix),
+              leaseToken,
+              id,
+              String(lockTimeout),
+            ),
+            prefix,
+            id,
+          ).pipe(Effect.asVoid);
+        },
+      ),
       removeLock: (prefix, id, leaseToken) =>
         withLeaseFence(
           removeLockFn(withPrefix(prefix), leaseToken, id),
@@ -1136,14 +1283,42 @@ export const makeWithRedis = (
               ),
               latest: yield* decodeText("effectmq_eventCursors.latest", latest),
             };
+            const firstId = parseStreamId(cursors.first);
+            const earliestId = parseStreamId(cursors.earliest);
+            const latestId = parseStreamId(cursors.latest);
+            if (
+              firstId === undefined ||
+              earliestId === undefined ||
+              latestId === undefined
+            ) {
+              return yield* invalidReply(
+                "effectmq_eventCursors",
+                "Redis stream ids",
+                cursors,
+              );
+            }
             const cursor = options.cursor ?? cursors.latest;
+            const requestedId =
+              options.cursor === undefined
+                ? latestId
+                : cursor === "$"
+                  ? undefined
+                  : parseStreamId(cursor);
+            if (cursor !== "$" && requestedId === undefined) {
+              return yield* new InvalidCursor({ cursor });
+            }
             const streamWasTrimmed =
               cursors.first !== "0-0" &&
-              compareStreamIds(cursors.earliest, cursors.first) > 0;
+              compareStreamIds(earliestId, firstId) > 0;
+            const requestedFromStart =
+              requestedId !== undefined &&
+              requestedId[0] === 0n &&
+              requestedId[1] === 0n;
             const requestedTrimmedEvent =
-              cursor === "0" ||
-              (compareStreamIds(cursor, cursors.first) >= 0 &&
-                compareStreamIds(cursor, cursors.earliest) < 0);
+              requestedFromStart ||
+              (requestedId !== undefined &&
+                compareStreamIds(requestedId, firstId) >= 0 &&
+                compareStreamIds(requestedId, earliestId) < 0);
             if (streamWasTrimmed && requestedTrimmedEvent) {
               return yield* new CursorExpired({
                 requested: cursor,

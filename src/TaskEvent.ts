@@ -4,6 +4,7 @@ import {
   BooleanFromBytes,
   EngineTaskSchema,
   ExecutionStateSchema,
+  IntegerFromBytes,
   NumberFromBytes,
   TaskLists,
   TextFromBytes,
@@ -14,8 +15,8 @@ import { CompletionPolicySchema } from "./TaskRecord.js";
 const eventBase = {
   id: Schema.String,
   taskId: Schema.String,
-  generation: NumberFromBytes,
-  protocolVersion: NumberFromBytes,
+  generation: IntegerFromBytes,
+  protocolVersion: IntegerFromBytes,
   schemaId: TextFromBytes,
 };
 
@@ -44,7 +45,7 @@ export const EventSchema = Schema.Union([
       failureKind: TextFromBytes.pipe(
         Schema.decodeTo(Schema.Literals(["handler", "stall"])),
       ),
-      attempt: NumberFromBytes,
+      attempt: IntegerFromBytes,
       terminal: BooleanFromBytes,
     }),
   }),
@@ -68,9 +69,9 @@ export const EventSchema = Schema.Union([
         Schema.decodeTo(ExecutionStateSchema),
         Schema.optional,
       ),
-      attempt: NumberFromBytes,
-      handlerFailureCount: NumberFromBytes,
-      stalledAttemptCount: NumberFromBytes,
+      attempt: IntegerFromBytes,
+      handlerFailureCount: IntegerFromBytes,
+      stalledAttemptCount: IntegerFromBytes,
     }),
   }),
 ]);

@@ -6,11 +6,14 @@
  *
  * @module
  */
+
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import type * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Function from "effect/Function";
 import * as Result from "effect/Result";
@@ -184,6 +187,13 @@ export interface TaskOptions {
   onDuplicate?: "return-existing" | "new-generation";
 }
 
+/** Indicates that per-offer timing or retry overrides are invalid. */
+export class TaskOptionsError extends Data.TaggedError("TaskOptionsError")<{
+  readonly field: "delay" | "maxRetries" | "maxStalledCount";
+  readonly constraint: string;
+  readonly actual: unknown;
+}> {}
+
 /**
  * Redis connection loss made it impossible to determine whether an offer was
  * committed. Retry with the same queue payload/idempotency identity; the
@@ -211,6 +221,22 @@ export class RetentionContextRequired extends Data.TaggedError(
 )<{
   readonly queue: string;
   readonly taskId: string;
+}> {}
+
+/** A task retry schedule failed while deciding whether to run another attempt. */
+export class RetryPolicyError extends Data.TaggedError("RetryPolicyError")<{
+  readonly queue: string;
+  readonly taskId: string;
+  readonly cause: unknown;
+}> {}
+
+/** Indicates that lease supervision options cannot produce a safe attempt. */
+export class ProcessingConfigurationError extends Data.TaggedError(
+  "ProcessingConfigurationError",
+)<{
+  readonly field: keyof ProcessingOptions;
+  readonly constraint: string;
+  readonly actual: unknown;
 }> {}
 
 declare const TaskHandleSuccess: unique symbol;
@@ -285,10 +311,19 @@ export class CallerTimeout extends Data.TaggedError("CallerTimeout")<{
   readonly timeout: Duration.Input;
 }> {}
 
+/** The supplied queue descriptor does not match a persisted task handle. */
+export class TaskHandleMismatch extends Data.TaggedError("TaskHandleMismatch")<{
+  readonly expectedQueue: string;
+  readonly actualQueue: string;
+  readonly expectedTaskName: string;
+  readonly actualTaskName: string;
+}> {}
+
 /** Recoverable failures produced while offering a task generation. */
 export type OfferError =
   | IndeterminateWriteError
   | RetentionContextRequired
+  | TaskOptionsError
   | Task.TaskIdentityGenerationError
   | StorageProtocol.StorageProtocolError
   | TaskEngine.TaskEngineError
@@ -311,9 +346,13 @@ export type OfferRequirements<
 /** Infrastructure and codec failures produced while completing an attempt. */
 export type CompleteError =
   | StorageProtocol.StorageProtocolError
+  | RetryPolicyError
   | TaskEngine.LeaseLost
   | TaskEngine.TaskEngineError
   | Schema.SchemaError;
+
+/** Completion failures plus invalid direct `completeOne` processing options. */
+export type CompleteOneError = CompleteError | ProcessingConfigurationError;
 
 /** Services required by completion, including handler and retry environments. */
 export type CompleteRequirements<
@@ -339,7 +378,9 @@ export type WaitError<Failure> =
   | TaskNotFound
   | ResultExpired
   | CallerTimeout
+  | TaskHandleMismatch
   | TaskEngine.CursorExpired
+  | TaskEngine.InvalidCursor
   | TaskEngine.TaskEngineError
   | StorageProtocol.StorageProtocolError
   | Schema.SchemaError;
@@ -386,6 +427,14 @@ export type OfferOutcome<
   readonly task: Task.Task<Payload, Success, Error>;
   readonly handle: TaskHandle<Success["Type"], Error["Type"]>;
 };
+
+const hasBuiltInErrorTag = (value: unknown): boolean =>
+  typeof value === "object" &&
+  value !== null &&
+  "_tag" in value &&
+  Object.values(StorageProtocol.builtInErrorTags).some(
+    (tag) => tag === value._tag,
+  );
 /**
  * Enqueues a typed payload and returns its exact generation handle.
  *
@@ -444,6 +493,28 @@ export const offer = Effect.fnUntraced(function* <
   OfferRequirements<Payload, Success, Error, IdentityR>
 > {
   yield* TaskInvariant.validate(queue.task);
+  const delay = options?.delay ?? 0;
+  if (
+    !Number.isFinite(delay) ||
+    Math.abs(delay) > Number.MAX_SAFE_INTEGER ||
+    delay < 0
+  ) {
+    return yield* new TaskOptionsError({
+      field: "delay",
+      constraint: "a finite safe number greater than or equal to 0",
+      actual: options?.delay,
+    });
+  }
+  for (const field of ["maxRetries", "maxStalledCount"] as const) {
+    const actual = options?.[field];
+    if (actual !== undefined && (!Number.isSafeInteger(actual) || actual < 0)) {
+      return yield* new TaskOptionsError({
+        field,
+        constraint: "a non-negative safe integer",
+        actual,
+      });
+    }
+  }
   const encodePayload = Schema.encodeEffect(queue.task.payloadSchema);
   const id = options?.taskId ?? (yield* queue.task.idempotencyKey(payload));
   const engine = yield* TaskEngine.TaskEngine;
@@ -470,7 +541,7 @@ export const offer = Effect.fnUntraced(function* <
         queue.task.storageLimits,
       ),
       schemaId: queue.task.schemaId,
-      delay: options?.delay ?? 0,
+      delay,
       maxRetries: options?.maxRetries ?? -1,
       maxStalledCount: options?.maxStalledCount ?? 1,
       maxErrorEntries: queue.task.storageLimits.maxErrorEntries,
@@ -507,6 +578,7 @@ export const offer = Effect.fnUntraced(function* <
                 }),
               );
             case "IndeterminateCommit":
+            case "InvalidReply":
               return Effect.fail(
                 new IndeterminateWriteError({
                   cause,
@@ -516,7 +588,7 @@ export const offer = Effect.fnUntraced(function* <
               );
             case "TransportFailure":
             case "ScriptFailure":
-            case "InvalidReply":
+            case "InvalidInput":
             case "LeaseLost":
               return Effect.fail(cause);
           }
@@ -626,25 +698,63 @@ const fail = Effect.fnUntraced(function* <
       : queue.task.maxRetries;
 
   const failedAt = new Date(yield* Clock.currentTimeMillis);
-  const retryAt =
-    queue.task.retrySchedule && attempt.task.handlerFailureCount < maxRetries
-      ? yield* nextRunAt(
-          queue.task.retrySchedule,
-          new Date(attempt.task.createdAt.getTime() + attempt.task.delay),
-          [...attempt.task.errors, { timestamp: failedAt, error: failure }],
-        )
-      : undefined;
+  const encodedFailure = yield* StorageProtocol.encodeValue(
+    queue.task.schemaId,
+    "failure",
+    yield* encodeFailure(failure),
+    queue.task.storageLimits,
+  );
+  const canRetry =
+    queue.task.retrySchedule !== undefined &&
+    attempt.task.handlerFailureCount < maxRetries &&
+    !hasBuiltInErrorTag(failure);
+  const handlerErrors = attempt.task.errors.filter(
+    ({ error }) => !hasBuiltInErrorTag(error),
+  );
+  if (canRetry && handlerErrors.length < attempt.task.handlerFailureCount) {
+    yield* engine.writeError(
+      queue.name,
+      attempt.task.id,
+      attempt.leaseToken,
+      encodedFailure,
+    );
+    return yield* new RetryPolicyError({
+      queue: queue.name,
+      taskId: attempt.task.id,
+      cause: new Error(
+        "Retry schedule history was truncated before it could be replayed safely",
+      ),
+    });
+  }
+  const retryDecision = canRetry
+    ? yield* nextRunAt(
+        queue.task.retrySchedule,
+        new Date(attempt.task.createdAt.getTime() + attempt.task.delay),
+        [...handlerErrors, { timestamp: failedAt, error: failure }],
+      ).pipe(Effect.exit)
+    : Exit.succeed<number | undefined>(undefined);
+  if (Exit.isFailure(retryDecision)) {
+    if (Cause.hasInterruptsOnly(retryDecision.cause)) {
+      return yield* Effect.interrupt;
+    }
+    yield* engine.writeError(
+      queue.name,
+      attempt.task.id,
+      attempt.leaseToken,
+      encodedFailure,
+    );
+    return yield* new RetryPolicyError({
+      queue: queue.name,
+      taskId: attempt.task.id,
+      cause: Cause.squash(retryDecision.cause),
+    });
+  }
   return yield* engine.writeError(
     queue.name,
     attempt.task.id,
     attempt.leaseToken,
-    yield* StorageProtocol.encodeValue(
-      queue.task.schemaId,
-      "failure",
-      yield* encodeFailure(failure),
-      queue.task.storageLimits,
-    ),
-    retryAt,
+    encodedFailure,
+    retryDecision.value,
   );
 });
 
@@ -685,6 +795,94 @@ export interface ProcessingOptions {
   readonly heartbeatRetryCount?: number;
 }
 
+interface ResolvedProcessingOptions {
+  readonly lockTimeout: number;
+  readonly lockRefresh: number;
+  readonly heartbeatRetryDelay: number;
+  readonly heartbeatRetryCount: number;
+}
+
+const defaultProcessingOptions: ResolvedProcessingOptions = {
+  lockTimeout: 30_000,
+  lockRefresh: 10_000,
+  heartbeatRetryDelay: 250,
+  heartbeatRetryCount: 3,
+};
+
+const processingDuration = (
+  field: keyof ProcessingOptions,
+  input: Duration.Input,
+  requireWholeMilliseconds = false,
+) =>
+  Effect.try({
+    try: () => Duration.toMillis(input),
+    catch: () =>
+      new ProcessingConfigurationError({
+        field,
+        constraint: "a valid duration greater than zero",
+        actual: input,
+      }),
+  }).pipe(
+    Effect.filterOrFail(
+      (value) =>
+        Number.isFinite(value) &&
+        value > 0 &&
+        (!requireWholeMilliseconds || Number.isSafeInteger(value)),
+      () =>
+        new ProcessingConfigurationError({
+          field,
+          constraint: requireWholeMilliseconds
+            ? "a positive safe-integer number of milliseconds"
+            : "a finite duration greater than zero",
+          actual: input,
+        }),
+    ),
+  );
+
+const resolveProcessingOptions = Effect.fnUntraced(function* (
+  options?: ProcessingOptions,
+): Effect.fn.Return<ResolvedProcessingOptions, ProcessingConfigurationError> {
+  const lockTimeout = yield* processingDuration(
+    "lockTimeout",
+    options?.lockTimeout ?? Duration.seconds(30),
+    true,
+  );
+  const lockRefresh = yield* processingDuration(
+    "lockRefresh",
+    options?.lockRefresh ?? Duration.seconds(10),
+    true,
+  );
+  if (lockRefresh >= lockTimeout) {
+    return yield* new ProcessingConfigurationError({
+      field: "lockRefresh",
+      constraint: "a duration shorter than lockTimeout",
+      actual: options?.lockRefresh ?? Duration.seconds(10),
+    });
+  }
+  const heartbeatRetryDelay = yield* processingDuration(
+    "heartbeatRetryDelay",
+    options?.heartbeatRetryDelay ?? Duration.millis(250),
+  );
+  const configuredRetryCount = options?.heartbeatRetryCount ?? 3;
+  if (!Number.isSafeInteger(configuredRetryCount) || configuredRetryCount < 0) {
+    return yield* new ProcessingConfigurationError({
+      field: "heartbeatRetryCount",
+      constraint: "a non-negative safe integer",
+      actual: configuredRetryCount,
+    });
+  }
+  const safetyWindow = lockTimeout - lockRefresh;
+  return {
+    lockTimeout,
+    lockRefresh,
+    heartbeatRetryDelay,
+    heartbeatRetryCount: Math.min(
+      configuredRetryCount,
+      Math.floor(safetyWindow / heartbeatRetryDelay),
+    ),
+  };
+});
+
 const processAttempt = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
@@ -696,29 +894,16 @@ const processAttempt = Effect.fnUntraced(function* <
   self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
   attempt: TaskAttempt<Payload, Success, Error>,
   handler: TaskHandler<Payload, Success, Error, R>,
-  options?: ProcessingOptions,
+  options: ResolvedProcessingOptions,
 ) {
-  const lockTimeout = Duration.toMillis(
-    options?.lockTimeout ?? Duration.seconds(30),
-  );
-  const lockRefresh = Duration.toMillis(
-    options?.lockRefresh ?? Duration.seconds(10),
-  );
-  const retryDelay = Math.max(
-    1,
-    Duration.toMillis(options?.heartbeatRetryDelay ?? Duration.millis(250)),
-  );
-  const safetyWindow = Math.max(0, lockTimeout - lockRefresh);
-  const heartbeatRetryCount = Math.min(
-    Math.max(0, options?.heartbeatRetryCount ?? 3),
-    Math.floor(safetyWindow / retryDelay),
-  );
+  const { lockTimeout, lockRefresh, heartbeatRetryDelay, heartbeatRetryCount } =
+    options;
 
   const renew = extendLock(self, attempt, lockTimeout).pipe(
     Effect.retry({
       while: (error) => error._tag === "TaskEngineError",
       times: heartbeatRetryCount,
-      schedule: Schedule.spaced(retryDelay),
+      schedule: Schedule.spaced(heartbeatRetryDelay),
     }),
   );
   const heartBeat = renew.pipe(
@@ -751,7 +936,8 @@ const processAttempt = Effect.fnUntraced(function* <
  * This operation polls until work is available, then returns the processed task
  * identifier. It is available in data-first and data-last forms. Handler
  * failures are recorded on the task and may schedule a retry; only decoding,
- * storage, Redis, or ownership failures remain in the Effect failure channel.
+ * storage, Redis, ownership, or retry-policy evaluation failures remain in the
+ * Effect failure channel.
  *
  * **Gotchas**
  *
@@ -832,8 +1018,11 @@ export const complete: {
     CompleteRequirements<Payload, Success, Error, TR, R>
   > {
     yield* TaskInvariant.validate(self.task);
-    const attempt = yield* takeUnsafe(self);
-    return yield* processAttempt(self, attempt, handler);
+    const options = defaultProcessingOptions;
+    const attempt = yield* takeUnsafe(self, {
+      lockTimeout: options.lockTimeout,
+    });
+    return yield* processAttempt(self, attempt, handler, options);
   }),
 );
 
@@ -857,16 +1046,17 @@ export const completeOne = Effect.fnUntraced(function* <
   options?: ProcessingOptions,
 ): Effect.fn.Return<
   boolean,
-  CompleteError,
+  CompleteOneError,
   CompleteRequirements<Payload, Success, Error, TR, R>
 > {
   yield* TaskInvariant.validate(self.task);
+  const resolved = yield* resolveProcessingOptions(options);
   const attempt = yield* takeAvailable(self, {
     poll: false,
-    lockTimeout: options?.lockTimeout,
+    lockTimeout: resolved.lockTimeout,
   });
   if (attempt === null) return false;
-  yield* processAttempt(self, attempt, handler, options);
+  yield* processAttempt(self, attempt, handler, resolved);
   return true;
 });
 
@@ -875,9 +1065,9 @@ export const completeOne = Effect.fnUntraced(function* <
  *
  * Wraps the engine's raw event stream and decodes each event's task-shaped
  * payload: `task.created`/`task.updated` yield typed {@link Task.Task}s,
- * `task.failed` yields a typed error, and `task.completed` yields a typed
- * success value. `cursor` resumes from a prior event id (defaults to now, so
- * only future events are delivered).
+ * `task.failed` yields the task's typed error or a built-in stalled/canceled
+ * error, and `task.completed` yields a typed success value. `cursor` resumes
+ * from a prior event id (defaults to now, so only future events are delivered).
  *
  * **Gotchas**
  *
@@ -948,16 +1138,11 @@ const streamEffect = Effect.fnUntraced(function* <
           };
         }
         if (event._tag === "task.failed") {
-          const decodeError = Schema.decodeEffect(queue.task.errorSchema);
+          const decodeError = Schema.decodeEffect(
+            Schema.Union([TaskErrorSchema, queue.task.errorSchema]),
+          );
           const rawFailure = event.payload.error;
-          const builtIn =
-            typeof rawFailure === "object" &&
-            rawFailure !== null &&
-            "_tag" in rawFailure &&
-            Object.values(StorageProtocol.builtInErrorTags).includes(
-              rawFailure._tag as never,
-            );
-          const failure = builtIn
+          const failure = hasBuiltInErrorTag(rawFailure)
             ? rawFailure
             : yield* StorageProtocol.decodeValue(
                 rawFailure,
@@ -968,7 +1153,7 @@ const streamEffect = Effect.fnUntraced(function* <
             ...event,
             payload: {
               ...event.payload,
-              error: builtIn ? failure : yield* decodeError(failure),
+              error: yield* decodeError(failure),
             },
           };
         }
@@ -1035,6 +1220,14 @@ export const wait = Effect.fnUntraced(function* <
   WaitRequirements<Payload, Success, Error>
 > {
   const operation = Effect.gen(function* () {
+    if (handle.queue !== queue.name || handle.taskName !== queue.task.name) {
+      return yield* new TaskHandleMismatch({
+        expectedQueue: queue.name,
+        actualQueue: handle.queue,
+        expectedTaskName: queue.task.name,
+        actualTaskName: handle.taskName,
+      });
+    }
     if (handle.protocolVersion !== StorageProtocol.protocolVersion) {
       return yield* new StorageProtocol.UnsupportedProtocolVersion({
         encountered: handle.protocolVersion,
@@ -1151,6 +1344,12 @@ export const wait = Effect.fnUntraced(function* <
       }
       const lastFailure = task.errors.at(-1)?.error;
       if (lastFailure === undefined) {
+        const result = yield* engine.getResult(
+          handle.queue,
+          handle.taskId,
+          handle.generation,
+        );
+        if (result !== null) return yield* decodeTerminalResult(result);
         return yield* new StorageProtocol.CorruptStorageValue({
           message: "Terminal failure has no error entry",
         });
@@ -1169,7 +1368,8 @@ export const wait = Effect.fnUntraced(function* <
         (event) =>
           event.taskId === handle.taskId &&
           event.generation === handle.generation &&
-          (event._tag === "task.completed" || event._tag === "task.failed"),
+          (event._tag === "task.completed" ||
+            (event._tag === "task.failed" && event.payload.terminal)),
       ),
       Stream.take(1),
       Stream.runCollect,

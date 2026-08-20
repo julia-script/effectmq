@@ -176,14 +176,22 @@ export type StorageProtocolError =
   | UnsupportedProtocolVersion
   | SchemaIdentityMismatch;
 
-const packr = new Packr({ useRecords: false, int64AsType: "number" });
+const packr = new Packr({
+  useRecords: false,
+  mapsAsObjects: false,
+  int64AsType: "bigint",
+});
 const prefix = "effectmq:v1:";
 
 const validate = (
   value: unknown,
   path: string,
   seen: Set<object>,
+  allowRootUndefined = false,
 ): UnsupportedStorageValue | undefined => {
+  if (value === undefined && path === "$" && allowRootUndefined) {
+    return undefined;
+  }
   if (
     value === null ||
     typeof value === "string" ||
@@ -193,7 +201,9 @@ const validate = (
     return undefined;
   }
   if (typeof value === "number") {
-    return Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER
+    return Number.isFinite(value) &&
+      Math.abs(value) <= Number.MAX_SAFE_INTEGER &&
+      !Object.is(value, -0)
       ? undefined
       : new UnsupportedStorageValue({ path, valueType: "unsafe number" });
   }
@@ -206,8 +216,32 @@ const validate = (
   seen.add(value);
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index++) {
-      const error = validate(value[index], `${path}[${index}]`, seen);
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        descriptor === undefined ||
+        !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) {
+        return new UnsupportedStorageValue({
+          path: `${path}[${index}]`,
+          valueType: "sparse or non-data array entry",
+        });
+      }
+      const error = validate(descriptor.value, `${path}[${index}]`, seen);
       if (error) return error;
+    }
+    for (const key of Reflect.ownKeys(value)) {
+      if (key === "length") continue;
+      if (
+        typeof key !== "string" ||
+        !/^(?:0|[1-9]\d*)$/.test(key) ||
+        Number(key) >= value.length
+      ) {
+        return new UnsupportedStorageValue({
+          path,
+          valueType: "array with custom properties",
+        });
+      }
     }
     seen.delete(value);
     return undefined;
@@ -218,24 +252,73 @@ const validate = (
       valueType: value.constructor?.name ?? "non-plain object",
     });
   }
-  for (const [key, nested] of Object.entries(value)) {
-    const error = validate(nested, `${path}.${key}`, seen);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") {
+      return new UnsupportedStorageValue({
+        path,
+        valueType: "symbol-keyed object",
+      });
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) {
+      return new UnsupportedStorageValue({
+        path: `${path}.${key}`,
+        valueType: "non-data property",
+      });
+    }
+    const error = validate(descriptor.value, `${path}.${key}`, seen);
     if (error) return error;
   }
   seen.delete(value);
   return undefined;
 };
 
+const defineDataProperty = (
+  target: Record<string, unknown>,
+  key: string,
+  value: unknown,
+) => {
+  Object.defineProperty(target, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+};
+
 const normalizeDecoded = (value: unknown): unknown => {
   if (Buffer.isBuffer(value)) return new Uint8Array(value);
+  if (typeof value === "bigint") {
+    return value >= BigInt(Number.MIN_SAFE_INTEGER) &&
+      value <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(value)
+      : value;
+  }
   if (Array.isArray(value)) return value.map(normalizeDecoded);
-  if (typeof value === "object" && value !== null) {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, nested]) => [
-        key,
-        normalizeDecoded(nested),
-      ]),
-    );
+  if (value instanceof Map) {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, nested] of value) {
+      if (typeof key !== "string") {
+        throw new TypeError("Storage object keys must be strings");
+      }
+      defineDataProperty(normalized, key, normalizeDecoded(nested));
+    }
+    return normalized;
+  }
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    Object.getPrototypeOf(value) === Object.prototype
+  ) {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value)) {
+      defineDataProperty(normalized, key, normalizeDecoded(nested));
+    }
+    return normalized;
   }
   return value;
 };
@@ -243,10 +326,13 @@ const normalizeDecoded = (value: unknown): unknown => {
 /**
  * Encodes a lossless JavaScript value into an ASCII-safe MessagePack envelope.
  *
- * Supported values are `null`, strings, booleans, finite safe numbers,
+ * Supported values are `null`, strings, booleans, finite safe numbers other
+ * than negative zero,
  * `Uint8Array`, arrays, and plain objects composed recursively from those
- * values. Cycles, class instances, unsafe numbers, `undefined`, `bigint`,
- * functions, and symbols fail with {@link UnsupportedStorageValue}.
+ * values. A top-level `undefined` success is supported for `Schema.Void`;
+ * nested `undefined` values and `undefined` payloads/failures remain invalid.
+ * Cycles, class instances, unsafe numbers, `bigint`, functions, and symbols
+ * fail with {@link UnsupportedStorageValue}.
  *
  * The size limit applies to the MessagePack bytes before base64 encoding.
  *
@@ -284,7 +370,7 @@ export const encodeValue = (
 > =>
   Effect.gen(function* () {
     const unsupported = yield* Effect.try({
-      try: () => validate(value, "$", new Set()),
+      try: () => validate(value, "$", new Set(), kind === "success"),
       catch: (cause) =>
         new StorageEncodingError({
           stage: "messagepack",
@@ -392,5 +478,25 @@ export const decodeValue = (
         message: `Expected ${expectedKind} envelope, received ${String(kind)}`,
       });
     }
-    return normalizeDecoded(value);
+    const normalized = yield* Effect.try({
+      try: () => normalizeDecoded(value),
+      catch: (cause) =>
+        new CorruptStorageValue({
+          message: "Stored value could not be normalized safely",
+          cause,
+        }),
+    });
+    const unsupported = validate(
+      normalized,
+      "$",
+      new Set(),
+      expectedKind === "success",
+    );
+    if (unsupported !== undefined) {
+      return yield* new CorruptStorageValue({
+        message: `Stored value is outside the supported storage domain at ${unsupported.path}`,
+        cause: unsupported,
+      });
+    }
+    return normalized;
   });

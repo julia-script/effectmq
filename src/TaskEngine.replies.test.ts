@@ -111,3 +111,40 @@ it.effect("rejects odd stream field arrays", () =>
     });
   }),
 );
+
+it.effect("rejects malformed caller cursors as typed failures", () =>
+  Effect.gen(function* () {
+    const engine = yield* TaskEngine.makeWithRedis(
+      service({ scriptReply: ["0-0", "0-0", "0-0"] }),
+    );
+    for (const cursor of [
+      "not-a-stream-id",
+      "18446744073709551616-0",
+      "0-18446744073709551616",
+      "1".repeat(1_000),
+    ]) {
+      const error = yield* engine
+        .stream("queue", { cursor })
+        .pipe(Stream.runHead, Effect.flip);
+      expect(error).toMatchObject({ _tag: "InvalidCursor", cursor });
+    }
+  }),
+);
+
+it.effect("rejects malformed persisted latest cursors as invalid replies", () =>
+  Effect.gen(function* () {
+    const engine = yield* TaskEngine.makeWithRedis(
+      service({ scriptReply: ["0-0", "0-0", "$"] }),
+    );
+    const error = yield* engine
+      .stream("queue")
+      .pipe(Stream.runHead, Effect.flip);
+    expect(error).toMatchObject({
+      _tag: "TaskEngineError",
+      reason: {
+        _tag: "InvalidReply",
+        operation: "effectmq_eventCursors",
+      },
+    });
+  }),
+);

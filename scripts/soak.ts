@@ -1,4 +1,4 @@
-import { Effect, Fiber, Layer, Ref, Schema } from "effect";
+import { Effect, Fiber, Ref, Schema } from "effect";
 import {
   NodeRedisPool,
   RedisPool,
@@ -52,25 +52,23 @@ const run = Effect.scoped(
       return yield* Effect.die("Redis roles are not ready");
     }
     const runId = crypto.randomUUID();
-    const queue = TaskQueue.make(
-      `soak-${runId}`,
-      Task.make({
-        name: "soak-task",
-        schemaId: "effectmq/soak/v1",
-        payload: { id: Schema.String, body: Schema.String },
-        success: Schema.String,
-        error: Schema.Never,
-        idempotencyKey: (payload) => payload.id,
-        storageLimits: { maxEventEntries: 1_000 },
-        retention: {
-          taskRecordMs: 0,
-          resultMs: 0,
-          terminalIndexMs: 0,
-          deadLetterMs: 0,
-          eventMs: 60_000,
-        },
-      }),
-    );
+    const task = yield* Task.make({
+      name: "soak-task",
+      schemaId: "effectmq/soak/v1",
+      payload: { id: Schema.String, body: Schema.String },
+      success: Schema.String,
+      error: Schema.Never,
+      idempotencyKey: (payload) => payload.id,
+      storageLimits: { maxEventEntries: 1_000 },
+      retention: {
+        taskRecordMs: 0,
+        resultMs: 0,
+        terminalIndexMs: 0,
+        deadLetterMs: 0,
+        eventMs: 60_000,
+      },
+    });
+    const queue = TaskQueue.make(`soak-${runId}`, task);
     const completed = yield* Ref.make(0);
     const worker = Worker.make(
       queue,
@@ -84,7 +82,7 @@ const run = Effect.scoped(
         maintenanceInterval: "10 millis",
         pollInterval: "2 millis",
         processing: {
-          heartbeatInterval: "1 second",
+          lockRefresh: "1 second",
           lockTimeout: "5 seconds",
         },
       },
@@ -236,17 +234,17 @@ const run = Effect.scoped(
   }),
 );
 
-const layer = Layer.provideMerge(
-  TaskEngine.layer({
+const layer = TaskEngine.layer({
+  engine: {
     debugMode: true,
     maintenanceBatchSize: TaskEngine.maxMaintenanceBatchSize,
-  }),
-  NodeRedisPool.layer({
+  },
+  redis: {
     url: redisUrl,
     commandOptions: { timeout: 2_000 },
     pool: { maximum: Math.max(16, concurrency), minimum: 1 },
-  }),
-);
+  },
+});
 
 console.log(
   JSON.stringify(

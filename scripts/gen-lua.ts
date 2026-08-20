@@ -6,7 +6,7 @@
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
-const luaFiles = readdirSync("src", { recursive: true })
+const luaFiles = readdirSync("src", { recursive: true, encoding: "utf8" })
   .filter((file) => file.endsWith(".lua"))
   .map((file) => join("src", file))
   .sort();

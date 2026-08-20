@@ -1,4 +1,5 @@
-import { Effect } from "effect";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import { Effect, Layer } from "effect";
 import { NodeRedisPool, RedisPool, TaskEngine } from "../src/index.js";
 
 const redisUrl = process.env.EFFECTMQ_REDIS_URL ?? "redis://127.0.0.1:6379";
@@ -182,7 +183,11 @@ const program = Effect.gen(function* () {
 console.log(
   JSON.stringify(
     await Effect.runPromise(
-      program.pipe(Effect.provide(NodeRedisPool.layer({ url: redisUrl }))),
+      program.pipe(
+        Effect.provide(
+          Layer.merge(NodeRedisPool.layer({ url: redisUrl }), NodeCrypto.layer),
+        ),
+      ),
     ),
     null,
     2,

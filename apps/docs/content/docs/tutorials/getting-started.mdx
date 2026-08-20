@@ -37,7 +37,15 @@ docker run --name effectmq-tutorial-redis --publish 6379:6379 --detach redis:8-a
 Confirm that Redis is ready:
 
 ```bash
-docker exec effectmq-tutorial-redis redis-cli ping
+for ((attempt = 1; attempt <= 30; attempt++)); do
+  if docker exec effectmq-tutorial-redis redis-cli ping; then
+    break
+  fi
+  if ((attempt == 30)); then
+    exit 1
+  fi
+  sleep 0.2
+done
 ```
 
 The command prints:
@@ -48,33 +56,16 @@ PONG
 
 ## Create the project
 
-Create `package.json`:
-
-```json
-{
-  "name": "effectmq-hello",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "start": "tsx src/main.ts"
-  },
-  "dependencies": {
-    "@effect/platform-node": "4.0.0-beta.107",
-    "@effectmq/core": "0.3.0-rc.0",
-    "effect": "4.0.0-beta.107",
-    "tsx": "4.22.4"
-  }
-}
-```
-
-Install the dependencies and create the source directory:
+Initialize the package and install the pinned EffectMQ dependencies:
 
 ```bash
-pnpm install
+pnpm init
+pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-beta.107 @effect/platform-node@4.0.0-beta.107
+pnpm add --save-dev tsx@4.22.4
 mkdir src
 ```
 
-The installation finishes with `Done` and creates `node_modules`.
+The installation creates `package.json`, `pnpm-lock.yaml`, and `node_modules`.
 
 ## Define the task and queue
 
@@ -82,8 +73,14 @@ Create `src/main.ts`:
 
 ```ts
 import { NodeRuntime } from "@effect/platform-node"
-import { Task, TaskEngine, TaskQueue, Worker } from "@effectmq/core"
-import { Console, Effect, Schema } from "effect"
+import {
+  NodeRedisPool,
+  Task,
+  TaskEngine,
+  TaskQueue,
+  Worker
+} from "@effectmq/core"
+import { Console, Effect, Layer, Schema } from "effect"
 
 const Greet = Task.make({
   name: "greet",
@@ -95,6 +92,12 @@ const Greet = Task.make({
 })
 
 const greetings = TaskQueue.make("tutorial-greetings", Greet)
+
+const EngineLive = TaskEngine.layer().pipe(
+  Layer.provideMerge(
+    NodeRedisPool.layer({ url: "redis://127.0.0.1:6379" })
+  )
+)
 
 const worker = Worker.make(
   greetings,
@@ -125,11 +128,7 @@ const program = Effect.scoped(
 )
 
 program.pipe(
-  Effect.provide(
-    TaskEngine.layer({
-      redis: { url: "redis://127.0.0.1:6379" }
-    })
-  ),
+  Effect.provide(EngineLive),
   NodeRuntime.runMain
 )
 ```
@@ -142,7 +141,7 @@ operations.
 Run the application:
 
 ```bash
-pnpm start
+pnpm exec tsx src/main.ts
 ```
 
 The output should contain:
@@ -157,8 +156,8 @@ Notice that the producer receives a `TaskHandle` from `offer` and passes that
 handle to `wait`. The handle identifies the exact task generation whose result
 the caller expects.
 
-Run `pnpm start` once more. The stable idempotency key causes the producer to
-find the retained generation:
+Run `pnpm exec tsx src/main.ts` once more. The stable idempotency key causes
+the producer to find the retained generation:
 
 ```text
 Offered Ada as TaskExisting

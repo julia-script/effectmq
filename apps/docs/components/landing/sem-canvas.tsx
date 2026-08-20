@@ -24,9 +24,9 @@ const accentColor = () =>
     .trim() || "#C6F94F";
 
 /**
- * Semaphore constellation: runners offer into a queue whose head is pulled
- * through a column of permit stars. Three modes — bounded (5 permits),
- * rate limit (1 permit on a clock), fan-out (6 permits).
+ * Worker constellation: producers offer into a queue whose head is pulled
+ * through local worker slots. Three modes — a five-slot local pool, a paced
+ * local loop, and process-level fan-out.
  */
 export function SemCanvas({ mode }: { readonly mode: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -64,13 +64,13 @@ export function SemCanvas({ mode }: { readonly mode: number }) {
       rateMs = m === 1 ? 620 : 0;
       gateLabel =
         m === 0
-          ? "Semaphore.make(5)"
+          ? "Worker concurrency: 5"
           : m === 1
             ? 'Schedule.spaced("100 millis")'
-            : "6 fibers · Effect.all";
+            : "6 worker processes";
       NODES = {
-        runnerA: { x: 0.09, y: 0.28, label: "runner A", flash: 0 },
-        runnerB: { x: 0.09, y: 0.72, label: "runner B", flash: 0 },
+        runnerA: { x: 0.09, y: 0.28, label: "producer A", flash: 0 },
+        runnerB: { x: 0.09, y: 0.72, label: "producer B", flash: 0 },
         queue: { x: 0.38, y: 0.5, label: "queue", flash: 0 },
         done: { x: 0.92, y: 0.5, label: "done", flash: 0 },
       };
@@ -94,7 +94,7 @@ export function SemCanvas({ mode }: { readonly mode: number }) {
         EDGES.push({
           a: "queue",
           b: k,
-          label: j === midIdx ? (m === 2 ? "complete" : "withPermit") : "",
+          label: j === midIdx ? (m === 1 ? "complete()" : "completeOne()") : "",
         });
         EDGES.push({ a: k, b: "done", label: "" });
       });

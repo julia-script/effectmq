@@ -15,38 +15,71 @@ the same key.
 ```ts
 import { Task, TaskQueue } from "@effectmq/core"
 import { Effect, Schema } from "effect"
+import {
+  HttpClient,
+  HttpClientRequest,
+  HttpClientResponse
+} from "effect/unstable/http"
 
-const ChargeError = Schema.Struct({ reason: Schema.String })
+class ChargeRequestFailed extends Schema.TaggedError<ChargeRequestFailed>()(
+  "ChargeRequestFailed",
+  {
+    chargeId: Schema.String,
+    cause: Schema.Defect()
+  }
+) {}
+
+const ChargeResponse = Schema.Struct({ chargeId: Schema.String })
 
 const ChargeTask = Task.make({
   name: "charge-card",
+  schemaId: "charge-card/v1",
   payload: { chargeId: Schema.String, amount: Schema.Number },
   success: Schema.String,
-  error: ChargeError,
+  error: ChargeRequestFailed,
   idempotencyKey: ({ chargeId }) => chargeId
 })
 
 const chargeHandler: TaskQueue.TaskHandler<
   typeof ChargeTask.payloadSchema,
   typeof ChargeTask.successSchema,
-  typeof ChargeTask.errorSchema
-> = (task) =>
-  Effect.tryPromise({
-    try: async () => {
-      const response = await fetch("https://payments.example/charges", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "idempotency-key": `charges:${task.id}:${task.generation}`
-        },
-        body: JSON.stringify(task.payload)
-      })
-      if (!response.ok) throw new Error(`payment status ${response.status}`)
-      return Schema.decodeUnknownSync(Schema.String)(await response.text())
-    },
-    catch: (cause) => ({ reason: String(cause) })
-  })
+  typeof ChargeTask.errorSchema,
+  HttpClient.HttpClient
+> = Effect.fn("chargeHandler")(
+  function* (task) {
+    return yield* Effect.gen(function* () {
+      const client = (yield* HttpClient.HttpClient).pipe(
+        HttpClient.filterStatusOk
+      )
+      const request = yield* HttpClientRequest.post(
+        "https://payments.example/charges"
+      ).pipe(
+        HttpClientRequest.setHeader(
+          "idempotency-key",
+          `charges:${task.id}:${task.generation}`
+        ),
+        HttpClientRequest.schemaBodyJson(ChargeTask.payloadSchema)(task.payload)
+      )
+      const response = yield* client.execute(request)
+      const body = yield* HttpClientResponse.schemaBodyJson(ChargeResponse)(
+        response
+      )
+      return body.chargeId
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ChargeRequestFailed({ chargeId: task.payload.chargeId, cause })
+      )
+    )
+  }
+)
 ```
+
+The handler requires `HttpClient.HttpClient`; provide `FetchHttpClient.layer`
+once in the application layer graph. Tests can provide a stub client without
+patching global `fetch`. The client rejects non-2xx responses in the typed error
+channel, and the schema decoder validates the provider response before the
+handler returns it.
 
 The downstream service must durably associate that key with the first outcome.
 If it accepts the side effect and the EffectMQ acknowledgement is lost, the

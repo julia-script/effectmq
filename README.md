@@ -1,18 +1,42 @@
-# @effectmq/core
+# effectmq
 
-It's a task queue built on [Effect](https://effect.website): typed payloads, typed results, typed errors, all the way down. You describe a unit of work as a schema, hand it to a queue, and process it with a handler that is just an `Effect`. Retries, delays, idempotency, cron schedules: handled. The available engine is backed by Redis, but, like many things in Effect, it can be swapped for a different implementation.
+**A typed, Redis-backed task queue for Effect 4.** Define work with schemas, run
+handlers as Effects, and keep payloads, results, and failures typed from producer
+to worker.
+
+[Website](https://docs-one-eta-87.vercel.app/) ·
+[Documentation](https://docs-one-eta-87.vercel.app/docs) ·
+[Getting started](https://docs-one-eta-87.vercel.app/docs/tutorials/getting-started) ·
+[API reference](https://docs-one-eta-87.vercel.app/docs/reference/task-queue) ·
+[npm](https://www.npmjs.com/package/@effectmq/core)
+
+effectmq is for background jobs that need durable Redis state without becoming a
+workflow engine: send an email, resize an image, refresh a cache, or materialize
+a scheduled report. It provides:
+
+- schema-checked payloads, successes, and failures;
+- at-least-once delivery with fenced attempts and stalled-worker recovery;
+- Effect `Schedule` retries, delayed offers, deduplication, and durable cron;
+- bounded local worker concurrency, graceful draining, and maintenance;
+- typed lifecycle streams plus `wait` and `execute` for durable results.
+
+## Install
 
 ```bash
-pnpm add @effectmq/core effect@4.0.0-beta.107 @effect/platform-node@4.0.0-beta.107
+pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-beta.107 @effect/platform-node@4.0.0-beta.107
 ```
 
-This library is built on the Effect 4 beta and doesn't work with the current stable Effect release. The examples below use the bundled `NodeRedisPool` layer, a connection-pooled Redis client that ships with the package (`@effect/platform-node` is only needed for `NodeRuntime`). This is beta-era software riding beta-era Effect; pin accordingly.
+> [!IMPORTANT]
+> effectmq currently targets the Effect 4 beta and is not compatible with the
+> stable Effect 3 release. Pin the versions shown above. Node.js 22.19 or newer
+> is required; CI verifies Node.js 22 and 24.
 
-Node.js 22.19 or newer is required; the release matrix verifies Node.js 22 and 24.
+The package includes its pooled `NodeRedisPool` implementation.
+`@effect/platform-node` is only needed by these examples for `NodeRuntime`.
 
 ---
 
-## In thirty seconds
+## Quick start
 
 Define a task, enqueue work, process it. The whole loop:
 
@@ -46,11 +70,13 @@ const AppLayer = TaskEngine.layer({
 program.pipe(Effect.provide(AppLayer), NodeRuntime.runMain);
 ```
 
-That's the shape of it. The rest of this README explains the pieces (typed errors, retries, worker pools, schedules) and the one thing the library deliberately *doesn't* do.
+That is the complete producer-to-worker loop. For a clean-room walkthrough with
+Redis startup and expected output, follow the
+[getting-started tutorial](https://docs-one-eta-87.vercel.app/docs/tutorials/getting-started).
 
 ---
 
-## The setup, once
+## Runtime setup
 
 `TaskEngine.layer()` is the complete Node live graph: it provides the engine,
 cryptographic identity generation, and the retained Redis pool, role, and
@@ -74,7 +100,9 @@ ACL, bounded-pool, persistence, failover, health, and shutdown guidance.
 
 The tested platform matrix is in the [support policy](./docs/support-policy.md), and reproducible throughput/tail-latency results are published as [performance evidence](./docs/performance.md).
 
-`TaskEngine` is the machinery underneath: atomic Lua scripts, locks, the lists tasks move between. Provide its layer and forget it; the API you live in is `TaskQueue` and `Scheduler`.
+`TaskEngine` is the machinery underneath: atomic Lua scripts, leases, and the
+lists tasks move between. Provide its layer once; application code normally
+lives in `TaskQueue`, `Worker`, and `Scheduler`.
 
 ---
 
@@ -135,7 +163,10 @@ One `complete` processes one task. To process *many*, set your workers up accord
 
 ### Predefine the handler
 
-Handlers are just functions and workers are just Effects, so both are values you can name once and reuse. Type a handler with `TaskHandler` to declare it next to the task definition, before any queue exists; bind it to a queue with `complete` and you have a worker effect you can run, repeat, or fork like any other:
+Handlers are functions and workers are Effects, so both are values you can name
+once and reuse. Type a handler with `TaskHandler` to declare it next to the task
+definition before any queue exists. Bind it with `complete` for one task, or use
+the managed `Worker` shown below for a long-running process:
 
 ```ts docs-check=email
 // Declared against the task definition — no queue in sight yet.
@@ -189,7 +220,7 @@ const offerAndWait = Effect.gen(function* () {
 
 ---
 
-## On concurrency
+## Run a worker
 
 `complete` processes exactly one task. For a long-running process, `Worker`
 provides bounded local concurrency, lease supervision, maintenance, and graceful
@@ -200,11 +231,11 @@ const worker = Worker.make(emails, handleSendEmail, { concurrency: 5 });
 const program = Worker.run(worker);
 ```
 
-The built-in worker does not impose distributed/global concurrency or rate
-limits. Compose those policies from Effect primitives or external coordination,
-and run more worker processes to fan out. The queue preserves eligible work and
-fences the current attempt; handlers remain at-least-once and must make external
-side effects idempotent.
+`concurrency` is local to one worker process (valid values: 1–1000). Run more
+processes to fan out. Distributed/global concurrency and rate limits require
+external coordination; effectmq does not pretend a process-local semaphore can
+enforce them. The queue fences each attempt, but handlers remain at-least-once,
+so make external side effects idempotent.
 
 ---
 
@@ -260,28 +291,23 @@ const worker = Worker.make(reportQueue, ({ payload }) =>
 ## Notes
 
 - **Completion policies.** `offer` accepts `onSuccessPolicy` and `onFailurePolicy`, each one of `delete` | `keep` | `mark-as-success` | `mark-as-failure`. They decide where a finished task lands: gone, quietly retained, or parked on the success/failed list for inspection. Defaults are `delete`.
-- **Retries.** Declare `retry` on the task definition (`Task.make`) as an Effect `Schedule` — or a `{ while, until, times, schedule }` options object. On failure the next run time is computed from the schedule and the task lands on the scheduled list until then; when the schedule is exhausted, the failure policy applies. `maxRetries` caps the attempts so an unbounded schedule (e.g. `Schedule.forever`) can't loop forever: it defaults to `5`, is overridable per-`offer` (the per-offer value wins), and set it to `null` for truly unbounded retries. A `Canceled` error skips remaining retries.
+- **Retries.** Declare `retry` on the task definition (`Task.make`) as an Effect `Schedule` — or a `{ while, until, times, schedule }` options object. On failure the next run time is computed from the schedule and the task lands on the scheduled list until then; when the schedule is exhausted, the failure policy applies. The task-level `maxRetries` cap defaults to `5`; pass `null` there for an intentionally unbounded cap. An `offer` may override the cap with a finite non-negative number. Built-in canceled or stalled failures are not retried by the handler schedule.
 - **Idempotency.** The `idempotencyKey` is the task id. By default, offering the same key returns the existing generation unchanged; replacement requires explicit new-generation mode.
 - **Delays.** `offer(..., { delay })` schedules the task for the future; it sits on the scheduled list until its time comes.
 - **The engine.** `TaskEngine` is the low-level, Lua-backed layer all of this sits on. You provide its layer; you rarely call it directly.
 
-## Production guides
+## Go deeper
 
-- [Architecture](./docs/architecture.md)
-- [Runtime boundaries](./docs/runtime-boundaries.md)
-- [API reference](./docs/api-reference.md)
-- [Delivery guarantees](./docs/delivery-guarantees.md)
-- [Idempotent offers](./docs/idempotent-offers.md)
-- [Task relationships](./docs/task-relationships.md)
-- [Durable scheduling](./docs/scheduler.md)
-- [Storage protocol v1](./docs/storage-protocol-v1.md)
-- [Operations](./docs/operations.md)
-- [Support policy](./docs/support-policy.md)
-- [Upgrade and rollback](./docs/upgrade-and-rollback.md)
-- [Performance evidence](./docs/performance.md)
-- [Soak evidence](./docs/soak.md)
-- [Release process](./docs/releasing.md)
-- [Current release record](./docs/release-readiness.md)
+| If you need to… | Read… |
+| --- | --- |
+| learn the library from a running example | [Getting started](https://docs-one-eta-87.vercel.app/docs/tutorials/getting-started) |
+| process, schedule, retry, or await tasks | [How-to guides](https://docs-one-eta-87.vercel.app/docs/how-to/process-tasks) |
+| look up exact API behavior | [API reference](./docs/api-reference.md) |
+| understand delivery and task identity | [Delivery guarantees](./docs/delivery-guarantees.md) · [Idempotent offers](./docs/idempotent-offers.md) |
+| operate Redis and plan upgrades | [Operations](./docs/operations.md) · [Upgrade and rollback](./docs/upgrade-and-rollback.md) |
+| inspect architecture and storage contracts | [Architecture](./docs/architecture.md) · [Runtime boundaries](./docs/runtime-boundaries.md) · [Storage protocol v1](./docs/storage-protocol-v1.md) |
+| evaluate support and performance | [Support policy](./docs/support-policy.md) · [Performance evidence](./docs/performance.md) · [Soak evidence](./docs/soak.md) |
+| release the package | [Release process](./docs/releasing.md) · [Current release record](./docs/release-readiness.md) |
 
 ---
 

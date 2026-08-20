@@ -31,9 +31,14 @@ export const apiTabLabels = [
 export const apiSnippets: ReadonlyArray<ReactNode> = [
   // 01 define
   <pre key="define">
-    <K>import</K> {"{ Schedule, Schema }"} <K>from</K> <S>"effect"</S>
+    <K>import</K> {"{ Cron, Effect, Schedule, Schema }"} <K>from</K>{" "}
+    <S>"effect"</S>
     {";\n"}
-    <K>import</K> {"{ Task, TaskQueue }"} <K>from</K> <S>"@effectmq/core"</S>
+    <K>import</K> {"{ NodeRuntime }"} <K>from</K> <S>"@effect/platform-node"</S>
+    {";\n"}
+    <K>import</K>{" "}
+    {"{ Scheduler, Task, TaskEngine, TaskQueue, type TaskHandler, Worker }"}{" "}
+    <K>from</K> <S>"@effectmq/core"</S>
     {";\n\n"}
     <K>class</K> <T>EmailRejected</T> <K>extends</K> <T>Schema</T>
     {".TaggedError<"}
@@ -74,8 +79,8 @@ export const apiSnippets: ReadonlyArray<ReactNode> = [
     {".make("}
     <S>"emails"</S>
     {", SendEmail);\n\n"}
-    <C>{"// Enqueue a payload — idempotent, durable.\n"}</C>
-    <K>yield</K>
+    <C>{"// Enqueue a payload and keep its durable handle.\n"}</C>
+    <K>const</K> offered = <K>yield</K>
     {"* "}
     <T>TaskQueue</T>
     {".offer(emails, {\n  to: "}
@@ -95,39 +100,33 @@ export const apiSnippets: ReadonlyArray<ReactNode> = [
     <C>{"// succeeds with your value — or fails with EmailRejected\n"}</C>
     {"\n"}
     <C>{"// Or await a task you already offered.\n"}</C>
-    <K>const</K> task = <K>yield</K>
-    {"* "}
-    <T>TaskQueue</T>
-    {".offer(emails, payload);\n"}
     <K>const</K> outcome = <K>yield</K>
     {"* "}
     <T>TaskQueue</T>
-    {".wait(emails, task.handle);"}
+    {".wait(emails, offered.handle);"}
   </pre>,
   // 03 worker
   <pre key="worker">
-    <C>{"// Take one task, run it, report the outcome.\n"}</C>
-    <K>yield</K>
-    {"* "}
-    <T>TaskQueue</T>
-    {".complete(emails, (task) =>\n  "}
+    <C>{"// Define the handler once, against the task schema.\n"}</C>
+    <K>const</K> handleSendEmail: <T>TaskHandler</T>
+    {
+      "<\n  typeof SendEmail.payloadSchema,\n  typeof SendEmail.successSchema,\n  typeof SendEmail.errorSchema\n> = (task) =>\n  "
+    }
     <T>Effect</T>
     {".succeed("}
     {/* biome-ignore lint/suspicious/noTemplateCurlyInString: displayed as literal code */}
     <S>{"`provider:${task.payload.to}`"}</S>
-    {"),\n);\n\n"}
-    <C>{"// Or name the handler once, and loop forever.\n"}</C>
-    <K>const</K>
-    {" sendEmailWorker = "}
-    <T>TaskQueue</T>
-    {".complete(emails, handleSendEmail);\n"}
-    <K>yield</K>
-    {"* sendEmailWorker.pipe("}
-    <T>Effect</T>
-    {".repeat("}
-    <T>Schedule</T>
-    {".forever));\n\n"}
-    <C>{"// The engine + its Redis layer: the only wiring you need.\n"}</C>
+    {");\n\n"}
+    <C>
+      {"// A managed worker polls, supervises leases and drains cleanly.\n"}
+    </C>
+    <K>const</K> worker = <T>Worker</T>
+    {".make(emails, handleSendEmail, { concurrency: "}
+    <N>5</N>
+    {" });\n"}
+    <K>const</K> program = <T>Worker</T>
+    {".run(worker);\n\n"}
+    <C>{"// Provide the complete Redis-backed runtime once.\n"}</C>
     <K>const</K> AppLayer = <T>TaskEngine</T>
     {".layer({\n  redis: { url: "}
     <S>"redis://localhost:6379"</S>
@@ -139,35 +138,22 @@ export const apiSnippets: ReadonlyArray<ReactNode> = [
   </pre>,
   // 04 concurrency
   <pre key="concurrency">
-    <C>{"// No bespoke concurrency options. Just Effect.\n"}</C>
-    <K>const</K> worker = <T>Effect</T>
-    {".gen("}
-    <K>function</K>
-    {"* () {\n  "}
-    <C>{"// At most 5 tasks in flight at any moment.\n"}</C>
-    {"  "}
-    <K>const</K> semaphore = <K>yield</K>
-    {"* "}
-    <T>Semaphore</T>
-    {".make("}
+    <C>{"// Local concurrency is a Worker option, not a fiber recipe.\n"}</C>
+    <K>const</K> worker = <T>Worker</T>
+    {".make(emails, handleSendEmail, {\n  concurrency: "}
     <N>5</N>
-    {");\n\n  "}
-    <K>yield</K>
-    {"* "}
-    <T>Semaphore</T>
-    {".withPermit(\n    semaphore,\n    "}
-    <T>TaskQueue</T>
-    {".complete(emails, handleSendEmail),\n  ).pipe(\n    "}
-    <T>Effect</T>
-    {".forkScoped,               "}
-    <C>{"// each worker is its own fiber\n"}</C>
-    {"    "}
-    <T>Effect</T>
-    {".repeat("}
-    <T>Schedule</T>
-    {".forever), "}
-    <C>{"// ...that keeps pulling work\n"}</C>
-    {"  );\n});"}
+    {",\n  pollInterval: "}
+    <S>"250 millis"</S>
+    {",\n  drainTimeout: "}
+    <S>"30 seconds"</S>
+    {",\n});\n\n"}
+    <C>
+      {
+        "// The limit is per process. Add shared coordination for a global cap.\n"
+      }
+    </C>
+    <K>const</K> program = <T>Worker</T>
+    {".run(worker);"}
   </pre>,
   // 05 schedule
   <pre key="schedule">
@@ -198,46 +184,30 @@ export const apiSnippets: ReadonlyArray<ReactNode> = [
   </pre>,
 ];
 
-export const semTabLabels = ["bounded", "rate limit", "fan-out"];
+export const semTabLabels = ["worker pool", "local pacing", "fan-out"];
 
 export const semSnippets: ReadonlyArray<ReactNode> = [
   // bounded
   <pre key="bounded">
-    <C>{"// At most 5 tasks in flight, across any number of runners.\n"}</C>
-    <K>const</K> semaphore = <K>yield</K>
-    {"* "}
-    <T>Semaphore</T>
-    {".make("}
+    <C>{"// Five acquire/process loops in this worker process.\n"}</C>
+    <K>const</K> worker = <T>Worker</T>
+    {".make(emails, handle, { concurrency: "}
     <N>5</N>
-    {");\n\n"}
+    {" });\n\n"}
     <K>yield</K>
     {"* "}
-    <T>Semaphore</T>
-    {".withPermit(\n  semaphore,\n  "}
-    <T>TaskQueue</T>
-    {".complete(emails, handle),\n).pipe("}
-    <T>Effect</T>
-    {".forkScoped, "}
-    <T>Effect</T>
-    {".repeat("}
-    <T>Schedule</T>
-    {".forever));"}
+    <T>Worker</T>
+    {".run(worker);"}
   </pre>,
   // rate limit
   <pre key="rate-limit">
-    <C>{"// A rate limit is just a Semaphore + a Schedule.\n"}</C>
-    <K>const</K> permits = <K>yield</K>
-    {"* "}
-    <T>Semaphore</T>
-    {".make("}
-    <N>1</N>
-    {");\n\n"}
+    <C>
+      {"// Pace one local loop. Use shared coordination for a global limit.\n"}
+    </C>
+    <K>const</K> runOne = <T>TaskQueue</T>
+    {".complete(emails, handle);\n\n"}
     <K>yield</K>
-    {"* "}
-    <T>Semaphore</T>
-    {".withPermit(\n  permits,\n  "}
-    <T>TaskQueue</T>
-    {".complete(emails, handle),\n).pipe(\n  "}
+    {"* runOne.pipe(\n  "}
     <T>Effect</T>
     {".repeat("}
     <T>Schedule</T>
@@ -249,22 +219,19 @@ export const semSnippets: ReadonlyArray<ReactNode> = [
   </pre>,
   // fan-out
   <pre key="fan-out">
-    <C>{"// Fan out: more fibers — or more processes. Same worker.\n"}</C>
-    <K>const</K> worker = <T>TaskQueue</T>
-    {".complete(emails, handle).pipe(\n  "}
+    <C>
+      {"// Run the same worker program in more OS processes or containers.\n"}
+    </C>
+    <K>const</K> worker = <T>Worker</T>
+    {".make(emails, handle, { concurrency: "}
+    <N>5</N>
+    {" });\n\n"}
+    <K>const</K> program = <T>Worker</T>
+    {".run(worker).pipe(\n  "}
     <T>Effect</T>
-    {".repeat("}
-    <T>Schedule</T>
-    {".forever),\n);\n\n"}
-    <K>yield</K>
-    {"* "}
-    <T>Effect</T>
-    {".all(\n  "}
-    <T>Array</T>
-    {".from({ length: "}
-    <N>6</N>
-    {" }, () => worker),\n  { concurrency: "}
-    <S>"unbounded"</S>
-    {" },\n);"}
+    {".provide(AppLayer),\n);\n\n"}
+    <T>NodeRuntime</T>
+    {".runMain(program); "}
+    <C>{"// deploy N replicas"}</C>
   </pre>,
 ];

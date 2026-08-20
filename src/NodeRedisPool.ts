@@ -7,7 +7,14 @@
  *
  * @module
  */
-import { Context, Data, Effect, Layer, Metric, Ref, Scope } from "effect";
+import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
+import * as Data from "effect/Data";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Metric from "effect/Metric";
+import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
 import * as Redis from "effect/unstable/persistence/Redis";
 import {
   createClientPool,
@@ -18,6 +25,7 @@ import {
   type RedisSentinelOptions,
 } from "redis";
 import * as Observability from "./Observability.js";
+import * as RedisReadiness from "./RedisReadiness.js";
 import {
   makeConnectionRoles,
   make as makeRedisPool,
@@ -181,15 +189,15 @@ export interface RedisConnectionHealthService {
 export class RedisConnectionHealth extends Context.Service<
   RedisConnectionHealth,
   RedisConnectionHealthService
->()("effectmq/RedisConnectionHealth") {}
+>()("@effectmq/core/RedisConnectionHealth") {}
 
 const roles: ReadonlyArray<RedisRole> = ["producer", "worker", "maintenance"];
 
-const initialRoleHealth = (): RedisRoleHealth => ({
+const initialRoleHealth = (now: number): RedisRoleHealth => ({
   state: "disconnected",
   commandErrors: 0,
   reconnects: 0,
-  lastChangeAt: Date.now(),
+  lastChangeAt: now,
 });
 
 const binaryTypeMapping = {
@@ -245,66 +253,76 @@ const makeClient = Effect.fnUntraced(function* (
   role: RedisRole,
   health: Ref.Ref<HealthState>,
 ) {
+  const clock = yield* Clock.Clock;
+  const now = () => clock.currentTimeMillisUnsafe();
   const topology = config.topology ?? "standalone";
   const standalone = topology === "standalone";
-  const standaloneClient =
-    config.topology !== "sentinel"
-      ? (() => {
-          const { topology: _topology, pool, ...clientOptions } = config;
-          return createClientPool(
-            clientOptions as Omit<RedisClientOptions, "clientSideCache">,
-            pool as Partial<NodeRedisClientPoolOptions> | undefined,
-          );
-        })()
-      : undefined;
-  const sentinelClient =
-    config.topology === "sentinel"
-      ? createSentinel(config.sentinel)
-      : undefined;
+  const { standaloneClient, sentinelClient } = yield* Effect.try({
+    try: () => ({
+      standaloneClient:
+        config.topology !== "sentinel"
+          ? (() => {
+              const { topology: _topology, pool, ...clientOptions } = config;
+              return createClientPool(
+                clientOptions as Omit<RedisClientOptions, "clientSideCache">,
+                pool as Partial<NodeRedisClientPoolOptions> | undefined,
+              );
+            })()
+          : undefined,
+      sentinelClient:
+        config.topology === "sentinel"
+          ? createSentinel(config.sentinel)
+          : undefined,
+    }),
+    catch: (cause) => new Redis.RedisError({ cause }),
+  });
   const client = standaloneClient ?? sentinelClient;
-  if (client === undefined) throw new Error("unreachable Redis topology");
+  if (client === undefined) return yield* unsupportedCluster();
 
   // EventEmitter treats an unhandled error event as process-fatal. Install
   // before connect and log no connection config or raw error string.
-  client.on("error", () => {
+  const onError = () => {
     Effect.runFork(
       Effect.all([
         updateHealth(health, role, (current) => ({
           ...current,
           state: "degraded",
           commandErrors: current.commandErrors + 1,
-          lastChangeAt: Date.now(),
+          lastChangeAt: now(),
         })),
         Effect.logError("effectmq Redis connection error", { role, topology }),
         Metric.update(Observability.redisErrors, 1),
       ]).pipe(Effect.asVoid),
     );
-  });
+  };
+  client.on("error", onError);
 
+  let onTopologyChange: ((event: unknown) => void) | undefined;
   if (standalone) {
-    client.on("reconnecting", () => {
+    onTopologyChange = () => {
       Effect.runFork(
         Effect.all([
           updateHealth(health, role, (current) => ({
             ...current,
             state: "connecting",
             reconnects: current.reconnects + 1,
-            lastChangeAt: Date.now(),
+            lastChangeAt: now(),
           })),
           Effect.logWarning("effectmq Redis connection reconnecting", { role }),
           Metric.update(Observability.redisReconnects, 1),
         ]).pipe(Effect.asVoid),
       );
-    });
+    };
+    client.on("reconnecting", onTopologyChange);
   } else {
-    client.on("topology-change", (event) => {
+    onTopologyChange = (event) => {
       Effect.runFork(
         Effect.all([
           updateHealth(health, role, (current) => ({
             ...current,
             state: "connecting",
             reconnects: current.reconnects + 1,
-            lastChangeAt: Date.now(),
+            lastChangeAt: now(),
           })),
           Effect.logWarning("effectmq Redis Sentinel topology changed", {
             role,
@@ -316,13 +334,49 @@ const makeClient = Effect.fnUntraced(function* (
           Metric.update(Observability.redisReconnects, 1),
         ]).pipe(Effect.asVoid),
       );
-    });
+    };
+    client.on("topology-change", onTopologyChange);
   }
 
   const scope = yield* Effect.scope;
+  let closed = false;
   yield* Scope.addFinalizer(
     scope,
-    Effect.promise(() => client.close()),
+    Effect.sync(() => {
+      client.off("error", onError);
+      if (onTopologyChange !== undefined) {
+        client.off(
+          standalone ? "reconnecting" : "topology-change",
+          onTopologyChange,
+        );
+      }
+    }).pipe(
+      Effect.andThen(
+        Effect.suspend(() => {
+          if (closed) return Effect.void;
+          closed = true;
+          return Effect.tryPromise({
+            try: () => client.close(),
+            catch: (cause) => new Redis.RedisError({ cause }),
+          }).pipe(
+            Effect.catch((closeError) =>
+              Effect.logWarning(
+                "effectmq Redis graceful close failed; forcing destroy",
+                { role, topology, closeError },
+              ).pipe(
+                Effect.andThen(
+                  Effect.try({
+                    try: () => client.destroy(),
+                    catch: (cause) => new Redis.RedisError({ cause }),
+                  }),
+                ),
+                Effect.orDie,
+              ),
+            ),
+          );
+        }),
+      ),
+    ),
   );
 
   const rawSend = <A = unknown>(
@@ -344,7 +398,7 @@ const makeClient = Effect.fnUntraced(function* (
     yield* updateHealth(health, role, (current) => ({
       ...current,
       state: "connecting",
-      lastChangeAt: Date.now(),
+      lastChangeAt: now(),
     }));
     yield* Effect.tryPromise({
       try: async () => await client.connect(),
@@ -358,7 +412,7 @@ const makeClient = Effect.fnUntraced(function* (
     yield* updateHealth(health, role, (current) => ({
       ...current,
       state: "ready",
-      lastChangeAt: Date.now(),
+      lastChangeAt: now(),
     }));
   }).pipe(Effect.cached);
   // Building the scoped Layer is the startup boundary: resolve topology and
@@ -381,7 +435,7 @@ const makeClient = Effect.fnUntraced(function* (
               ...current,
               state: "degraded",
               commandErrors: current.commandErrors + 1,
-              lastChangeAt: Date.now(),
+              lastChangeAt: now(),
             })),
           ),
         );
@@ -389,7 +443,7 @@ const makeClient = Effect.fnUntraced(function* (
           ...current,
           state: "ready",
           lastChangeAt:
-            current.state === "ready" ? current.lastChangeAt : Date.now(),
+            current.state === "ready" ? current.lastChangeAt : now(),
         }));
         return result;
       });
@@ -409,10 +463,11 @@ const make = Effect.fnUntraced(function* (config: RedisConfig = {}) {
 
   const topology: "standalone" | "sentinel" =
     config.topology === "sentinel" ? "sentinel" : "standalone";
+  const now = yield* Clock.currentTimeMillis;
   const health = yield* Ref.make<HealthState>({
-    producer: initialRoleHealth(),
-    worker: initialRoleHealth(),
-    maintenance: initialRoleHealth(),
+    producer: initialRoleHealth(now),
+    worker: initialRoleHealth(now),
+    maintenance: initialRoleHealth(now),
   });
   const supported = config as Exclude<RedisConfig, ClusterRedisConfig>;
   const producer = yield* makeClient(supported, "producer", health);
@@ -430,14 +485,11 @@ const make = Effect.fnUntraced(function* (config: RedisConfig = {}) {
   );
   const connectionHealth = RedisConnectionHealth.of({
     snapshot,
-    readiness: Effect.all([
+    readiness: RedisReadiness.fromProbes([
       producer.redisPool.send("PING"),
       worker.redisPool.send("PING"),
       maintenance.redisPool.send("PING"),
-    ]).pipe(
-      Effect.as(true),
-      Effect.catchCause(() => Effect.succeed(false)),
-    ),
+    ]),
   });
 
   return Context.make(RedisPool, producer.redisPool).pipe(

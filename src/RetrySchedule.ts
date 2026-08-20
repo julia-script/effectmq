@@ -1,14 +1,14 @@
-import { Duration, Effect, Pull, Schedule } from "effect";
+/** Retry schedule construction and stepping helpers. @internal */
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as Pull from "effect/Pull";
+import * as Schedule from "effect/Schedule";
 
 export const buildFromOptions = <Input>(options: {
-  schedule?: Schedule.Schedule<any, Input, any, any> | undefined;
-  while?:
-    | ((input: Input) => boolean | Effect.Effect<boolean, any, any>)
-    | undefined;
-  until?:
-    | ((input: Input) => boolean | Effect.Effect<boolean, any, any>)
-    | undefined;
-  times?: number | undefined;
+  schedule?: Schedule.Schedule<any, Input, any, any>;
+  while?: (input: Input) => boolean | Effect.Effect<boolean, any, any>;
+  until?: (input: Input) => boolean | Effect.Effect<boolean, any, any>;
+  times?: number;
 }) => {
   const { while: whileFn, until: untilFn, times } = options;
   let schedule: Schedule.Schedule<any, Input, any, any> = options.schedule
@@ -24,7 +24,7 @@ export const buildFromOptions = <Input>(options: {
     schedule = Schedule.while(schedule, ({ input }) => {
       const applied = untilFn(input);
       return Effect.isEffect(applied)
-        ? Effect.map(applied, (b) => !b)
+        ? Effect.map(applied, (value) => !value)
         : Effect.succeed(!applied);
     });
   }
@@ -39,20 +39,16 @@ export const buildFromOptions = <Input>(options: {
 export const nextRunAt = Effect.fnUntraced(function* <R>(
   schedule: Schedule.Schedule<any, any, any, R>,
   createdAt: Date,
-  errors: { timestamp: Date; error: unknown }[],
+  errors: readonly { readonly timestamp: Date; readonly error: unknown }[],
 ) {
   const step = yield* Schedule.toStep(schedule);
   let time = createdAt.getTime();
   for (const error of errors) {
-    const [_, delay] = yield* Pull.catchDone(
+    const [, delay] = yield* Pull.catchDone(
       step(error.timestamp.getTime(), error.error),
-      (v) => {
-        return Effect.succeed([v, -1] as const);
-      },
+      (value) => Effect.succeed([value, -1] as const),
     );
-    if (delay === -1) {
-      return undefined;
-    }
+    if (delay === -1) return undefined;
     time = error.timestamp.getTime() + Duration.toMillis(delay);
   }
   return time;

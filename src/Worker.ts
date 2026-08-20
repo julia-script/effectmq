@@ -4,16 +4,15 @@
  *
  * @module
  */
-import {
-  Data,
-  Duration,
-  Effect,
-  FiberSet,
-  Option,
-  Ref,
-  Schedule,
-  type Schema,
-} from "effect";
+import type * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as FiberSet from "effect/FiberSet";
+import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
+import * as Schedule from "effect/Schedule";
+import type * as Schema from "effect/Schema";
 import { RedisConnectionRoles } from "./RedisPool.js";
 import * as TaskEngine from "./TaskEngine.js";
 import * as TaskQueue from "./TaskQueue.js";
@@ -53,10 +52,17 @@ export interface Worker<
   Success extends Schema.Top,
   Error extends Schema.Top,
   QueueR = never,
+  QueueIdentityR = never,
   HandlerR = never,
 > {
   readonly [TypeId]: typeof TypeId;
-  readonly queue: TaskQueue.TaskQueue<Payload, Success, Error, QueueR>;
+  readonly queue: TaskQueue.TaskQueue<
+    Payload,
+    Success,
+    Error,
+    QueueR,
+    QueueIdentityR
+  >;
   readonly handler: TaskQueue.TaskHandler<Payload, Success, Error, HandlerR>;
   readonly options: WorkerOptions;
 }
@@ -70,19 +76,20 @@ export interface Worker<
  * import { Effect, Schema } from "effect"
  * import { Task, TaskQueue, Worker } from "@effectmq/core"
  *
- * const email = Task.make({
- *   name: "email",
- *   payload: { address: Schema.String },
- *   success: Schema.Void,
- *   error: Schema.String
+ * const worker = Effect.gen(function* () {
+ *   const email = yield* Task.make({
+ *     name: "email",
+ *     payload: { address: Schema.String },
+ *     success: Schema.Void,
+ *     error: Schema.String
+ *   })
+ *   const emails = TaskQueue.make("emails", email)
+ *   return Worker.make(
+ *     emails,
+ *     ({ payload }) => Effect.log(`Emailing ${payload.address}`),
+ *     { concurrency: 2 }
+ *   )
  * })
- * const emails = TaskQueue.make("emails", email)
- *
- * const worker = Worker.make(
- *   emails,
- *   ({ payload }) => Effect.log(`Emailing ${payload.address}`),
- *   { concurrency: 2 }
- * )
  * ```
  *
  * @category Constructors
@@ -93,12 +100,13 @@ export const make = <
   Success extends Schema.Top,
   Error extends Schema.Top,
   QueueR = never,
+  QueueIdentityR = never,
   HandlerR = never,
 >(
-  queue: TaskQueue.TaskQueue<Payload, Success, Error, QueueR>,
+  queue: TaskQueue.TaskQueue<Payload, Success, Error, QueueR, QueueIdentityR>,
   handler: TaskQueue.TaskHandler<Payload, Success, Error, HandlerR>,
   options: WorkerOptions = {},
-): Worker<Payload, Success, Error, QueueR, HandlerR> => ({
+): Worker<Payload, Success, Error, QueueR, QueueIdentityR, HandlerR> => ({
   [TypeId]: TypeId,
   queue,
   handler,
@@ -124,31 +132,35 @@ class WorkerSlotStopped extends Data.TaggedError("WorkerSlotStopped") {}
  * @category Operations
  * @since 0.3.0
  */
-export const run = <
+export const run = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
   QueueR,
+  QueueIdentityR,
   HandlerR,
 >(
-  worker: Worker<Payload, Success, Error, QueueR, HandlerR>,
-): Effect.Effect<
+  worker: Worker<Payload, Success, Error, QueueR, QueueIdentityR, HandlerR>,
+): Effect.fn.Return<
   never,
   never,
   | RedisConnectionRoles
+  | Crypto.Crypto
   | QueueR
   | HandlerR
   | Payload["DecodingServices"]
   | Success["EncodingServices"]
   | Error["EncodingServices"]
-> =>
-  Effect.scoped(
+> {
+  return yield* Effect.scoped(
     Effect.gen(function* () {
       const roles = yield* RedisConnectionRoles;
-      const workerEngine = yield* TaskEngine.makeWithRedis(roles.worker);
+      const workerEngine = yield* TaskEngine.makeWithRedis(roles.worker).pipe(
+        Effect.orDie,
+      );
       const maintenanceEngine = yield* TaskEngine.makeWithRedis(
         roles.maintenance,
-      );
+      ).pipe(Effect.orDie);
       const accepting = yield* Ref.make(true);
       const slots = yield* FiberSet.make<void, never>();
       const pollInterval = worker.options.pollInterval ?? Duration.seconds(1);
@@ -211,3 +223,4 @@ export const run = <
       return yield* Effect.never;
     }),
   );
+});

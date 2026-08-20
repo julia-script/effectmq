@@ -6,22 +6,11 @@
  *
  * @module
  */
-import { Context, Effect, Layer, Option } from "effect";
-import type { TaskIdentity } from "./Schemas.js";
-
-export interface TaskContext {
-  readonly currentTask?: TaskIdentity;
-}
-export const TaskContext = Context.Service<TaskContext>(
-  "~effectmq/TaskContext",
-);
-
-/** Provide a task context. Used by `TaskQueue.complete` around handler runs. */
-export const layer = (options: TaskContext = {}) =>
-  Layer.succeed(TaskContext, options);
+import * as Context from "effect/Context";
+import type { TaskIdentity } from "./TaskRecord.js";
 
 /** The identity of the task generation whose handler is running, if any. */
-export const currentTask: Effect.Effect<TaskIdentity | undefined> = Effect.map(
-  Effect.serviceOption(TaskContext),
-  (context) => (Option.isSome(context) ? context.value.currentTask : undefined),
+export const currentTask = Context.Reference<TaskIdentity | undefined>(
+  "@effectmq/core/TaskContext/currentTask",
+  { defaultValue: () => undefined },
 );

@@ -22,6 +22,25 @@ use local `redis-server` processes and are enabled with:
 EFFECTMQ_TEST_REDIS=local EFFECTMQ_TEST_SENTINEL=local pnpm test
 ```
 
+Effectful tests use `@effect/vitest`: use `it.effect` for isolated Effects and
+suite-scoped Layers for shared services. Do not call `Effect.runPromise` from a
+test or keep a module-level `ManagedRuntime`. Test resources must be acquired
+with `Effect.acquireRelease`; the lifecycle gate fails on leaked tracked
+resources or a finalizer timeout. Run `pnpm typecheck:test` when changing any
+test or `src/testing` support file.
+
+Use `TestClock` plus `Deferred`/latches for unit-level time and concurrency.
+Only Redis-owned TTL/restart/failover tests use real time; label those suites
+and prefer bounded polling with diagnostic timeouts over fixed sleeps.
+
+Production modules import supported narrow `effect/*` subpaths. Public
+Effect-returning functions pin exact success, error, and service channels and
+use `Effect.fnUntraced` for reusable generator implementations. Services are
+`Context.Service` classes with `@effectmq/core/<Service>` identifiers; optional
+fiber-local values are `Context.Reference`s. Use `TaskEngine.layerNoDeps()` for
+custom Redis composition and reserve `TaskEngine.layer()` for the complete Node
+live graph.
+
 Edit `src/lua/taskEngine.lua`, then run `pnpm gen:lua`; never hand-edit the
 generated TypeScript module. CI rejects generated drift. Add committed golden
 fixtures for any declared storage compatibility pair and property/fault tests

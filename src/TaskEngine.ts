@@ -9,6 +9,7 @@
  * @module
  */
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -17,19 +18,20 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import taskEngineScript from "./lua/taskEngine.js";
-import * as Observability from "./Observability.js";
-import { RedisPool, type RedisPoolService } from "./RedisPool.js";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   type EngineTask,
   type EngineTaskInsert,
   EngineTaskSchema,
   type EngineTerminalResult,
   EngineTerminalResultSchema,
-  type Event,
-  EventSchema,
-  UnknownFromMsgpack,
-} from "./Schemas.js";
+} from "./EngineRecord.js";
+import taskEngineScript from "./lua/taskEngine.js";
+import { UnknownFromMsgpack } from "./MessagePack.js";
+import * as NodeRedisPool from "./NodeRedisPool.js";
+import * as Observability from "./Observability.js";
+import { RedisPool, type RedisPoolService } from "./RedisPool.js";
+import { type Event, EventSchema } from "./TaskEvent.js";
 
 const TypeId = "~effectmq/TaskEngine" as const;
 
@@ -54,18 +56,72 @@ export type TaskEngineConfig = {
  * @since 0.3.0
  */
 export const maxMaintenanceBatchSize = 1_000;
+
+/** Predictable validation failure for task-engine configuration. */
+export class TaskEngineConfigurationError extends Data.TaggedError(
+  "TaskEngineConfigurationError",
+)<{
+  readonly field: "maintenanceBatchSize";
+  readonly constraint: string;
+  readonly actual: unknown;
+}> {}
+
+const validateConfig = (
+  config: TaskEngineConfig = {},
+): Effect.Effect<void, TaskEngineConfigurationError> => {
+  const maintenanceBatchSize = config.maintenanceBatchSize ?? 100;
+  return Number.isSafeInteger(maintenanceBatchSize) &&
+    maintenanceBatchSize >= 1 &&
+    maintenanceBatchSize <= maxMaintenanceBatchSize
+    ? Effect.void
+    : Effect.fail(
+        new TaskEngineConfigurationError({
+          field: "maintenanceBatchSize",
+          constraint: `an integer between 1 and ${maxMaintenanceBatchSize}`,
+          actual: maintenanceBatchSize,
+        }),
+      );
+};
 /**
  * Wraps a Redis, script, encoding, or decoding failure at the engine boundary.
  *
  * @category Errors
  * @since 0.1.0
  */
+export type TaskEngineErrorReason =
+  | { readonly _tag: "TransportFailure"; readonly operation: string }
+  | { readonly _tag: "ScriptFailure"; readonly operation: string }
+  | {
+      readonly _tag: "InvalidReply";
+      readonly operation: string;
+      readonly expected: string;
+    }
+  | {
+      readonly _tag: "RelationshipLimit";
+      readonly scope: "holder" | "retained";
+      readonly maxCount: number;
+    }
+  | { readonly _tag: "IndeterminateCommit"; readonly operation: string }
+  | { readonly _tag: "LeaseLost"; readonly operation: string };
+
 export class TaskEngineError extends Data.TaggedError("TaskEngineError")<{
-  readonly message?: string;
+  readonly reason: TaskEngineErrorReason;
   readonly cause: unknown;
 }> {
-  static of(message: string) {
-    return (cause: unknown) => new TaskEngineError({ cause, message });
+  static invalidReply(operation: string, expected: string) {
+    return (cause: unknown) =>
+      new TaskEngineError({
+        reason: { _tag: "InvalidReply", operation, expected },
+        cause,
+      });
+  }
+
+  static redis(operation: string, mutating = false) {
+    return (cause: unknown) =>
+      new TaskEngineError({
+        reason: classifyRedisFailure(operation, mutating, cause),
+        cause,
+      });
   }
 }
 
@@ -153,18 +209,49 @@ export class CursorExpired extends Data.TaggedError("CursorExpired")<{
   readonly earliest: string;
 }> {}
 
-const causeText = (cause: unknown, depth = 0): string => {
+const diagnosticText = (cause: unknown, depth = 0): string => {
   if (depth >= 6) return String(cause);
   if (typeof cause !== "object" || cause === null) return String(cause);
 
   const parts = [String(cause)];
   if ("message" in cause) parts.push(String(cause.message));
-  if ("cause" in cause) parts.push(causeText(cause.cause, depth + 1));
+  if ("cause" in cause) parts.push(diagnosticText(cause.cause, depth + 1));
   return parts.join(" ");
 };
 
+const transportPattern =
+  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket closed|connection (?:is )?closed|connection lost|read only/i;
+
+const classifyRedisFailure = (
+  operation: string,
+  mutating: boolean,
+  cause: unknown,
+): TaskEngineErrorReason => {
+  const diagnostic = diagnosticText(cause);
+  const relationship = diagnostic.match(
+    /STORAGE_RELATIONSHIP_LIMIT (holder|retained) (\d+)/,
+  );
+  if (relationship) {
+    return {
+      _tag: "RelationshipLimit",
+      scope: relationship[1] as "holder" | "retained",
+      maxCount: Number(relationship[2]),
+    };
+  }
+  if (diagnostic.includes("LEASE_LOST")) {
+    return { _tag: "LeaseLost", operation };
+  }
+  if (transportPattern.test(diagnostic)) {
+    return {
+      _tag: mutating ? "IndeterminateCommit" : "TransportFailure",
+      operation,
+    };
+  }
+  return { _tag: "ScriptFailure", operation };
+};
+
 const isLeaseLost = (error: TaskEngineError) =>
-  causeText(error.cause).includes("LEASE_LOST");
+  error.reason._tag === "LeaseLost";
 
 const compareStreamIds = (left: string, right: string): number => {
   const [leftTime = "0", leftSequence = "0"] = left.split("-");
@@ -266,7 +353,7 @@ export class TaskEngine extends Context.Service<
     readonly takeTask: (
       prefix: string,
       lockTimeout: number,
-    ) => Effect.Effect<TaskAttempt | null, TaskEngineError>;
+    ) => Effect.Effect<TaskAttempt | null, TaskEngineError, Crypto.Crypto>;
     /** Removes an unretained task generation and all queue memberships. */
     readonly removeTask: (
       prefix: string,
@@ -307,7 +394,7 @@ export class TaskEngine extends Context.Service<
       TaskEngineError | CursorExpired | Schema.SchemaError
     >;
   }
->()("TaskEngine") {}
+>()("@effectmq/core/TaskEngine") {}
 
 /**
  * The service interface represented by the {@link TaskEngine} tag.
@@ -335,7 +422,7 @@ export const setMockTime = (time: Duration.Input) =>
   Effect.gen(function* () {
     const redis = yield* RedisPool;
     yield* redis.send("SET", MOCKTIME_KEY, String(Duration.toMillis(time)));
-  }).pipe(Effect.mapError(TaskEngineError.of("Failed to set mock time")));
+  }).pipe(Effect.mapError(TaskEngineError.redis("setMockTime", true)));
 
 /**
  * Advances the Redis-global mock clock by a duration.
@@ -349,40 +436,120 @@ export const stepMockTime = (time: Duration.Input) =>
   Effect.gen(function* () {
     const redis = yield* RedisPool;
     yield* redis.send("INCRBY", MOCKTIME_KEY, String(Duration.toMillis(time)));
-  }).pipe(Effect.mapError(TaskEngineError.of("Failed to step mock time")));
+  }).pipe(Effect.mapError(TaskEngineError.redis("stepMockTime", true)));
 
-const asText = (value: unknown): string =>
-  typeof value === "string"
-    ? value
-    : Buffer.from(value as Uint8Array).toString("utf8");
+const invalidReply = (operation: string, expected: string, received: unknown) =>
+  new TaskEngineError({
+    reason: { _tag: "InvalidReply", operation, expected },
+    cause: { received },
+  });
 
-/** Fold a flat `[k1, v1, k2, v2, ...]` reply into a record, keys as utf8. */
-const entriesToRecord = (entries: ReadonlyArray<unknown>) => {
-  const record: Record<string, unknown> = {};
-  for (let i = 0; i < entries.length; i += 2) {
-    record[asText(entries[i])] = entries[i + 1];
+const decodeText = (
+  operation: string,
+  value: unknown,
+): Effect.Effect<string, TaskEngineError> => {
+  if (typeof value === "string") return Effect.succeed(value);
+  if (value instanceof Uint8Array) {
+    return Effect.try({
+      try: () => Buffer.from(value).toString("utf8"),
+      catch: (cause) =>
+        new TaskEngineError({
+          reason: {
+            _tag: "InvalidReply",
+            operation,
+            expected: "UTF-8 text bytes",
+          },
+          cause,
+        }),
+    });
   }
-  return record;
+  return Effect.fail(invalidReply(operation, "text or Uint8Array", value));
 };
 
-/** Decode a flat `["id", id, "name", name, ...]` raw-entry reply from Lua. */
-const parseTask = (task: ReadonlyArray<unknown>) =>
-  Schema.decodeUnknownEffect(EngineTaskSchema)(entriesToRecord(task)).pipe(
-    Effect.mapError(TaskEngineError.of("Failed to decode task")),
+const decodeNumber = (
+  operation: string,
+  value: unknown,
+): Effect.Effect<number, TaskEngineError> =>
+  Effect.gen(function* () {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    const text = yield* decodeText(operation, value);
+    const decoded = Number(text);
+    return Number.isFinite(decoded)
+      ? decoded
+      : yield* invalidReply(operation, "a finite number", value);
+  });
+
+const decodeArray = (
+  operation: string,
+  value: unknown,
+): Effect.Effect<ReadonlyArray<unknown>, TaskEngineError> =>
+  Array.isArray(value)
+    ? Effect.succeed(value)
+    : Effect.fail(invalidReply(operation, "an array", value));
+
+const decodeTuple = (
+  operation: string,
+  value: unknown,
+  length: number,
+): Effect.Effect<ReadonlyArray<unknown>, TaskEngineError> =>
+  Effect.flatMap(decodeArray(operation, value), (items) =>
+    items.length === length
+      ? Effect.succeed(items)
+      : Effect.fail(
+          invalidReply(operation, `an array of length ${length}`, value),
+        ),
   );
 
-const parseTerminalResult = (result: ReadonlyArray<unknown>) =>
-  Schema.decodeUnknownEffect(EngineTerminalResultSchema)(
-    entriesToRecord(result),
-  ).pipe(
-    Effect.mapError(TaskEngineError.of("Failed to decode terminal result")),
+/** Fold a flat `[k1, v1, k2, v2, ...]` reply into a prototype-safe record. */
+const entriesToRecord = Effect.fnUntraced(function* (
+  operation: string,
+  value: unknown,
+) {
+  const entries = yield* decodeArray(operation, value);
+  if (entries.length % 2 !== 0) {
+    return yield* invalidReply(
+      operation,
+      "an even-length field/value array",
+      value,
+    );
+  }
+  const record: Record<string, unknown> = Object.create(null);
+  for (let index = 0; index < entries.length; index += 2) {
+    record[yield* decodeText(operation, entries[index])] = entries[index + 1];
+  }
+  return record;
+});
+
+/** Decode a flat `["id", id, "name", name, ...]` raw-entry reply from Lua. */
+const parseTask = Effect.fnUntraced(function* (task: unknown) {
+  const record = yield* entriesToRecord("decodeTask", task);
+  return yield* Schema.decodeUnknownEffect(EngineTaskSchema)(record).pipe(
+    Effect.mapError(TaskEngineError.invalidReply("decodeTask", "task record")),
   );
+});
+
+const parseTerminalResult = Effect.fnUntraced(function* (result: unknown) {
+  const record = yield* entriesToRecord("decodeTerminalResult", result);
+  return yield* Schema.decodeUnknownEffect(EngineTerminalResultSchema)(
+    record,
+  ).pipe(
+    Effect.mapError(
+      TaskEngineError.invalidReply("decodeTerminalResult", "terminal result"),
+    ),
+  );
+});
 
 const packUnknown = Schema.encodeEffect(UnknownFromMsgpack);
 /** Encode a structured value as msgpack bytes for a script argument. */
 const pack = (value: unknown) =>
   packUnknown(value).pipe(
-    Effect.mapError(TaskEngineError.of("Failed to encode value")),
+    Effect.mapError(
+      (cause) =>
+        new TaskEngineError({
+          reason: { _tag: "ScriptFailure", operation: "encodeScriptArgument" },
+          cause,
+        }),
+    ),
   );
 
 const decodeEvents = Schema.decodeUnknownEffect(Schema.Array(EventSchema));
@@ -419,24 +586,14 @@ export const makeWithRedis = (
   }: TaskEngineConfig = {},
 ) =>
   Effect.gen(function* () {
-    if (
-      !Number.isSafeInteger(maintenanceBatchSize) ||
-      maintenanceBatchSize < 1 ||
-      maintenanceBatchSize > maxMaintenanceBatchSize
-    ) {
-      return yield* Effect.die(
-        new RangeError(
-          `maintenanceBatchSize must be an integer between 1 and ${maxMaintenanceBatchSize}`,
-        ),
-      );
-    }
+    yield* validateConfig({ maintenanceBatchSize });
     const debugFlag = debugMode ? "1" : "0";
     const withPrefix = (key: string) => `${prefix}:${key}`;
 
     // Every operation receives its name followed by the debug flag and its
     // own arguments. The Lua dispatcher preserves the operation-local layout.
     const call =
-      <A = unknown>(name: string, message: string) =>
+      <A = unknown>(name: string, mutating = false) =>
       (...args: ReadonlyArray<string | Uint8Array>) =>
         redis
           .evalScript<A>(
@@ -447,11 +604,11 @@ export const makeWithRedis = (
             String(maintenanceBatchSize),
             ...args,
           )
-          .pipe(Effect.mapError(TaskEngineError.of(message)));
+          .pipe(Effect.mapError(TaskEngineError.redis(name, mutating)));
 
     // binary replies: these functions return msgpack-encoded tasks
     const callBinary =
-      <A = unknown>(name: string, message: string) =>
+      <A = unknown>(name: string, mutating = false) =>
       (...args: ReadonlyArray<string | Uint8Array>) =>
         redis
           .evalScript<A>(
@@ -462,61 +619,24 @@ export const makeWithRedis = (
             String(maintenanceBatchSize),
             ...args,
           )
-          .pipe(Effect.mapError(TaskEngineError.of(message)));
+          .pipe(Effect.mapError(TaskEngineError.redis(name, mutating)));
 
-    const createTaskFn = callBinary<
-      readonly [unknown, unknown, ReadonlyArray<unknown>]
-    >("effectmq_createTask", "Failed to create task");
-    const getTaskFn = callBinary<ReadonlyArray<unknown> | null>(
-      "effectmq_getTask",
-      "Failed to get task",
-    );
-    const getGenerationFn = call<number>(
-      "effectmq_getGeneration",
-      "Failed to read task generation",
-    );
-    const getResultFn = callBinary<ReadonlyArray<unknown> | null>(
-      "effectmq_getResult",
-      "Failed to get terminal result",
-    );
-    const takeTaskFn = callBinary<
-      readonly [unknown, ReadonlyArray<unknown>] | null
-    >("effectmq_takeTask", "Failed to take task");
-    const writeSuccessFn = call(
-      "effectmq_writeSuccess",
-      "Failed to write success result",
-    );
-    const writeErrorFn = call(
-      "effectmq_writeError",
-      "Failed to write error result",
-    );
-    const removeTaskFn = call("effectmq_removeTask", "Failed to remove task");
-    const forceRemoveTaskFn = call(
-      "effectmq_forceRemoveTask",
-      "Failed to force-remove task",
-    );
-    const extendLockFn = call("effectmq_extendLock", "Failed to extend lock");
-    const removeLockFn = call("effectmq_removeLock", "Failed to remove lock");
-    const setScheduleFn = call<number>(
-      "effectmq_setSchedule",
-      "Failed to set schedule",
-    );
-    const consumeScheduleFn = call<[0 | 1, number | null]>(
-      "effectmq_consumeSchedule",
-      "Failed to consume schedule",
-    );
-    const listTasksFn = call<readonly [string, ...string[]]>(
-      "effectmq_listTasks",
-      "Failed to list tasks",
-    );
-    const maintainFn = call<readonly number[]>(
-      "effectmq_maintain",
-      "Failed to maintain queue",
-    );
-    const eventCursorsFn = call<readonly [string, string, string]>(
-      "effectmq_eventCursors",
-      "Failed to read event cursors",
-    );
+    const createTaskFn = callBinary("effectmq_createTask", true);
+    const getTaskFn = callBinary("effectmq_getTask");
+    const getGenerationFn = call("effectmq_getGeneration");
+    const getResultFn = callBinary("effectmq_getResult");
+    const takeTaskFn = callBinary("effectmq_takeTask", true);
+    const writeSuccessFn = call("effectmq_writeSuccess", true);
+    const writeErrorFn = call("effectmq_writeError", true);
+    const removeTaskFn = call("effectmq_removeTask", true);
+    const forceRemoveTaskFn = call("effectmq_forceRemoveTask", true);
+    const extendLockFn = call("effectmq_extendLock", true);
+    const removeLockFn = call("effectmq_removeLock", true);
+    const setScheduleFn = call("effectmq_setSchedule", true);
+    const consumeScheduleFn = call("effectmq_consumeSchedule", true);
+    const listTasksFn = call("effectmq_listTasks");
+    const maintainFn = call("effectmq_maintain", true);
+    const eventCursorsFn = call("effectmq_eventCursors");
 
     const withLeaseFence = <A>(
       operation: Effect.Effect<A, TaskEngineError>,
@@ -584,10 +704,23 @@ export const makeWithRedis = (
         String(task.deadLetterRetentionMs ?? 30 * 24 * 60 * 60 * 1000),
         String(task.eventRetentionMs ?? 7 * 24 * 60 * 60 * 1000),
       );
+      const [rawStatus, rawCursor, rawTask] = yield* decodeTuple(
+        "effectmq_createTask",
+        reply,
+        3,
+      );
+      const status = yield* decodeText("effectmq_createTask.status", rawStatus);
+      if (status !== "created" && status !== "existing") {
+        return yield* invalidReply(
+          "effectmq_createTask.status",
+          '"created" or "existing"',
+          rawStatus,
+        );
+      }
       return {
-        status: asText(reply[0]) as TaskCreateResult["status"],
-        cursor: asText(reply[1]),
-        task: yield* parseTask(reply[2]),
+        status,
+        cursor: yield* decodeText("effectmq_createTask.cursor", rawCursor),
+        task: yield* parseTask(rawTask),
       } satisfies TaskCreateResult;
     });
 
@@ -599,9 +732,14 @@ export const makeWithRedis = (
 
       getTask: Effect.fnUntraced(function* (prefix: string, id: string) {
         const reply = yield* getTaskFn(withPrefix(prefix), id);
-        return reply ? yield* parseTask(reply) : null;
+        return reply === null ? null : yield* parseTask(reply);
       }),
-      getGeneration: (prefix, id) => getGenerationFn(withPrefix(prefix), id),
+      getGeneration: (prefix, id) =>
+        getGenerationFn(withPrefix(prefix), id).pipe(
+          Effect.flatMap((reply) =>
+            decodeNumber("effectmq_getGeneration", reply),
+          ),
+        ),
       getResult: Effect.fnUntraced(function* (
         prefix: string,
         id: string,
@@ -612,7 +750,7 @@ export const makeWithRedis = (
           id,
           String(generation),
         );
-        return reply ? yield* parseTerminalResult(reply) : null;
+        return reply === null ? null : yield* parseTerminalResult(reply);
       }),
       writeSuccess: Effect.fnUntraced(function* (
         prefix: string,
@@ -666,17 +804,32 @@ export const makeWithRedis = (
           limit > 1_000
         ) {
           return yield* new TaskEngineError({
-            message: "Invalid task-list page",
+            reason: {
+              _tag: "InvalidReply",
+              operation: "listTasks",
+              expected: "a non-negative cursor and limit between 1 and 1000",
+            },
             cause: new RangeError(
               "cursor must be a non-negative integer and limit must be between 1 and 1000",
             ),
           });
         }
-        const [nextCursor, ...items] = yield* listTasksFn(
+        const rawItems = yield* listTasksFn(
           withPrefix(prefix),
           list,
           cursor,
           String(limit),
+        );
+        const [rawNextCursor, ...rawTaskIds] = yield* decodeArray(
+          "effectmq_listTasks",
+          rawItems,
+        );
+        const nextCursor = yield* decodeText(
+          "effectmq_listTasks.cursor",
+          rawNextCursor,
+        );
+        const items = yield* Effect.forEach(rawTaskIds, (item) =>
+          decodeText("effectmq_listTasks.taskId", item),
         );
         return {
           items,
@@ -684,7 +837,7 @@ export const makeWithRedis = (
         };
       }),
       maintain: Effect.fnUntraced(function* (prefix: string) {
-        const values = yield* maintainFn(withPrefix(prefix)).pipe(
+        const reply = yield* maintainFn(withPrefix(prefix)).pipe(
           Effect.tapError((error) =>
             Effect.all([
               Metric.update(
@@ -700,43 +853,76 @@ export const makeWithRedis = (
             ]).pipe(Effect.asVoid),
           ),
         );
+        const values = yield* decodeTuple("effectmq_maintain", reply, 7);
+        const numbers = yield* Effect.forEach(values, (value) =>
+          decodeNumber("effectmq_maintain", value),
+        );
         const health: Observability.QueueHealth = {
-          depth: Number(values[0] ?? 0),
-          oldestTaskAgeMs: Number(values[1] ?? 0),
-          sweepLagMs: Number(values[2] ?? 0),
-          dueBacklog: Number(values[3] ?? 0),
-          expiredLeaseBacklog: Number(values[4] ?? 0),
-          retentionBacklog: Number(values[5] ?? 0),
-          processed: Number(values[6] ?? 0),
+          depth: numbers[0],
+          oldestTaskAgeMs: numbers[1],
+          sweepLagMs: numbers[2],
+          dueBacklog: numbers[3],
+          expiredLeaseBacklog: numbers[4],
+          retentionBacklog: numbers[5],
+          processed: numbers[6],
         };
         yield* Observability.recordQueueHealth(prefix, health);
         return health;
       }),
-      eventCursors: (prefix) =>
-        eventCursorsFn(withPrefix(prefix)).pipe(
-          Effect.map(([first, earliest, latest]) => ({
-            first: asText(first),
-            earliest: asText(earliest),
-            latest: asText(latest),
-          })),
-        ),
+      eventCursors: Effect.fnUntraced(function* (prefix: string) {
+        const [first, earliest, latest] = yield* eventCursorsFn(
+          withPrefix(prefix),
+        ).pipe(
+          Effect.flatMap((reply) =>
+            decodeTuple("effectmq_eventCursors", reply, 3),
+          ),
+        );
+        return {
+          first: yield* decodeText("effectmq_eventCursors.first", first),
+          earliest: yield* decodeText(
+            "effectmq_eventCursors.earliest",
+            earliest,
+          ),
+          latest: yield* decodeText("effectmq_eventCursors.latest", latest),
+        };
+      }),
       takeTask: Effect.fnUntraced(function* (
         prefix: string,
         lockTimeout: number,
       ) {
-        const leaseToken = `lease/${crypto.randomUUID()}`;
+        const crypto = yield* Crypto.Crypto;
+        const leaseToken = yield* crypto.randomUUIDv4.pipe(
+          Effect.map((uuid) => `lease/${uuid}`),
+          Effect.mapError(
+            (cause) =>
+              new TaskEngineError({
+                reason: {
+                  _tag: "ScriptFailure",
+                  operation: "generateLeaseToken",
+                },
+                cause,
+              }),
+          ),
+        );
         const reply = yield* takeTaskFn(
           withPrefix(prefix),
           leaseToken,
           String(lockTimeout),
         );
 
-        return reply
-          ? ({
-              leaseToken: asText(reply[0]),
-              task: yield* parseTask(reply[1]),
-            } satisfies TaskAttempt)
-          : null;
+        if (reply === null) return null;
+        const [rawLeaseToken, rawTask] = yield* decodeTuple(
+          "effectmq_takeTask",
+          reply,
+          2,
+        );
+        return {
+          leaseToken: yield* decodeText(
+            "effectmq_takeTask.leaseToken",
+            rawLeaseToken,
+          ),
+          task: yield* parseTask(rawTask),
+        } satisfies TaskAttempt;
       }),
       removeTask: (prefix, id) =>
         removeTaskFn(withPrefix(prefix), id).pipe(Effect.asVoid),
@@ -757,6 +943,9 @@ export const makeWithRedis = (
         ).pipe(Effect.asVoid),
       setSchedule: (name, next) => {
         return setScheduleFn(prefix, name, String(next.getTime())).pipe(
+          Effect.flatMap((reply) =>
+            decodeNumber("effectmq_setSchedule", reply),
+          ),
           Effect.map((next) => new Date(next)),
         );
       },
@@ -767,10 +956,38 @@ export const makeWithRedis = (
           String(toConsume.getTime()),
           String(next.getTime()),
         ).pipe(
-          Effect.map(([consumed, next]) => ({
-            consumed: consumed === 1,
-            next: next ? new Date(next) : undefined,
-          })),
+          Effect.flatMap((reply) =>
+            Effect.gen(function* () {
+              const values = yield* decodeArray(
+                "effectmq_consumeSchedule",
+                reply,
+              );
+              if (values.length < 1 || values.length > 2) {
+                return yield* invalidReply(
+                  "effectmq_consumeSchedule",
+                  "a one- or two-item tuple",
+                  reply,
+                );
+              }
+              const consumed = yield* decodeNumber(
+                "effectmq_consumeSchedule.consumed",
+                values[0],
+              );
+              const rawNext = values[1];
+              return {
+                consumed: consumed === 1,
+                next:
+                  rawNext === null || rawNext === undefined
+                    ? undefined
+                    : new Date(
+                        yield* decodeNumber(
+                          "effectmq_consumeSchedule.next",
+                          rawNext,
+                        ),
+                      ),
+              };
+            }),
+          ),
         );
       },
 
@@ -790,13 +1007,27 @@ export const makeWithRedis = (
         // replies with [stream, entries] tuples, node-redis with a Map
         // (binary type mapping) or an object keyed by stream name.
         // Normalize to the entry list of the single stream we read.
-        const entriesOf = (
-          reply: unknown,
-        ): ReadonlyArray<[unknown, ReadonlyArray<unknown>]> => {
-          if (reply instanceof Map) return [...reply.values()][0];
-          if (Array.isArray(reply)) return reply[0][1];
-          return Object.values(reply as object)[0];
-        };
+        const entriesOf = Effect.fnUntraced(function* (reply: unknown) {
+          let rawEntries: unknown;
+          if (reply instanceof Map) {
+            rawEntries = [...reply.values()][0];
+          } else {
+            const streams = yield* decodeArray("xread", reply);
+            const stream = yield* decodeTuple("xread.stream", streams[0], 2);
+            rawEntries = stream[1];
+          }
+          const entries = yield* decodeArray("xread.entries", rawEntries);
+          if (entries.length === 0) {
+            return yield* invalidReply(
+              "xread.entries",
+              "at least one stream entry",
+              reply,
+            );
+          }
+          return yield* Effect.forEach(entries, (entry) =>
+            decodeTuple("xread.entry", entry, 2),
+          );
+        });
 
         const readFrom = (cursor: string) =>
           Stream.paginate(cursor, (cursor) =>
@@ -814,7 +1045,7 @@ export const makeWithRedis = (
                   cursor,
                 )
                 .pipe(
-                  Effect.mapError(TaskEngineError.of("Failed to poll stream")),
+                  Effect.mapError(TaskEngineError.redis("xread")),
                   Effect.repeat({
                     until: (value) => !!value,
                   }),
@@ -824,46 +1055,59 @@ export const makeWithRedis = (
               // "new:"/"existing:" prefixed fields are task snapshots, the
               // rest is the tag-specific payload (values stay raw bytes — the
               // event schema decodes scalars and msgpack blobs per field)
-              const records = entriesOf(reply).map(([entryId, fields]) => {
-                const flat: Record<string, unknown> = {};
-                const newTask: Record<string, unknown> = {};
-                const existingTask: Record<string, unknown> = {};
-                for (let i = 0; i < fields.length; i += 2) {
-                  const key = asText(fields[i]);
-                  const value = fields[i + 1];
-                  if (key.startsWith("new:")) {
-                    newTask[key.slice("new:".length)] = value;
-                  } else if (key.startsWith("existing:")) {
-                    existingTask[key.slice("existing:".length)] = value;
-                  } else {
-                    flat[key] = value;
+              const entries = yield* entriesOf(reply);
+              const records = yield* Effect.forEach(entries, (entry) =>
+                Effect.gen(function* () {
+                  const [entryId, rawFields] = entry;
+                  const fields = yield* decodeArray("xread.fields", rawFields);
+                  if (fields.length % 2 !== 0) {
+                    return yield* invalidReply(
+                      "xread.fields",
+                      "an even-length field/value array",
+                      rawFields,
+                    );
                   }
-                }
-                const {
-                  taskId,
-                  generation,
-                  protocolVersion,
-                  schemaId,
-                  _tag,
-                  ...payloadFields
-                } = flat;
-                const tag = asText(_tag);
-                const payload =
-                  tag === "task.created"
-                    ? { ...payloadFields, newTask }
-                    : tag === "task.updated"
-                      ? { ...payloadFields, existingTask, newTask }
-                      : payloadFields;
-                return {
-                  id: asText(entryId),
-                  taskId: asText(taskId),
-                  generation,
-                  protocolVersion,
-                  schemaId,
-                  _tag: tag,
-                  payload,
-                };
-              });
+                  const flat: Record<string, unknown> = Object.create(null);
+                  const newTask: Record<string, unknown> = Object.create(null);
+                  const existingTask: Record<string, unknown> =
+                    Object.create(null);
+                  for (let i = 0; i < fields.length; i += 2) {
+                    const key = yield* decodeText("xread.fieldName", fields[i]);
+                    const value = fields[i + 1];
+                    if (key.startsWith("new:")) {
+                      newTask[key.slice("new:".length)] = value;
+                    } else if (key.startsWith("existing:")) {
+                      existingTask[key.slice("existing:".length)] = value;
+                    } else {
+                      flat[key] = value;
+                    }
+                  }
+                  const {
+                    taskId,
+                    generation,
+                    protocolVersion,
+                    schemaId,
+                    _tag,
+                    ...payloadFields
+                  } = flat;
+                  const tag = yield* decodeText("xread.tag", _tag);
+                  const payload =
+                    tag === "task.created"
+                      ? { ...payloadFields, newTask }
+                      : tag === "task.updated"
+                        ? { ...payloadFields, existingTask, newTask }
+                        : payloadFields;
+                  return {
+                    id: yield* decodeText("xread.entryId", entryId),
+                    taskId: yield* decodeText("xread.taskId", taskId),
+                    generation,
+                    protocolVersion,
+                    schemaId,
+                    _tag: tag,
+                    payload,
+                  };
+                }),
+              );
 
               const events = yield* decodeEvents(records).pipe(
                 Effect.tapError((error) => Effect.log(error.toString())),
@@ -879,11 +1123,18 @@ export const makeWithRedis = (
           Effect.gen(function* () {
             const [first, earliest, latest] = yield* eventCursorsFn(
               withPrefix(name),
+            ).pipe(
+              Effect.flatMap((reply) =>
+                decodeTuple("effectmq_eventCursors", reply, 3),
+              ),
             );
             const cursors = {
-              first: asText(first),
-              earliest: asText(earliest),
-              latest: asText(latest),
+              first: yield* decodeText("effectmq_eventCursors.first", first),
+              earliest: yield* decodeText(
+                "effectmq_eventCursors.earliest",
+                earliest,
+              ),
+              latest: yield* decodeText("effectmq_eventCursors.latest", latest),
             };
             const cursor = options.cursor ?? cursors.latest;
             const streamWasTrimmed =
@@ -914,15 +1165,34 @@ export const makeWithRedis = (
  */
 export const make = (config?: TaskEngineConfig) =>
   Effect.gen(function* () {
+    yield* validateConfig(config);
     const redis = yield* RedisPool;
     return yield* makeWithRedis(redis, config);
   });
 
 /**
  * Provides {@link TaskEngine} from an ambient {@link RedisPool} service.
+ * Use this for custom Redis implementations and test layers.
  *
  * @category Layers
  * @since 0.1.0
  */
-export const layer = (config?: TaskEngineConfig) =>
+export const layerNoDeps = (config?: TaskEngineConfig) =>
   Layer.effect(TaskEngine, make(config));
+
+/** Configuration for the standard Node.js live service graph. */
+export interface LiveConfig {
+  readonly engine?: TaskEngineConfig;
+  readonly redis?: NodeRedisPool.RedisConfig;
+}
+
+/**
+ * Provides a complete Node.js live graph: Redis connections, connection
+ * roles and health, Crypto, and the task engine.
+ */
+export const layer = (config: LiveConfig = {}) =>
+  layerNoDeps(config.engine).pipe(
+    Layer.provideMerge(
+      Layer.merge(NodeRedisPool.layer(config.redis), NodeCrypto.layer),
+    ),
+  );

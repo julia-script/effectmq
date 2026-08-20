@@ -11,7 +11,7 @@ cursor only after the offer. A normal `Worker` executes the task with the
 queue's leases, retries, failure policy, and at-least-once delivery.
 
 ```ts
-const schedule = Scheduler.make({
+const schedule = yield* Scheduler.make({
   name: "nightly-report",
   cron: Cron.parseUnsafe("0 2 * * *", "America/Sao_Paulo"),
   queue: reports,
@@ -36,3 +36,7 @@ process loss. A scheduler outage does not lose the Redis cursor; on restart the
 configured missed policy decides what to materialize. Scheduler availability
 does not imply worker availability, and the reverse is also true. Monitor both
 cursor lag and target queue age.
+
+When `materializeDue` is called without `now`, it reads Effect's `Clock` when
+the Effect executes. Tests may pass an explicit instant; construction time and
+ambient `Date.now` do not influence materialization.

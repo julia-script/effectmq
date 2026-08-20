@@ -6,25 +6,28 @@
  *
  * @module
  */
-import { Schedule, Stream } from "effect";
+import * as Clock from "effect/Clock";
+import type * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Function from "effect/Function";
 import * as Result from "effect/Result";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import type { EngineTerminalResult } from "./EngineRecord.js";
+import { nextRunAt } from "./RetrySchedule.js";
 import {
   type CompletionPolicy,
   decodeTask,
-  type EngineTerminalResult,
   TaskErrorSchema,
-} from "./Schemas.js";
+} from "./TaskRecord.js";
 import * as StorageProtocol from "./StorageProtocol.js";
 import type * as Task from "./Task.js";
 import * as TaskContext from "./TaskContext.js";
 import * as TaskEngine from "./TaskEngine.js";
-import { nextRunAt } from "./utils.js";
 
 const TypeId = "~effectmq/TaskQueue" as const;
 
@@ -42,10 +45,11 @@ export interface TaskQueue<
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
   R = never,
+  IdentityR = Crypto.Crypto,
 > {
   readonly [TypeId]: typeof TypeId;
   readonly name: string;
-  readonly task: Task.TaskDefinition<Payload, Success, Error, R>;
+  readonly task: Task.TaskDefinition<Payload, Success, Error, R, IdentityR>;
 }
 /**
  * Creates a typed queue descriptor from a stable name and task definition.
@@ -58,10 +62,11 @@ export const make = <
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
   R = never,
+  IdentityR = never,
 >(
   name: string,
-  taskDefinition: Task.TaskDefinition<Payload, Success, Error, R>,
-): TaskQueue<Payload, Success, Error, R> => {
+  taskDefinition: Task.TaskDefinition<Payload, Success, Error, R, IdentityR>,
+): TaskQueue<Payload, Success, Error, R, IdentityR> => {
   return {
     [TypeId]: TypeId,
     name,
@@ -95,15 +100,20 @@ const takeAvailable = Effect.fnUntraced(function* <
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
   R = never,
+  IdentityR = never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
   options?: TakeOptions,
 ): Effect.fn.Return<
   TaskAttempt<Payload, Success, Error> | null,
   | StorageProtocol.StorageProtocolError
   | TaskEngine.TaskEngineError
   | Schema.SchemaError,
-  TaskEngine.TaskEngine | Payload["DecodingServices"]
+  | TaskEngine.TaskEngine
+  | Crypto.Crypto
+  | Payload["DecodingServices"]
+  | Success["DecodingServices"]
+  | Error["DecodingServices"]
 > {
   const engine = yield* TaskEngine.TaskEngine;
   const poolInterval = Duration.toMillis(
@@ -137,7 +147,11 @@ const takeUnsafe = Effect.fnUntraced(function* <
   Success extends Schema.Top = Schema.Void,
   Error extends Schema.Top = Schema.Never,
   R = never,
->(queue: TaskQueue<Payload, Success, Error, R>, options?: TakeOptions) {
+  IdentityR = never,
+>(
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
+  options?: TakeOptions,
+) {
   const attempt = yield* takeAvailable(queue, options);
   if (attempt === null) {
     return yield* Effect.die("Polling take unexpectedly returned null");
@@ -197,37 +211,6 @@ export class RetentionContextRequired extends Data.TaggedError(
   readonly queue: string;
   readonly taskId: string;
 }> {}
-
-const causeText = (cause: unknown, depth = 0): string => {
-  if (depth >= 4) return String(cause);
-  if (typeof cause !== "object" || cause === null || !("cause" in cause)) {
-    return String(cause);
-  }
-  return `${String(cause)} ${causeText(cause.cause, depth + 1)}`;
-};
-
-const isIndeterminateConnectionFailure = (
-  error: TaskEngine.TaskEngineError,
-): boolean =>
-  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket closed|connection (?:is )?closed|connection lost|read only/i.test(
-    causeText(error.cause),
-  );
-
-const relationshipLimit = (
-  error: TaskEngine.TaskEngineError,
-): StorageProtocol.StorageCountLimitExceeded | undefined => {
-  const match = causeText(error.cause).match(
-    /STORAGE_RELATIONSHIP_LIMIT (holder|retained) (\d+)/,
-  );
-  if (!match) return undefined;
-  const maxCount = Number(match[2]);
-  return new StorageProtocol.StorageCountLimitExceeded({
-    resource: "relationships",
-    scope: match[1] as "holder" | "retained",
-    actualCount: maxCount,
-    maxCount,
-  });
-};
 
 declare const TaskHandleSuccess: unique symbol;
 declare const TaskHandleError: unique symbol;
@@ -301,6 +284,89 @@ export class CallerTimeout extends Data.TaggedError("CallerTimeout")<{
   readonly timeout: Duration.Input;
 }> {}
 
+/** Recoverable failures produced while offering a task generation. */
+export type OfferError =
+  | IndeterminateWriteError
+  | RetentionContextRequired
+  | Task.TaskIdentityGenerationError
+  | StorageProtocol.StorageProtocolError
+  | TaskEngine.TaskEngineError
+  | Schema.SchemaError;
+
+/** Services required to encode an offer and decode its returned task record. */
+export type OfferRequirements<
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+  IdentityR,
+> =
+  | TaskEngine.TaskEngine
+  | Payload["EncodingServices"]
+  | Payload["DecodingServices"]
+  | Success["DecodingServices"]
+  | Error["DecodingServices"]
+  | IdentityR;
+
+/** Infrastructure and codec failures produced while completing an attempt. */
+export type CompleteError =
+  | StorageProtocol.StorageProtocolError
+  | TaskEngine.LeaseLost
+  | TaskEngine.TaskEngineError
+  | Schema.SchemaError;
+
+/** Services required by completion, including handler and retry environments. */
+export type CompleteRequirements<
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+  QueueR,
+  HandlerR,
+> =
+  | TaskEngine.TaskEngine
+  | Crypto.Crypto
+  | QueueR
+  | HandlerR
+  | Payload["DecodingServices"]
+  | Success["DecodingServices"]
+  | Error["DecodingServices"]
+  | Success["EncodingServices"]
+  | Error["EncodingServices"];
+
+/** Recoverable terminal-protocol failures produced by {@link wait}. */
+export type WaitError<Failure> =
+  | TaskFailed<Failure | typeof TaskErrorSchema.Type>
+  | TaskNotFound
+  | ResultExpired
+  | CallerTimeout
+  | TaskEngine.CursorExpired
+  | TaskEngine.TaskEngineError
+  | StorageProtocol.StorageProtocolError
+  | Schema.SchemaError;
+
+/** Services required to decode durable task and terminal event state. */
+export type WaitRequirements<
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+> =
+  | TaskEngine.TaskEngine
+  | Payload["DecodingServices"]
+  | Success["DecodingServices"]
+  | Error["DecodingServices"];
+
+/** Exact failure union of {@link offer} followed by {@link wait}. */
+export type ExecuteError<Failure> = OfferError | WaitError<Failure>;
+
+/** Exact service union of {@link offer} followed by {@link wait}. */
+export type ExecuteRequirements<
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+  IdentityR,
+> =
+  | OfferRequirements<Payload, Success, Error, IdentityR>
+  | WaitRequirements<Payload, Success, Error>;
+
 /**
  * The generation-safe result of offering a task.
  *
@@ -343,19 +409,19 @@ export type OfferOutcome<
  * import { Effect, Schema } from "effect"
  * import { Task, TaskEngine, TaskQueue } from "@effectmq/core"
  *
- * const resize = Task.make({
- *   name: "resize-image",
- *   payload: { imageId: Schema.String },
- *   success: Schema.String,
- *   error: Schema.String,
- *   idempotencyKey: ({ imageId }) => imageId
- * })
- * const images = TaskQueue.make("images", resize)
- *
- * const enqueue = TaskQueue.offer(images, { imageId: "img-42" }).pipe(
- *   Effect.map(({ handle }) => handle),
- *   Effect.provide(TaskEngine.layer())
- * )
+ * const enqueue = Effect.gen(function* () {
+ *   const resize = yield* Task.make({
+ *     name: "resize-image",
+ *     payload: { imageId: Schema.String },
+ *     success: Schema.String,
+ *     error: Schema.String,
+ *     idempotencyKey: ({ imageId }) => imageId
+ *   })
+ *   const images = TaskQueue.make("images", resize)
+ *   return yield* TaskQueue.offer(images, { imageId: "img-42" }).pipe(
+ *     Effect.map(({ handle }) => handle)
+ *   )
+ * }).pipe(Effect.provide(TaskEngine.layer()))
  * ```
  *
  * @category Operations
@@ -366,21 +432,18 @@ export const offer = Effect.fnUntraced(function* <
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
+  IdentityR = never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
   payload: Payload["Type"],
   options?: TaskOptions,
 ): Effect.fn.Return<
   OfferOutcome<Payload, Success, Error>,
-  | IndeterminateWriteError
-  | RetentionContextRequired
-  | StorageProtocol.StorageProtocolError
-  | TaskEngine.TaskEngineError
-  | Schema.SchemaError,
-  TaskEngine.TaskEngine | Payload["DecodingServices"]
+  OfferError,
+  OfferRequirements<Payload, Success, Error, IdentityR>
 > {
   const encodePayload = Schema.encodeEffect(queue.task.payloadSchema);
-  const id = options?.taskId ?? queue.task.idempotencyKey(payload);
+  const id = options?.taskId ?? (yield* queue.task.idempotencyKey(payload));
   const engine = yield* TaskEngine.TaskEngine;
   const currentTask = yield* TaskContext.currentTask;
   if (options?.retainResultUntil && currentTask === undefined) {
@@ -431,17 +494,30 @@ export const offer = Effect.fnUntraced(function* <
           | StorageProtocol.StorageCountLimitExceeded
           | TaskEngine.TaskEngineError
         > => {
-          const limit = relationshipLimit(cause);
-          if (limit) return Effect.fail(limit);
-          return isIndeterminateConnectionFailure(cause)
-            ? Effect.fail(
+          switch (cause.reason._tag) {
+            case "RelationshipLimit":
+              return Effect.fail(
+                new StorageProtocol.StorageCountLimitExceeded({
+                  resource: "relationships",
+                  scope: cause.reason.scope,
+                  actualCount: cause.reason.maxCount,
+                  maxCount: cause.reason.maxCount,
+                }),
+              );
+            case "IndeterminateCommit":
+              return Effect.fail(
                 new IndeterminateWriteError({
                   cause,
                   queue: queue.name,
                   taskId: id,
                 }),
-              )
-            : Effect.fail(cause);
+              );
+            case "TransportFailure":
+            case "ScriptFailure":
+            case "InvalidReply":
+            case "LeaseLost":
+              return Effect.fail(cause);
+          }
         },
       ),
     );
@@ -473,13 +549,14 @@ export const offer = Effect.fnUntraced(function* <
  * @category Operations
  * @since 0.1.0
  */
-export const extendLock = Effect.fnUntraced(function* <
+const extendLock = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
+  IdentityR = never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
   attempt: TaskAttempt<Payload, Success, Error>,
   lockTimeout?: Duration.Input,
 ) {
@@ -496,39 +573,14 @@ export const extendLock = Effect.fnUntraced(function* <
   );
 });
 
-/**
- * Voluntarily releases a low-level attempt back to runnable work.
- *
- * The exact lease token is required. Releasing does not record a stalled
- * failure; lease expiry recovery does.
- *
- * @category Operations
- * @since 0.1.0
- */
-export const release = Effect.fnUntraced(function* <
-  Payload extends Schema.Top,
-  Success extends Schema.Top,
-  Error extends Schema.Top,
-  R = never,
->(
-  queue: TaskQueue<Payload, Success, Error, R>,
-  attempt: TaskAttempt<Payload, Success, Error>,
-) {
-  const engine = yield* TaskEngine.TaskEngine;
-  return yield* engine.removeLock(
-    queue.name,
-    attempt.task.id,
-    attempt.leaseToken,
-  );
-});
-
 const succeed = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
+  IdentityR = never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
   attempt: TaskAttempt<Payload, Success, Error>,
   success: Success["Type"],
 ) {
@@ -556,8 +608,9 @@ const fail = Effect.fnUntraced(function* <
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
+  IdentityR = never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
   attempt: TaskAttempt<Payload, Success, Error>,
   failure: Error["Type"],
 ) {
@@ -570,12 +623,13 @@ const fail = Effect.fnUntraced(function* <
       ? attempt.task.maxRetries
       : queue.task.maxRetries;
 
+  const failedAt = new Date(yield* Clock.currentTimeMillis);
   const retryAt =
     queue.task.retrySchedule && attempt.task.handlerFailureCount < maxRetries
       ? yield* nextRunAt(
           queue.task.retrySchedule,
           new Date(attempt.task.createdAt.getTime() + attempt.task.delay),
-          [...attempt.task.errors, { timestamp: new Date(), error: failure }],
+          [...attempt.task.errors, { timestamp: failedAt, error: failure }],
         )
       : undefined;
   return yield* engine.writeError(
@@ -634,9 +688,10 @@ const processAttempt = Effect.fnUntraced(function* <
   Success extends Schema.Top,
   Error extends Schema.Top,
   TR = never,
+  IdentityR = never,
   R = never,
 >(
-  self: TaskQueue<Payload, Success, Error, TR>,
+  self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
   attempt: TaskAttempt<Payload, Success, Error>,
   handler: TaskHandler<Payload, Success, Error, R>,
   options?: ProcessingOptions,
@@ -672,15 +727,11 @@ const processAttempt = Effect.fnUntraced(function* <
   );
 
   const handlerResult = handler(attempt.task).pipe(
-    Effect.provide(
-      TaskContext.layer({
-        currentTask: {
-          queue: self.name,
-          id: attempt.task.id,
-          generation: attempt.task.generation,
-        },
-      }),
-    ),
+    Effect.provideService(TaskContext.currentTask, {
+      queue: self.name,
+      id: attempt.task.id,
+      generation: attempt.task.generation,
+    }),
     Effect.result,
   );
   const result = yield* Effect.raceFirst(handlerResult, heartBeat);
@@ -711,18 +762,19 @@ const processAttempt = Effect.fnUntraced(function* <
  * import { Effect, Schema } from "effect"
  * import { Task, TaskQueue } from "@effectmq/core"
  *
- * const greet = Task.make({
- *   name: "greet",
- *   payload: { name: Schema.String },
- *   success: Schema.String,
- *   error: Schema.String
+ * const processNext = Effect.gen(function* () {
+ *   const greet = yield* Task.make({
+ *     name: "greet",
+ *     payload: { name: Schema.String },
+ *     success: Schema.String,
+ *     error: Schema.String
+ *   })
+ *   const greetings = TaskQueue.make("greetings", greet)
+ *   return yield* TaskQueue.complete(
+ *     greetings,
+ *     ({ payload }) => Effect.succeed(`Hello, ${payload.name}!`)
+ *   )
  * })
- * const greetings = TaskQueue.make("greetings", greet)
- *
- * const processNext = TaskQueue.complete(
- *   greetings,
- *   ({ payload }) => Effect.succeed(`Hello, ${payload.name}!`)
- * )
  * ```
  *
  * @category Operations
@@ -734,65 +786,52 @@ export const complete: {
     Success extends Schema.Top,
     Error extends Schema.Top,
     TR = never,
+    IdentityR = never,
     R = never,
   >(
     handler: TaskHandler<Payload, Success, Error, R>,
   ): (
-    self: TaskQueue<Payload, Success, Error, TR>,
+    self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
   ) => Effect.Effect<
     string,
-    | StorageProtocol.StorageProtocolError
-    | TaskEngine.LeaseLost
-    | TaskEngine.TaskEngineError
-    | Schema.SchemaError,
-    TR | R
+    CompleteError,
+    CompleteRequirements<Payload, Success, Error, TR, R>
   >;
   <
     Payload extends Schema.Top,
     Success extends Schema.Top,
     Error extends Schema.Top,
     TR = never,
+    IdentityR = never,
     R = never,
   >(
-    self: TaskQueue<Payload, Success, Error, TR>,
+    self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
     handler: TaskHandler<Payload, Success, Error, R>,
   ): Effect.Effect<
     string,
-    | StorageProtocol.StorageProtocolError
-    | TaskEngine.LeaseLost
-    | TaskEngine.TaskEngineError
-    | Schema.SchemaError,
-    TR | R
+    CompleteError,
+    CompleteRequirements<Payload, Success, Error, TR, R>
   >;
 } = Function.dual(
   2,
-  <
+  Effect.fnUntraced(function* <
     Payload extends Schema.Top,
     Success extends Schema.Top,
     Error extends Schema.Top,
     TR = never,
+    IdentityR = never,
     R = never,
   >(
-    self: TaskQueue<Payload, Success, Error, TR>,
+    self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
     handler: TaskHandler<Payload, Success, Error, R>,
-  ): Effect.Effect<
+  ): Effect.fn.Return<
     string,
-    | StorageProtocol.StorageProtocolError
-    | Schema.SchemaError
-    | TaskEngine.LeaseLost
-    | TaskEngine.TaskEngineError,
-    | TaskEngine.TaskEngine
-    | TR
-    | R
-    | Payload["DecodingServices"]
-    | Success["EncodingServices"]
-    | Error["EncodingServices"]
-  > => {
-    return Effect.gen(function* () {
-      const attempt = yield* takeUnsafe(self);
-      return yield* processAttempt(self, attempt, handler);
-    });
-  },
+    CompleteError,
+    CompleteRequirements<Payload, Success, Error, TR, R>
+  > {
+    const attempt = yield* takeUnsafe(self);
+    return yield* processAttempt(self, attempt, handler);
+  }),
 );
 
 /**
@@ -807,12 +846,17 @@ export const completeOne = Effect.fnUntraced(function* <
   Success extends Schema.Top,
   Error extends Schema.Top,
   TR = never,
+  IdentityR = never,
   R = never,
 >(
-  self: TaskQueue<Payload, Success, Error, TR>,
+  self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
   handler: TaskHandler<Payload, Success, Error, R>,
   options?: ProcessingOptions,
-) {
+): Effect.fn.Return<
+  boolean,
+  CompleteError,
+  CompleteRequirements<Payload, Success, Error, TR, R>
+> {
   const attempt = yield* takeAvailable(self, {
     poll: false,
     lockTimeout: options?.lockTimeout,
@@ -844,8 +888,10 @@ export const stream = <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
+  QueueR,
+  IdentityR,
 >(
-  queue: TaskQueue<Payload, Success, Error>,
+  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR>,
   {
     cursor,
     pollInterval,
@@ -853,80 +899,96 @@ export const stream = <
     cursor?: string;
     pollInterval?: Duration.Duration;
   } = {},
-) =>
-  Effect.gen(function* () {
-    const engine = yield* TaskEngine.TaskEngine;
+) => Stream.unwrap(streamEffect(queue, { cursor, pollInterval }));
 
-    return engine.stream(queue.name, { cursor, pollInterval }).pipe(
-      Stream.mapEffect((event) =>
-        Effect.gen(function* () {
-          if (event._tag === "task.created") {
-            const task = event.payload.newTask;
-            return {
-              ...event,
-              payload: {
-                ...event.payload,
-                newTask: yield* decodeTask(queue.task, task),
-              },
-            };
-          }
-          if (event._tag === "task.updated") {
-            const { existingTask, newTask } = event.payload;
-            return {
-              ...event,
-              payload: {
-                ...event.payload,
-                existingTask: yield* decodeTask(queue.task, existingTask),
-                newTask: yield* decodeTask(queue.task, newTask),
-              },
-            };
-          }
-          if (event._tag === "task.failed") {
-            const decodeError = Schema.decodeEffect(queue.task.errorSchema);
-            const rawFailure = event.payload.error;
-            const builtIn =
-              typeof rawFailure === "object" &&
-              rawFailure !== null &&
-              "_tag" in rawFailure &&
-              Object.values(StorageProtocol.builtInErrorTags).includes(
-                rawFailure._tag as never,
-              );
-            const failure = builtIn
-              ? rawFailure
-              : yield* StorageProtocol.decodeValue(
-                  rawFailure,
-                  queue.task.schemaId,
-                  "failure",
-                );
-            return {
-              ...event,
-              payload: {
-                ...event.payload,
-                error: builtIn ? failure : yield* decodeError(failure),
-              },
-            };
-          }
-          if (event._tag === "task.completed") {
-            const decodeSuccess = Schema.decodeEffect(queue.task.successSchema);
-            const success = yield* StorageProtocol.decodeValue(
-              event.payload.success,
-              queue.task.schemaId,
-              "success",
+const streamEffect = Effect.fnUntraced(function* <
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+  QueueR,
+  IdentityR,
+>(
+  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR>,
+  {
+    cursor,
+    pollInterval,
+  }: {
+    cursor?: string;
+    pollInterval?: Duration.Duration;
+  } = {},
+) {
+  const engine = yield* TaskEngine.TaskEngine;
+
+  return engine.stream(queue.name, { cursor, pollInterval }).pipe(
+    Stream.mapEffect((event) =>
+      Effect.gen(function* () {
+        if (event._tag === "task.created") {
+          const task = event.payload.newTask;
+          return {
+            ...event,
+            payload: {
+              ...event.payload,
+              newTask: yield* decodeTask(queue.task, task),
+            },
+          };
+        }
+        if (event._tag === "task.updated") {
+          const { existingTask, newTask } = event.payload;
+          return {
+            ...event,
+            payload: {
+              ...event.payload,
+              existingTask: yield* decodeTask(queue.task, existingTask),
+              newTask: yield* decodeTask(queue.task, newTask),
+            },
+          };
+        }
+        if (event._tag === "task.failed") {
+          const decodeError = Schema.decodeEffect(queue.task.errorSchema);
+          const rawFailure = event.payload.error;
+          const builtIn =
+            typeof rawFailure === "object" &&
+            rawFailure !== null &&
+            "_tag" in rawFailure &&
+            Object.values(StorageProtocol.builtInErrorTags).includes(
+              rawFailure._tag as never,
             );
-            return {
-              ...event,
-              payload: {
-                ...event.payload,
-                success: yield* decodeSuccess(success),
-              },
-            };
-          }
+          const failure = builtIn
+            ? rawFailure
+            : yield* StorageProtocol.decodeValue(
+                rawFailure,
+                queue.task.schemaId,
+                "failure",
+              );
+          return {
+            ...event,
+            payload: {
+              ...event.payload,
+              error: builtIn ? failure : yield* decodeError(failure),
+            },
+          };
+        }
+        if (event._tag === "task.completed") {
+          const decodeSuccess = Schema.decodeEffect(queue.task.successSchema);
+          const success = yield* StorageProtocol.decodeValue(
+            event.payload.success,
+            queue.task.schemaId,
+            "success",
+          );
+          return {
+            ...event,
+            payload: {
+              ...event.payload,
+              success: yield* decodeSuccess(success),
+            },
+          };
+        }
 
-          return event;
-        }),
-      ),
-    );
-  }).pipe(Stream.unwrap);
+        return event;
+      }),
+    ),
+  );
+});
 
 /**
  * Configures a caller-local deadline for {@link wait}.
@@ -953,15 +1015,21 @@ export interface WaitOptions {
  * @category Operations
  * @since 0.2.0
  */
-export const wait = <
+export const wait = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
+  QueueR,
+  IdentityR,
 >(
-  queue: TaskQueue<Payload, Success, Error>,
+  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR>,
   handle: TaskHandle<Success["Type"], Error["Type"]>,
   options: WaitOptions = {},
-) => {
+): Effect.fn.Return<
+  Success["Type"],
+  WaitError<Error["Type"]>,
+  WaitRequirements<Payload, Success, Error>
+> {
   const operation = Effect.gen(function* () {
     if (handle.protocolVersion !== StorageProtocol.protocolVersion) {
       return yield* new StorageProtocol.UnsupportedProtocolVersion({
@@ -1124,7 +1192,7 @@ export const wait = <
   });
 
   const timeout = options.timeout;
-  return timeout === undefined
+  return yield* timeout === undefined
     ? operation
     : operation.pipe(
         Effect.timeoutOrElse({
@@ -1138,7 +1206,7 @@ export const wait = <
             ),
         }),
       );
-};
+});
 /**
  * Offer a task and await its outcome through the same generation-safe handle
  * protocol as {@link wait}.
@@ -1156,14 +1224,16 @@ export const execute = Effect.fnUntraced(function* <
   Payload extends Schema.Top,
   Success extends Schema.Top,
   Error extends Schema.Top,
+  QueueR,
+  IdentityR,
 >(
-  queue: TaskQueue<Payload, Success, Error>,
+  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR>,
   payload: Payload["Type"],
   options?: TaskOptions,
 ): Effect.fn.Return<
   Success["Type"],
-  Error["Type"],
-  TaskEngine.TaskEngine | Payload["DecodingServices"]
+  ExecuteError<Error["Type"]>,
+  ExecuteRequirements<Payload, Success, Error, IdentityR>
 > {
   const offered = yield* offer(queue, payload, options);
   return yield* wait(queue, offered.handle);

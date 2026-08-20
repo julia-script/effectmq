@@ -1,5 +1,6 @@
 /** Effect metrics emitted by EffectMQ's Redis and queue runtime. @module */
-import { Effect, Metric } from "effect";
+import * as Effect from "effect/Effect";
+import * as Metric from "effect/Metric";
 
 /**
  * Gauge of runnable, delayed, and leased tasks, attributed by queue.

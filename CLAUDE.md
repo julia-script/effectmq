@@ -11,7 +11,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 pnpm install                      # install (pnpm@10.x, see packageManager)
 pnpm build                        # tsc -> dist/ (tests and src/testing are excluded from the build)
-pnpm exec tsc --noEmit            # typecheck (what CI runs)
+pnpm typecheck                    # strict production + complete test typecheck
+pnpm typecheck:src                # production sources only
+pnpm typecheck:test               # all tests and src/testing support
 pnpm exec biome check src/        # lint (what CI runs)
 pnpm lint:fix                     # biome check --write --unsafe
 pnpm test                         # vitest run (integration tests, needs Docker — see below)
@@ -24,7 +26,9 @@ Note: the `pnpm lint` script runs `turbo run lint`, but turbo is not a dependenc
 
 ### Tests need Docker
 
-Tests use `@testcontainers/redis` to spin up a real Redis container per vitest worker; `src/testing/redisLayer.ts` builds a shared `TestRuntime` (ManagedRuntime) at module import time so the container boot doesn't eat the first test's timeout. Test timeout is 30s (`vitest.config.ts`). The root `docker-compose.yml` Redis is for manual/local experimentation only — tests don't use it.
+Effectful tests use `@effect/vitest`. Redis integration suites install the suite-scoped `TestLayer` from `src/testing/redisLayer.ts`; it acquires and releases containers, clients, child processes, listeners, and temporary directories through Effect scopes. Never add a module-level `ManagedRuntime`, direct `Effect.runPromise` test runner, or top-level resource warming. Container acquisition has an explicit 60s hook timeout and normal tests have a 30s timeout (`vitest.config.ts`). The root `docker-compose.yml` Redis is for manual/local experimentation only — tests don't use it.
+
+Use `it.effect` for Effectful unit tests and `layer(...)(..., (it) => ...)` for suites with dependencies. Unit-level timing uses `TestClock` and a `Deferred`/latch before advancing time. Tests that exercise Redis TTL, restart, or Sentinel failover are explicitly labeled “real Redis time,” exclude Effect test services, and use bounded polling with diagnostic timeouts rather than fixed sleeps. Pure value/schema tests remain ordinary Vitest tests with explicit assertions.
 
 ### Releases
 
@@ -40,17 +44,19 @@ Flat `src/` with a strict layering, top to bottom:
 - **`TaskEngine.ts`** (the big one, ~1000 lines) — the low-level `Context.Service` implementing queue primitives as **atomic Lua scripts** (inline `/*lua*/` strings, built by `buildScripts`): create/take/writeSuccess/writeError, lock extend/remove, delayed + cron schedule state. Tasks move between Redis lists: `wait`, `scheduled`, `active`, `failed`, `success`. Every state change publishes to a per-queue Redis Stream (`<prefix>:<name>:events`, via `XADD`); `stream` polls it with `XREAD` (default 1s). Consumers rarely call the engine directly — go through `TaskQueue`/`Scheduler`.
 - **`RedisPool.ts`** — the minimal service the engine depends on: just `send` + `eval`. Any Redis client can implement it.
 - **`NodeRedisPool.ts`** — the bundled `RedisPool` implementation using node-redis `createClientPool` (lazy connect, closed on layer scope end). Tests provide `RedisPool` via ioredis + testcontainers instead (`src/testing/redisLayer.ts`) — proof the service boundary works.
-- **`Schemas.ts`** — shared task model: completion policies (`delete` | `keep` | `mark-as-success` | `mark-as-failure`), built-in `Stalled`/`Canceled` tagged errors, encode/decode between engine (Redis hash) representation and typed tasks.
+- **`TaskRecord.ts`** — public typed task record schemas and storage codecs.
+- **`TaskEvent.ts`** — public queue lifecycle event schemas.
+- **`EngineRecord.ts` / `MessagePack.ts` / `RetrySchedule.ts`** — internal Redis record, binary codec, and retry-schedule concepts.
 
-Wiring: `TaskEngine.layer()` requires `RedisPool`; the standard app layer is `Layer.provideMerge(TaskEngine.layer(), NodeRedisPool.layer())`.
+Wiring: `TaskEngine.layer()` is the complete zero-requirement Node live graph and intentionally retains Redis operational services. `TaskEngine.layerNoDeps()` is the custom-client layer that requires `RedisPool`.
 
 The library deliberately has **no built-in concurrency/rate limiting** — one `complete` processes one task, and callers compose concurrency from Effect primitives (fibers, semaphores, schedules). Don't add worker-pool machinery.
 
 ## Conventions
 
 - **Effect 4 beta idioms**: `Context.Service` classes for services, `Schema.TaggedError` for schema-backed errors, `Effect.fnUntraced` for functions, `Data.TaggedError` for engine errors, imports from `effect/unstable/*` where needed (e.g. `effect/unstable/persistence/Redis`). Match these when adding code.
-- Type IDs are string constants like `"~effectmq/TaskEngine"`; built-in error tags use the `~effectmq/Error/...` namespace.
-- `effect` is a **peerDependency** (`>=4.0.0-beta.107`) and devDependency, never a hard dependency. Direct `@effect/*` development dependencies use the same beta baseline. The only runtime dependencies are `msgpackr` and `redis`.
+- Service identifiers use `@effectmq/core/<Service>`; nominal type IDs and built-in error tags use the `~effectmq/...` namespace.
+- `effect` is a **peerDependency** (`>=4.0.0-beta.107`) and devDependency. `@effect/platform-node` is a runtime dependency for the standard live graph; all Effect packages use the same beta baseline.
 - Public API (everything re-exported from `src/index.ts` as namespace exports) carries TSDoc, including `@module` headers per file. Keep new exports documented.
 - Formatting/linting is Biome (2-space indent); config in `biome.json`.
 

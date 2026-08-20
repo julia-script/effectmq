@@ -1,9 +1,11 @@
 import { readFileSync } from "node:fs";
 
 const workflow = readFileSync(".github/workflows/release.yml", "utf8");
+const ciWorkflow = readFileSync(".github/workflows/ci.yml", "utf8");
 const manifest = JSON.parse(readFileSync("package.json", "utf8")) as {
   repository?: { url?: string };
   publishConfig?: { access?: string; provenance?: boolean };
+  scripts?: Record<string, string>;
 };
 
 const errors: string[] = [];
@@ -42,6 +44,29 @@ requireMatch(
   /NPM_CONFIG_PROVENANCE:\s*["']?true["']?/,
   "npm provenance must be enabled",
 );
+
+const qualityJob =
+  /\n {2}quality-and-tests:\n[\s\S]*?(?=\n {2}[a-z][a-z-]+:\n)/.exec(
+    ciWorkflow,
+  )?.[0];
+if (
+  !qualityJob ||
+  !/- uses: actions\/checkout@v4\n\s+with:\n\s+fetch-depth:\s*0/.test(
+    qualityJob,
+  )
+) {
+  errors.push(
+    "ci.yml: quality checks must fetch full history before running changeset status",
+  );
+}
+if (
+  manifest.scripts?.["check:changesets"] !==
+  "changeset status --since=origin/main"
+) {
+  errors.push(
+    "package.json: changeset checks must compare against the fetched origin/main ref",
+  );
+}
 
 if (/\b(?:NPM_TOKEN|NODE_AUTH_TOKEN)\b/.test(workflow)) {
   errors.push("release.yml: long-lived npm publication tokens are forbidden");

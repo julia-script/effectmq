@@ -1,9 +1,13 @@
+import * as BunCrypto from "@effect/platform-bun/BunCrypto";
 import * as Context from "effect/Context";
+import type * as Crypto from "effect/Crypto";
 import type * as Effect from "effect/Effect";
-import type * as Layer from "effect/Layer";
+import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import type * as Stream from "effect/Stream";
+import type * as Redis from "effect/unstable/persistence/Redis";
 import { expect, it } from "vitest";
+import * as NodeRedisPool from "./NodeRedisPool.js";
 import type * as RedisPool from "./RedisPool.js";
 import * as TaskEngine from "./TaskEngine.js";
 import * as TaskQueue from "./TaskQueue.js";
@@ -150,11 +154,28 @@ const compilePublicContracts = () => {
 
   const layerNoDeps = TaskEngine.layerNoDeps();
   const liveLayer = TaskEngine.layer();
+  const bunNodeRedisLayer = TaskEngine.layerNoDeps().pipe(
+    Layer.provideMerge(Layer.merge(NodeRedisPool.layer(), BunCrypto.layer)),
+  );
   type LayerNoDepsRequirement = Expect<
     Equal<Layer.Services<typeof layerNoDeps>, RedisPool.RedisPool>
   >;
   type LiveLayerRequirement = Expect<
     Equal<Layer.Services<typeof liveLayer>, never>
+  >;
+  type LiveLayerSuccess = Expect<
+    Equal<
+      Layer.Success<typeof liveLayer>,
+      | TaskEngine.TaskEngine
+      | RedisPool.RedisPool
+      | RedisPool.RedisConnectionRoles
+      | NodeRedisPool.RedisConnectionHealth
+      | Redis.Redis
+      | Crypto.Crypto
+    >
+  >;
+  type BunNodeRedisRequirement = Expect<
+    Equal<Layer.Services<typeof bunNodeRedisLayer>, never>
   >;
 
   return undefined as unknown as
@@ -179,7 +200,9 @@ const compilePublicContracts = () => {
     | RejectAnyServices
     | FailedEventError
     | LayerNoDepsRequirement
-    | LiveLayerRequirement;
+    | LiveLayerRequirement
+    | LiveLayerSuccess
+    | BunNodeRedisRequirement;
 };
 
 it("pins public Effect and Layer channels at compile time", () => {

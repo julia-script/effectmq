@@ -23,16 +23,18 @@ a scheduled report. It provides:
 ## Install
 
 ```bash
+# Node
 pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-beta.107 @effect/platform-node@4.0.0-beta.107
+
+# Bun (node-redis is bundled; add platform-bun for BunRuntime and BunCrypto)
+bun add @effectmq/core@0.3.0-rc.0 effect@4.0.0-beta.107 @effect/platform-bun@4.0.0-beta.107
 ```
 
 > [!IMPORTANT]
 > effectmq currently targets the Effect 4 beta and is not compatible with the
 > stable Effect 3 release. Pin the versions shown above. Node.js 22.19 or newer
-> is required; CI verifies Node.js 22 and 24.
-
-The package includes its pooled `NodeRedisPool` implementation.
-`@effect/platform-node` is only needed by these examples for `NodeRuntime`.
+> is required; CI verifies Node.js 22 and 24. Bun plus node-redis is a
+> supported composition. It is not yet a CI platform.
 
 ---
 
@@ -78,9 +80,9 @@ Redis startup and expected output, follow the
 
 ## Runtime setup
 
-`TaskEngine.layer()` is the complete Node live graph: it provides the engine,
-cryptographic identity generation, and the retained Redis pool, role, and
-health services:
+`TaskEngine.layer()` is the live graph: engine, cryptographic identity, and
+the Redis pool, role, and health services. Run it with `NodeRuntime` or
+`BunRuntime`. The Redis adapter stays `NodeRedisPool` on both.
 
 ```ts
 import { TaskEngine } from "@effectmq/core";
@@ -90,8 +92,30 @@ const AppLayer = TaskEngine.layer({
 });
 ```
 
-Use `TaskEngine.layerNoDeps()` when composing a custom `RedisPool`
-implementation. `NodeRedisPool.layer()` remains available independently and
+Bun plus node-redis uses the same `TaskEngine.layer` call and
+`BunRuntime.runMain`. Swap `NodeCrypto` for `BunCrypto` when you compose
+yourself through `TaskEngine.layerNoDeps()`. Bun's built-in `RedisClient`
+is not the supported adapter yet. It has no binary `send`.
+
+```ts
+import { Effect, Layer } from "effect";
+import { BunCrypto, BunRuntime } from "@effect/platform-bun";
+import { NodeRedisPool, TaskEngine } from "@effectmq/core";
+
+const AppLayer = TaskEngine.layerNoDeps().pipe(
+  Layer.provideMerge(
+    Layer.merge(
+      NodeRedisPool.layer({ url: "redis://localhost:6379" }),
+      BunCrypto.layer,
+    ),
+  ),
+);
+
+Effect.void.pipe(Effect.provide(AppLayer), BunRuntime.runMain);
+```
+
+Use `TaskEngine.layerNoDeps()` when you bring your own `RedisPool`.
+`NodeRedisPool.layer()` remains available independently and
 accepts node-redis client options. It establishes separate producer, worker,
 and maintenance pools when the Layer starts. It supports standalone Redis and
 Sentinel; Redis Cluster fails startup because queue transitions use multi-key

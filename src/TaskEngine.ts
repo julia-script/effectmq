@@ -20,6 +20,7 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import type * as Redis from "effect/unstable/persistence/Redis";
 import {
   type EngineTask,
   type EngineTaskInsert,
@@ -29,9 +30,13 @@ import {
 } from "./EngineRecord.js";
 import taskEngineScript from "./lua/taskEngine.js";
 import { UnknownFromMsgpack } from "./MessagePack.js";
-import * as NodeRedisPool from "./NodeRedisPool.js";
 import * as Observability from "./Observability.js";
-import { RedisPool, type RedisPoolService } from "./RedisPool.js";
+import * as NodeRedisPool from "./NodeRedisPool.js";
+import {
+  type RedisConnectionRoles,
+  RedisPool,
+  type RedisPoolService,
+} from "./RedisPool.js";
 import { type Event, EventSchema } from "./TaskEvent.js";
 
 const TypeId = "~effectmq/TaskEngine" as const;
@@ -1346,8 +1351,8 @@ export const make = (config?: TaskEngineConfig) =>
   });
 
 /**
- * Provides {@link TaskEngine} from an ambient {@link RedisPool} service.
- * Use this for custom Redis implementations and test layers.
+ * Provides {@link TaskEngine} from an ambient {@link RedisPool}.
+ * Use this for custom Redis implementations, tests, and Bun plus node-redis.
  *
  * @category Layers
  * @since 0.1.0
@@ -1355,17 +1360,38 @@ export const make = (config?: TaskEngineConfig) =>
 export const layerNoDeps = (config?: TaskEngineConfig) =>
   Layer.effect(TaskEngine, make(config));
 
-/** Configuration for the standard Node.js live service graph. */
+/**
+ * Configuration for the standard live service graph.
+ *
+ * @category Configuration
+ * @since 0.1.0
+ */
 export interface LiveConfig {
   readonly engine?: TaskEngineConfig;
   readonly redis?: NodeRedisPool.RedisConfig;
 }
 
 /**
- * Provides a complete Node.js live graph: Redis connections, connection
- * roles and health, Crypto, and the task engine.
+ * Provides the live graph: Redis connections, connection roles and health,
+ * Crypto, and the task engine.
+ *
+ * @category Layers
+ * @since 0.1.0
  */
-export const layer = (config: LiveConfig = {}) =>
+export const layer = (
+  config: LiveConfig = {},
+): Layer.Layer<
+  | TaskEngine
+  | RedisPool
+  | RedisConnectionRoles
+  | NodeRedisPool.RedisConnectionHealth
+  | Redis.Redis
+  | Crypto.Crypto,
+  | TaskEngineConfigurationError
+  | Redis.RedisError
+  | NodeRedisPool.UnsupportedRedisTopology
+  | NodeRedisPool.InvalidRedisConfiguration
+> =>
   layerNoDeps(config.engine).pipe(
     Layer.provideMerge(
       Layer.merge(NodeRedisPool.layer(config.redis), NodeCrypto.layer),

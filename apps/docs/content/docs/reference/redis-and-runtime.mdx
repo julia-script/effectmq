@@ -10,8 +10,8 @@ TaskEngine.layer({ engine?, redis? }): Layer<LiveServices, LiveError>
 ```
 
 Provides `TaskEngine`, `RedisPool`, `RedisConnectionRoles`,
-`RedisConnectionHealth`, Effect Redis, and Crypto. It is the standard Node.js
-live graph.
+`RedisConnectionHealth`, Effect Redis, and Crypto. Run it with `NodeRuntime`
+or `BunRuntime`.
 
 Engine configuration:
 
@@ -27,8 +27,25 @@ Engine configuration:
 TaskEngine.layerNoDeps(config?): Layer<TaskEngine, TaskEngineConfigurationError, RedisPool>
 ```
 
-Requires an ambient custom `RedisPool`. It does not provide connection roles,
-health, Effect Redis, or Crypto.
+Requires an ambient `RedisPool`. It does not provide connection roles, health,
+Effect Redis, or Crypto.
+
+Bun plus `BunCrypto` is this composition:
+
+```ts
+import { Layer } from "effect"
+import { BunCrypto } from "@effect/platform-bun"
+import { NodeRedisPool, TaskEngine } from "@effectmq/core"
+
+const AppLayer = TaskEngine.layerNoDeps().pipe(
+  Layer.provideMerge(
+    Layer.merge(
+      NodeRedisPool.layer({ url: "redis://127.0.0.1:6379" }),
+      BunCrypto.layer
+    )
+  )
+)
+```
 
 ## `NodeRedisPool.layer`
 

@@ -7,9 +7,10 @@ package subpaths:
   processing, and scheduling APIs;
 - `TaskRecord` owns durable typed task records and `TaskEvent` owns lifecycle
   events;
-- `TaskEngine` owns atomic queue storage behavior;
-- `RedisPool`, `NodeRedisPool`, `StorageProtocol`, and `Observability` own the
-  external client, live Node adapter, value protocol, and metrics boundaries.
+- `TaskEngine` owns atomic queue storage behavior and the live graph;
+- `RedisPool`, `NodeRedisPool`, `StorageProtocol`, and
+  `Observability` own the external client, node-redis adapter, value
+  protocol, and metrics boundaries.
 
 Internal modules are deliberately not package subpaths. `MessagePack` owns the
 binary transform, `EngineRecord` owns Redis-facing record schemas,
@@ -27,11 +28,14 @@ TaskEvent -> TaskRecord + EngineRecord + MessagePack
 NodeRedisPool -> RedisPool + RedisReadiness + Observability
 ```
 
-`TaskEngine.layer()` is the standard zero-requirement Node live graph. It
-retains `TaskEngine`, `RedisPool`, `RedisConnectionRoles`,
-`RedisConnectionHealth`, Effect Redis, and Crypto services. Custom Redis
+`TaskEngine.layer()` is the live graph. It retains `TaskEngine`, `RedisPool`,
+`RedisConnectionRoles`, `RedisConnectionHealth`, Effect Redis, and Crypto.
+`TaskEngine.layerNoDeps()` requires an ambient `RedisPool`. Bun plus
+node-redis uses `TaskEngine.layer` with `BunRuntime`, or `layerNoDeps`
+composed with `NodeRedisPool.layer` and `BunCrypto.layer`. Custom Redis
 integrations provide `RedisPool` to `TaskEngine.layerNoDeps()`.
 
 Public queue declarations use named exact aliases for success, typed failure,
 and required services. The strict test compiler pins `complete`, `completeOne`,
-`decodeTask`, `wait`, `execute`, and both TaskEngine layer modes.
+`decodeTask`, `wait`, `execute`, both TaskEngine layer modes, and the Bun plus
+node-redis composition.

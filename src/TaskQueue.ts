@@ -457,7 +457,7 @@ const hasBuiltInErrorTag = (value: unknown): boolean =>
  *
  * ```ts
  * import { Effect, Schema } from "effect"
- * import { NodeLive, Task, TaskQueue } from "@effectmq/core"
+ * import { Task, TaskEngine, TaskQueue } from "@effectmq/core"
  *
  * const resize = Task.make({
  *   name: "resize-image",
@@ -471,7 +471,7 @@ const hasBuiltInErrorTag = (value: unknown): boolean =>
  *   return yield* TaskQueue.offer(images, { imageId: "img-42" }).pipe(
  *     Effect.map(({ handle }) => handle)
  *   )
- * }).pipe(Effect.provide(NodeLive.layer()))
+ * }).pipe(Effect.provide(TaskEngine.layer()))
  * ```
  *
  * @category Operations

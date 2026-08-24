@@ -11,7 +11,7 @@ production service.
 Provide the standard live graph with explicit timeouts and pool bounds:
 
 ```ts
-import { NodeLive } from "@effectmq/core"
+import { TaskEngine } from "@effectmq/core"
 import { Config, Effect, Layer, Redacted } from "effect"
 
 const AppLive = Layer.unwrap(
@@ -21,7 +21,7 @@ const AppLive = Layer.unwrap(
     password: Config.redacted("REDIS_PASSWORD")
   }).pipe(
     Effect.map(({ password, url, username }) =>
-      NodeLive.layer({
+      TaskEngine.layer({
         engine: {
           prefix: "my-service:effectmq:v1",
           maintenanceBatchSize: 100

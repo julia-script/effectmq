@@ -73,7 +73,7 @@ Create `src/main.ts`:
 
 ```ts
 import { NodeRuntime } from "@effect/platform-node"
-import { NodeLive, Task, TaskQueue, Worker } from "@effectmq/core"
+import { Task, TaskEngine, TaskQueue, Worker } from "@effectmq/core"
 import { Console, Effect, Schema } from "effect"
 
 const Greet = Task.make({
@@ -87,7 +87,7 @@ const Greet = Task.make({
 
 const greetings = TaskQueue.make("tutorial-greetings", Greet)
 
-const EngineLive = NodeLive.layer({
+const EngineLive = TaskEngine.layer({
   redis: { url: "redis://127.0.0.1:6379" }
 })
 

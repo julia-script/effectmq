@@ -45,8 +45,8 @@ const FEATURES = [
   },
   {
     title: "One runtime layer",
-    body: "NodeLive.layer wires the Redis pools, health services, cryptographic identity and Lua-backed engine. Provide it once; work through TaskQueue, Worker and Scheduler.",
-    code: "NodeLive.layer({ redis })",
+    body: "TaskEngine.layer wires the Redis pools, health services, cryptographic identity and Lua-backed engine. Provide it once; work through TaskQueue, Worker and Scheduler.",
+    code: "TaskEngine.layer({ redis })",
   },
 ];
 

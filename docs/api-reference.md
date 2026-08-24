@@ -72,12 +72,13 @@ coordination, ordinary removal, and administrative force removal. Prefer
 `TaskQueue`, `Worker`, and `Scheduler` unless building tooling or an alternate
 runtime.
 
-- `TaskEngine.layer(config?)` and `TaskEngine.layerNoDeps(config?)` require an
-  ambient `RedisPool`. They do not embed a Redis client or Crypto layer.
-- `NodeLive.layer({ engine?, redis? })` is the zero-requirement Node graph and
-  retains Redis operational services plus `NodeCrypto` in its output.
-- Bun plus node-redis is `TaskEngine.layer()` composed with
-  `NodeRedisPool.layer()` and `BunCrypto.layer`.
+- `TaskEngine.layer({ engine?, redis? })` is the live graph and retains Redis
+  operational services plus Crypto in its output.
+- `TaskEngine.layerNoDeps(config?)` requires an ambient `RedisPool`. Use it for
+  a custom client or for Bun plus `BunCrypto`.
+- Bun plus node-redis is `TaskEngine.layer` plus `BunRuntime`, or
+  `TaskEngine.layerNoDeps` composed with `NodeRedisPool.layer` and
+  `BunCrypto.layer`.
 - Invalid configuration and Redis reply shapes use structured typed errors;
   diagnostic strings are retained only as causes.
 
@@ -95,6 +96,6 @@ version, schema, value, size, and count errors. `Observability` exports Effect
 metrics for depth/age/backlogs, Redis errors/reconnects/script reloads,
 ownership loss, and retention failure.
 
-Stable subpaths are `./NodeLive`, `./NodeRedisPool`, `./Observability`,
+Stable subpaths are `./NodeRedisPool`, `./Observability`,
 `./RedisPool`, `./Scheduler`, `./StorageProtocol`, `./Task`, `./TaskEngine`,
 `./TaskEvent`, `./TaskQueue`, `./TaskRecord`, and `./Worker`.

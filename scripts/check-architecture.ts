@@ -27,7 +27,7 @@ const visit = (directory: string) => {
     }
     const rel = relative(root, path);
     const mayImportRuntime =
-      rel === "src/NodeLive.ts" ||
+      rel === "src/TaskEngine.ts" ||
       rel === "src/NodeRedisPool.ts" ||
       rel.startsWith("src/cli/");
     if (

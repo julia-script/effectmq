@@ -1,6 +1,5 @@
 import { Effect, Fiber, Ref, Schema } from "effect";
 import {
-  NodeLive,
   NodeRedisPool,
   RedisPool,
   Task,
@@ -235,7 +234,7 @@ const run = Effect.scoped(
   }),
 );
 
-const layer = NodeLive.layer({
+const layer = TaskEngine.layer({
   engine: {
     debugMode: true,
     maintenanceBatchSize: TaskEngine.maxMaintenanceBatchSize,

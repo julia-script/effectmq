@@ -35,7 +35,6 @@ try {
     "package/package.json",
     "package/dist/index.js",
     "package/dist/index.d.ts",
-    "package/dist/NodeLive.js",
     "package/dist/NodeRedisPool.js",
     "package/dist/Worker.js",
     "package/dist/cli/inspect-pre-release-data.js",
@@ -68,7 +67,6 @@ try {
     { cwd: consumer, stdio: "pipe" },
   );
   const subpaths = [
-    "NodeLive",
     "NodeRedisPool",
     "Observability",
     "RedisPool",

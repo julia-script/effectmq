@@ -7,7 +7,6 @@ import * as Schema from "effect/Schema";
 import type * as Stream from "effect/Stream";
 import type * as Redis from "effect/unstable/persistence/Redis";
 import { expect, it } from "vitest";
-import * as NodeLive from "./NodeLive.js";
 import * as NodeRedisPool from "./NodeRedisPool.js";
 import type * as RedisPool from "./RedisPool.js";
 import * as TaskEngine from "./TaskEngine.js";
@@ -154,23 +153,19 @@ const compilePublicContracts = () => {
   >;
 
   const layerNoDeps = TaskEngine.layerNoDeps();
-  const engineLayer = TaskEngine.layer();
-  const nodeLiveLayer = NodeLive.layer();
-  const bunNodeRedisLayer = TaskEngine.layer().pipe(
+  const liveLayer = TaskEngine.layer();
+  const bunNodeRedisLayer = TaskEngine.layerNoDeps().pipe(
     Layer.provideMerge(Layer.merge(NodeRedisPool.layer(), BunCrypto.layer)),
   );
   type LayerNoDepsRequirement = Expect<
     Equal<Layer.Services<typeof layerNoDeps>, RedisPool.RedisPool>
   >;
-  type EngineLayerRequirement = Expect<
-    Equal<Layer.Services<typeof engineLayer>, RedisPool.RedisPool>
+  type LiveLayerRequirement = Expect<
+    Equal<Layer.Services<typeof liveLayer>, never>
   >;
-  type NodeLiveRequirement = Expect<
-    Equal<Layer.Services<typeof nodeLiveLayer>, never>
-  >;
-  type NodeLiveSuccess = Expect<
+  type LiveLayerSuccess = Expect<
     Equal<
-      Layer.Success<typeof nodeLiveLayer>,
+      Layer.Success<typeof liveLayer>,
       | TaskEngine.TaskEngine
       | RedisPool.RedisPool
       | RedisPool.RedisConnectionRoles
@@ -205,9 +200,8 @@ const compilePublicContracts = () => {
     | RejectAnyServices
     | FailedEventError
     | LayerNoDepsRequirement
-    | EngineLayerRequirement
-    | NodeLiveRequirement
-    | NodeLiveSuccess
+    | LiveLayerRequirement
+    | LiveLayerSuccess
     | BunNodeRedisRequirement;
 };
 

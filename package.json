@@ -23,10 +23,6 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./NodeLive": {
-      "types": "./dist/NodeLive.d.ts",
-      "default": "./dist/NodeLive.js"
-    },
     "./NodeRedisPool": {
       "types": "./dist/NodeRedisPool.d.ts",
       "default": "./dist/NodeRedisPool.js"

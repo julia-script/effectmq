@@ -37,9 +37,9 @@ Production modules import supported narrow `effect/*` subpaths. Public
 Effect-returning functions pin exact success, error, and service channels and
 use `Effect.fnUntraced` for reusable generator implementations. Services are
 `Context.Service` classes with `@effectmq/core/<Service>` identifiers; optional
-fiber-local values are `Context.Reference`s. Use `TaskEngine.layer()` when the
-application supplies `RedisPool`. Use `NodeLive.layer()` for the complete Node
-graph.
+fiber-local values are `Context.Reference`s. Use `TaskEngine.layer()` for the
+live graph. Use `TaskEngine.layerNoDeps()` when the application supplies
+`RedisPool`.
 
 Edit `src/lua/taskEngine.lua`, then run `pnpm gen:lua`; never hand-edit the
 generated TypeScript module. CI rejects generated drift. Add committed golden

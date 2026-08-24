@@ -12,7 +12,7 @@ Create one queue whose payload records the nominal schedule time:
 
 ```ts
 import { NodeRuntime } from "@effect/platform-node"
-import { NodeLive, Scheduler, Task, TaskQueue, Worker } from "@effectmq/core"
+import { Scheduler, Task, TaskEngine, TaskQueue, Worker } from "@effectmq/core"
 import { Cron, Effect, Schema } from "effect"
 
 const GenerateReport = Task.make({
@@ -44,7 +44,7 @@ const program = Effect.gen(function* () {
 
 program.pipe(
   Effect.provide(
-    NodeLive.layer({ redis: { url: "redis://127.0.0.1:6379" } })
+    TaskEngine.layer({ redis: { url: "redis://127.0.0.1:6379" } })
   ),
   NodeRuntime.runMain
 )

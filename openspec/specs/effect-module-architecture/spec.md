@@ -41,18 +41,18 @@ Project runtime services SHALL use class-based service declarations with stable 
 - **THEN** it receives the documented absent default without requiring an extra layer
 
 ### Requirement: Service layers communicate dependency ownership
-`TaskEngine.layer` and `TaskEngine.layerNoDeps` SHALL require an ambient `RedisPool` and SHALL NOT select a process runtime or Redis client. The Node convenience graph SHALL live in `NodeLive.layer` and SHALL retain Redis operational services plus Crypto. A Bun plus node-redis application SHALL compose `TaskEngine.layer` with `NodeRedisPool.layer` and `BunCrypto.layer`.
+`TaskEngine.layer` SHALL provide the live graph and SHALL retain Redis operational services plus Crypto. `TaskEngine.layerNoDeps` SHALL require an ambient `RedisPool` and SHALL NOT select a process runtime or Redis client. A Bun plus node-redis application SHALL run `TaskEngine.layer` under `BunRuntime`, or compose `TaskEngine.layerNoDeps` with `NodeRedisPool.layer` and `BunCrypto.layer`.
 
 #### Scenario: Application supplies a custom Redis pool
 - **WHEN** an application uses `TaskEngine.layer` or `TaskEngine.layerNoDeps`
 - **THEN** the type system requires the Redis pool service from the application
 
-#### Scenario: Application uses the Node live layer
-- **WHEN** an application uses `NodeLive.layer`
+#### Scenario: Application uses the live layer
+- **WHEN** an application uses `TaskEngine.layer`
 - **THEN** it receives the documented engine and Redis operational services with no unresolved requirements
 
 #### Scenario: Application uses Bun with node-redis
-- **WHEN** an application composes `TaskEngine.layer` with `NodeRedisPool.layer` and `BunCrypto.layer`
+- **WHEN** an application composes `TaskEngine.layerNoDeps` with `NodeRedisPool.layer` and `BunCrypto.layer`
 - **THEN** the composed layer has no unresolved requirements
 
 ### Requirement: Effect implementation style preserves contracts

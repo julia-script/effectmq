@@ -45,7 +45,7 @@ Define a task, enqueue work, process it. The whole loop:
 ```ts
 import { Effect, Schema } from "effect";
 import { NodeRuntime } from "@effect/platform-node";
-import { NodeLive, Task, TaskQueue } from "@effectmq/core";
+import { Task, TaskEngine, TaskQueue } from "@effectmq/core";
 
 const SendEmail = Task.make({
   name: "send-email",
@@ -65,7 +65,7 @@ const program = Effect.gen(function* () {
 });
 
 // The engine + its Redis layer: the only wiring you need to run the above.
-const AppLayer = NodeLive.layer({
+const AppLayer = TaskEngine.layer({
   redis: { url: "redis://localhost:6379" },
 });
 
@@ -80,34 +80,29 @@ Redis startup and expected output, follow the
 
 ## Runtime setup
 
-`TaskEngine` is a function of `RedisPool` (and `Crypto` per operation). It
-does not pick a process runtime or a Redis client. Compose those at the
-application edge.
-
-Node, with `NodeRuntime.runMain`:
+`TaskEngine.layer()` is the live graph: engine, cryptographic identity, and
+the Redis pool, role, and health services. Run it with `NodeRuntime` or
+`BunRuntime`. The Redis adapter stays `NodeRedisPool` on both.
 
 ```ts
-import { Effect } from "effect";
-import { NodeRuntime } from "@effect/platform-node";
-import { NodeLive } from "@effectmq/core";
+import { TaskEngine } from "@effectmq/core";
 
-const AppLayer = NodeLive.layer({
+const AppLayer = TaskEngine.layer({
   redis: { url: "redis://localhost:6379" },
 });
-
-Effect.void.pipe(Effect.provide(AppLayer), NodeRuntime.runMain);
 ```
 
-Bun plus node-redis, with `BunRuntime.runMain`. Bun's built-in `RedisClient`
-is not the supported adapter yet. It has no binary `send`. node-redis on Bun
-is the supported Bun Redis path:
+Bun plus node-redis uses the same `TaskEngine.layer` call and
+`BunRuntime.runMain`. Swap `NodeCrypto` for `BunCrypto` when you compose
+yourself through `TaskEngine.layerNoDeps()`. Bun's built-in `RedisClient`
+is not the supported adapter yet. It has no binary `send`.
 
 ```ts
 import { Effect, Layer } from "effect";
 import { BunCrypto, BunRuntime } from "@effect/platform-bun";
 import { NodeRedisPool, TaskEngine } from "@effectmq/core";
 
-const AppLayer = TaskEngine.layer().pipe(
+const AppLayer = TaskEngine.layerNoDeps().pipe(
   Layer.provideMerge(
     Layer.merge(
       NodeRedisPool.layer({ url: "redis://localhost:6379" }),
@@ -119,21 +114,7 @@ const AppLayer = TaskEngine.layer().pipe(
 Effect.void.pipe(Effect.provide(AppLayer), BunRuntime.runMain);
 ```
 
-A custom Redis client plus any Crypto layer:
-
-```ts
-import { Layer } from "effect";
-import type * as Crypto from "effect/Crypto";
-import { RedisPool, TaskEngine } from "@effectmq/core";
-
-declare const redis: Layer.Layer<RedisPool.RedisPool>;
-declare const crypto: Layer.Layer<Crypto.Crypto>;
-
-const AppLayer = TaskEngine.layer().pipe(
-  Layer.provideMerge(Layer.merge(redis, crypto)),
-);
-```
-
+Use `TaskEngine.layerNoDeps()` when you bring your own `RedisPool`.
 `NodeRedisPool.layer()` remains available independently and
 accepts node-redis client options. It establishes separate producer, worker,
 and maintenance pools when the Layer starts. It supports standalone Redis and

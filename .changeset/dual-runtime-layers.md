@@ -2,9 +2,8 @@
 "@effectmq/core": minor
 ---
 
-Split the Node convenience graph out of `TaskEngine.layer`.
+Document Bun plus node-redis as a supported composition.
 
-`TaskEngine.layer` (and `layerNoDeps`) now require an ambient `RedisPool`. They
-no longer embed `NodeRedisPool` or `NodeCrypto`. Use `NodeLive.layer` for the
-previous zero-requirement Node graph. Bun plus node-redis is
-`TaskEngine.layer` composed with `NodeRedisPool.layer` and `BunCrypto.layer`.
+`TaskEngine.layer` stays the live graph. `TaskEngine.layerNoDeps` is the
+compose path for a custom `RedisPool` or `BunCrypto`. Bun's built-in
+`RedisClient` is not the supported adapter yet.

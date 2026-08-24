@@ -13,7 +13,7 @@ Construct the worker from the same queue descriptor used by producers:
 
 ```ts
 import { NodeRuntime } from "@effect/platform-node"
-import { NodeLive, Task, TaskQueue, Worker } from "@effectmq/core"
+import { Task, TaskEngine, TaskQueue, Worker } from "@effectmq/core"
 import { Effect, Schema } from "effect"
 
 const SendEmail = Task.make({
@@ -47,7 +47,7 @@ const workerProgram = Worker.run(worker)
 
 workerProgram.pipe(
   Effect.provide(
-    NodeLive.layer({ redis: { url: "redis://127.0.0.1:6379" } })
+    TaskEngine.layer({ redis: { url: "redis://127.0.0.1:6379" } })
   ),
   NodeRuntime.runMain
 )

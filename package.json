@@ -23,6 +23,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./NodeLive": {
+      "types": "./dist/NodeLive.d.ts",
+      "default": "./dist/NodeLive.js"
+    },
     "./NodeRedisPool": {
       "types": "./dist/NodeRedisPool.d.ts",
       "default": "./dist/NodeRedisPool.js"
@@ -113,11 +117,18 @@
   "author": "",
   "license": "MIT",
   "peerDependencies": {
+    "@effect/platform-bun": ">=4.0.0-beta.107",
     "effect": ">=4.0.0-beta.107"
+  },
+  "peerDependenciesMeta": {
+    "@effect/platform-bun": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.1",
     "@changesets/cli": "^2.31.0",
+    "@effect/platform-bun": "4.0.0-beta.107",
     "@effect/vitest": "4.0.0-beta.107",
     "@testcontainers/redis": "^12.0.3",
     "@types/node": "^22.0.0",

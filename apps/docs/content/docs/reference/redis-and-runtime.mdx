@@ -6,12 +6,13 @@ description: Live layers, topology configuration, health services, engine config
 ## `TaskEngine.layer`
 
 ```text
-TaskEngine.layer({ engine?, redis? }): Layer<LiveServices, LiveError>
+TaskEngine.layer(config?): Layer<TaskEngine, TaskEngineConfigurationError, RedisPool>
 ```
 
-Provides `TaskEngine`, `RedisPool`, `RedisConnectionRoles`,
-`RedisConnectionHealth`, Effect Redis, and Crypto. It is the standard Node.js
-live graph.
+Requires an ambient `RedisPool`. It does not provide connection roles, health,
+Effect Redis, or Crypto. It does not select a process runtime.
+
+`TaskEngine.layerNoDeps` is an alias of `TaskEngine.layer`.
 
 Engine configuration:
 
@@ -21,14 +22,32 @@ Engine configuration:
 | `prefix` | `~effectmq:v1` | String Redis key prefix. |
 | `maintenanceBatchSize` | `100` | Safe integer from 1 through 1,000. |
 
-## `TaskEngine.layerNoDeps`
+## `NodeLive.layer`
 
 ```text
-TaskEngine.layerNoDeps(config?): Layer<TaskEngine, TaskEngineConfigurationError, RedisPool>
+NodeLive.layer({ engine?, redis? }): Layer<LiveServices, LiveError>
 ```
 
-Requires an ambient custom `RedisPool`. It does not provide connection roles,
-health, Effect Redis, or Crypto.
+Provides `TaskEngine`, `RedisPool`, `RedisConnectionRoles`,
+`RedisConnectionHealth`, Effect Redis, and Crypto. It is the standard Node.js
+live graph (`NodeRedisPool` plus `NodeCrypto`).
+
+Bun plus node-redis is a separate composition:
+
+```ts
+import { Layer } from "effect"
+import { BunCrypto } from "@effect/platform-bun"
+import { NodeRedisPool, TaskEngine } from "@effectmq/core"
+
+const AppLayer = TaskEngine.layer().pipe(
+  Layer.provideMerge(
+    Layer.merge(
+      NodeRedisPool.layer({ url: "redis://127.0.0.1:6379" }),
+      BunCrypto.layer
+    )
+  )
+)
+```
 
 ## `NodeRedisPool.layer`
 

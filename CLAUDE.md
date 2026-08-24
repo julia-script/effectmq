@@ -47,7 +47,7 @@ Flat `src/` with a strict layering, top to bottom:
 - **`TaskEvent.ts`** — public queue lifecycle event schemas.
 - **`EngineRecord.ts` / `MessagePack.ts` / `RetrySchedule.ts`** — internal Redis record, binary codec, and retry-schedule concepts.
 
-Wiring: `TaskEngine.layer()` is the complete zero-requirement Node live graph and intentionally retains Redis operational services. `TaskEngine.layerNoDeps()` is the custom-client layer that requires `RedisPool`.
+Wiring: `TaskEngine.layer()` / `TaskEngine.layerNoDeps()` require `RedisPool` and do not pick a runtime. `NodeLive.layer()` is the Node convenience graph (`NodeRedisPool` + `NodeCrypto`). Bun + node-redis is `TaskEngine.layer()` plus `NodeRedisPool.layer` plus `BunCrypto.layer`.
 
 `Worker` provides built-in bounded local concurrency, lease supervision,
 maintenance, and graceful draining. It does not provide distributed/global

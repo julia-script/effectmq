@@ -25,6 +25,17 @@ const visit = (directory: string) => {
     if (/\bDate\.now\(\)|\bcrypto\.randomUUID\(/.test(text)) {
       failures.push(`${relative(root, path)} reads ambient time or randomness`);
     }
+    const rel = relative(root, path);
+    const mayImportRuntime =
+      rel === "src/NodeLive.ts" ||
+      rel === "src/NodeRedisPool.ts" ||
+      rel.startsWith("src/cli/");
+    if (
+      !mayImportRuntime &&
+      /from ["'](?:redis|@effect\/platform-node(?:\/[^"']*)?)["']/.test(text)
+    ) {
+      failures.push(`${rel} imports redis or @effect/platform-node`);
+    }
   }
 };
 

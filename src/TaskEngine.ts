@@ -9,7 +9,6 @@
  * @module
  */
 
-import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
@@ -29,7 +28,6 @@ import {
 } from "./EngineRecord.js";
 import taskEngineScript from "./lua/taskEngine.js";
 import { UnknownFromMsgpack } from "./MessagePack.js";
-import * as NodeRedisPool from "./NodeRedisPool.js";
 import * as Observability from "./Observability.js";
 import { RedisPool, type RedisPoolService } from "./RedisPool.js";
 import { type Event, EventSchema } from "./TaskEvent.js";
@@ -1346,28 +1344,18 @@ export const make = (config?: TaskEngineConfig) =>
   });
 
 /**
- * Provides {@link TaskEngine} from an ambient {@link RedisPool} service.
- * Use this for custom Redis implementations and test layers.
+ * Provides {@link TaskEngine} from an ambient {@link RedisPool}.
  *
  * @category Layers
  * @since 0.1.0
  */
-export const layerNoDeps = (config?: TaskEngineConfig) =>
+export const layer = (config?: TaskEngineConfig) =>
   Layer.effect(TaskEngine, make(config));
 
-/** Configuration for the standard Node.js live service graph. */
-export interface LiveConfig {
-  readonly engine?: TaskEngineConfig;
-  readonly redis?: NodeRedisPool.RedisConfig;
-}
-
 /**
- * Provides a complete Node.js live graph: Redis connections, connection
- * roles and health, Crypto, and the task engine.
+ * Alias of {@link layer}.
+ *
+ * @category Layers
+ * @since 0.1.0
  */
-export const layer = (config: LiveConfig = {}) =>
-  layerNoDeps(config.engine).pipe(
-    Layer.provideMerge(
-      Layer.merge(NodeRedisPool.layer(config.redis), NodeCrypto.layer),
-    ),
-  );
+export const layerNoDeps = layer;

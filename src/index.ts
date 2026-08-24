@@ -9,6 +9,13 @@
  */
 
 /**
+ * Zero-requirement Node live graph: NodeRedisPool, NodeCrypto, and the engine.
+ *
+ * @category Modules
+ * @since 0.3.0
+ */
+export * as NodeLive from "./NodeLive.js";
+/**
  * Scoped node-redis adapters for standalone Redis and Sentinel.
  *
  * @category Modules

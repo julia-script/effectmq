@@ -12,10 +12,9 @@ Repository/package administrators must configure these controls once:
    and the `npm publish` action. npm requires only the filename, not the full
    `.github/workflows/` path.
 2. In GitHub, create the `npm-production` environment. Restrict deployment to
-   `main`, add required maintainers for production promotion, and do not store
-   an npm publication token. Enable self-review prevention only when another
-   required maintainer can approve; otherwise the release is impossible to
-   approve.
+   `main`, leave required reviewers disabled and the wait timer at zero, and
+   do not store an npm publication token. Releases proceed automatically after
+   CI succeeds; the environment is retained for the npm OIDC identity.
 3. Protect `main` and require the CI job `Exact-commit release gate` before
    merge. Require review for workflow and Changeset changes.
 4. Enable npm two-factor authentication for maintainer account changes and
@@ -33,19 +32,24 @@ GitHub OIDC publication identity.
    `pnpm check` covers format, lint, typechecks, architecture, Lua drift, docs,
    and release configuration. The changeset check is a separate PR policy and
    compares against `origin/main`.
-3. Merge the reviewed change after CI succeeds. Following successful main CI
-   and any required `npm-production` approval, Changesets opens or updates
-   `changeset-release/main` with the next version and changelog. The repository
-   is currently in `rc` prerelease mode.
+3. Merge the reviewed change after CI succeeds. Following successful main CI,
+   Changesets automatically opens or updates `changeset-release/main` with the
+   next stable version and changelog.
 4. Review the generated version PR. CI skips only the new-changeset requirement
    for this repository's `changeset-release/main` branch: versioning has already
    consumed the pending changesets. All quality, test, compatibility, package,
    soak, and release gates still run. Regular PRs, including forks, retain the
    changeset requirement.
-5. Merge the version PR, wait for CI on the merged main commit, and approve its
-   Release workflow deployment when it is waiting on `npm-production`. The
-   workflow publishes the gated version to npm. A merged PR alone does not
+5. Merge the version PR and wait for CI on the merged main commit. The Release
+   workflow automatically publishes the gated version to npm without a manual
+   environment approval, using npm's `latest` tag. A merged PR alone does not
    mean publication has completed.
+
+The transition out of `rc` mode is recorded by running `pnpm changeset pre exit`.
+Until the next version PR is generated, `.changeset/pre.json` keeps `mode: "exit"`
+and the package retains its current prerelease version. Changesets removes the
+prerelease suffix and the state file when generating that PR. Subsequent version
+PRs continue producing stable versions.
 
 Run the short CI-equivalent soak against an isolated Redis instance with:
 
@@ -61,7 +65,7 @@ five-minute candidate soak; see [Soak evidence](./soak.md).
 
 ## Candidate checklist
 
-- Changeset and intended prerelease version are reviewed.
+- Changeset and intended stable version are reviewed.
 - Compatibility, restart/Sentinel fault, package, benchmark, and soak evidence
   identify the exact candidate commit.
 - `pnpm verify:package` passes and its file list is reviewed.

@@ -19,6 +19,7 @@ jobs:
   release:
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    # Keep the npm OIDC environment identity; configure it without required reviewers.
     environment: npm-production
     steps:
       - uses: actions/checkout@v4

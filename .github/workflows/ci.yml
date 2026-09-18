@@ -25,6 +25,14 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Format, lint, typecheck, Lua drift, docs
         run: pnpm check
+      # Version PRs have already consumed their changesets. Require new
+      # changesets only on regular PRs, including PRs from forks.
+      - name: Require changesets for package changes
+        if: >-
+          github.event_name == 'pull_request' &&
+          !(github.head_ref == 'changeset-release/main' &&
+            github.event.pull_request.head.repo.full_name == github.repository)
+        run: pnpm check:changesets
       - name: Effect test lifecycle gate
         run: pnpm test:lifecycle
       - name: Build declarations and ESM

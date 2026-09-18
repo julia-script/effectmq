@@ -77,8 +77,8 @@ const consume = (cursor: string) =>
   }).pipe(
     Stream.runForEach((event) =>
       Effect.gen(function* () {
-        yield* persistCursor(event.id)
         yield* Effect.log(event._tag, event.taskId, event.generation)
+        yield* persistCursor(event.id)
       })
     )
   )

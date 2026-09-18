@@ -25,6 +25,40 @@ The package manifest's `repository.url` must remain exactly
 `https://github.com/julia-script/effectmq`; npm uses it when validating the
 GitHub OIDC publication identity.
 
+## Prepare and validate a release
+
+1. Add a Changeset for a package change with `pnpm changeset`. For a change
+   that does not need a package release, use `pnpm changeset --empty`.
+2. Fetch the base branch and run `pnpm check` and `pnpm check:changesets`.
+   `pnpm check` covers format, lint, typechecks, architecture, Lua drift, docs,
+   and release configuration. The changeset check is a separate PR policy and
+   compares against `origin/main`.
+3. Merge the reviewed change after CI succeeds. Following successful main CI
+   and any required `npm-production` approval, Changesets opens or updates
+   `changeset-release/main` with the next version and changelog. The repository
+   is currently in `rc` prerelease mode.
+4. Review the generated version PR. CI skips only the new-changeset requirement
+   for this repository's `changeset-release/main` branch: versioning has already
+   consumed the pending changesets. All quality, test, compatibility, package,
+   soak, and release gates still run. Regular PRs, including forks, retain the
+   changeset requirement.
+5. Merge the version PR, wait for CI on the merged main commit, and approve its
+   Release workflow deployment when it is waiting on `npm-production`. The
+   workflow publishes the gated version to npm. A merged PR alone does not
+   mean publication has completed.
+
+Run the short CI-equivalent soak against an isolated Redis instance with:
+
+```sh
+EFFECTMQ_REDIS_URL=redis://127.0.0.1:6391 \
+  EFFECTMQ_SOAK_DURATION_MS=15000 pnpm soak
+```
+
+`pnpm soak` uses `node --expose-gc --import tsx scripts/soak.ts`. This exposes
+GC in the workload process. Passing `--expose-gc` to the `tsx` CLI launcher
+does not expose it in its child process. Omit the duration override for the
+five-minute candidate soak; see [Soak evidence](./soak.md).
+
 ## Candidate checklist
 
 - Changeset and intended prerelease version are reviewed.

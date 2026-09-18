@@ -95,12 +95,15 @@ The handler type is:
 ## `TaskQueue.completeOne`
 
 ```text
-completeOne(queue, handler, processing?): Effect<boolean, CompleteError, CompleteRequirements>
+completeOne(queue, handler, processing?): Effect<boolean, CompleteOneError, CompleteRequirements>
 ```
 
 Attempts one non-polling acquisition. Returns `false` when no task is currently
 available and `true` after an attempt is processed. Managed workers use this
 operation internally.
+
+`CompleteOneError` adds `ProcessingConfigurationError` to `CompleteError` for
+invalid lease or heartbeat options.
 
 ### Processing options
 
@@ -123,6 +126,10 @@ wait(queue, handle, options?): Effect<Success, WaitError, WaitRequirements>
 Waits for the exact generation in the handle. It reads durable state,
 subscribes from the handle cursor, and rechecks state after subscription.
 
+Retriable failures do not end the wait. A terminal failure is wrapped in
+`TaskFailed.failure`. A handle for a different queue or task name fails with
+`TaskHandleMismatch`; schema identity is checked separately.
+
 `options.timeout` accepts `Duration.Input`. A timeout fails with
 `CallerTimeout` and does not cancel queue work.
 
@@ -142,7 +149,8 @@ stream(queue, { cursor?, pollInterval? }): Stream<Event, ...>
 ```
 
 Defaults to the current stream position, so an omitted cursor observes future
-events only. `pollInterval` defaults to one second in the engine.
+events only. `pollInterval` accepts `Duration.Duration` and defaults to a
+two-second blocking Redis read; it is not a delay between non-blocking polls.
 
 | Event tag | Typed payload |
 | --- | --- |

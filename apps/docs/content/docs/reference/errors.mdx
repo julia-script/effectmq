@@ -20,6 +20,7 @@ invariants do not appear in typed error unions.
 
 | Tag | Fields | Meaning |
 | --- | --- | --- |
+| `TaskOptionsError` | `field`, `constraint`, `actual` | An offer delay, retry cap, or stalled-attempt cap is invalid. |
 | `IndeterminateWriteError` | `queue`, `taskId`, `cause` | Redis may have committed the offer before the connection failed. |
 | `RetentionContextRequired` | `queue`, `taskId` | Current-task result retention was requested outside a managed handler. |
 
@@ -31,14 +32,17 @@ invariants do not appear in typed error unions.
 | --- | --- | --- |
 | `LeaseLost` | `prefix`, `taskId`, `cause` | The attempt no longer owns the generation. |
 | `TaskEngineError` | `reason`, `cause` | Redis transport, script, reply, relationship, commit, or lease boundary failure. |
+| `RetryPolicyError` | `queue`, `taskId`, `cause` | Retry-policy evaluation failed or retained failure history cannot replay it safely. |
 
-`TaskEngineError.reason._tag` is one of `TransportFailure`, `ScriptFailure`,
+`TaskEngineError.reason._tag` is one of `InvalidInput`, `TransportFailure`, `ScriptFailure`,
 `InvalidReply`, `RelationshipLimit`, `IndeterminateCommit`, or `LeaseLost`.
 
 ## Waiting
 
 | Tag | Fields | Meaning |
 | --- | --- | --- |
+| `TaskHandleMismatch` | `expectedQueue`, `actualQueue`, `expectedTaskName`, `actualTaskName` | The handle does not match the queue or task descriptor. |
+| `InvalidCursor` | `cursor` | The event cursor is not a valid Redis stream id. |
 | `TaskFailed` | `handle`, `failure` | The exact generation settled with the typed handler or built-in failure. |
 | `TaskNotFound` | `handle` | No task record, result, or known generation exists. |
 | `ResultExpired` | `handle`, `latestGeneration` | The handle's retained result is unavailable. |
@@ -65,6 +69,8 @@ Built-in terminal task failures are tagged `~effectmq/Error/Stalled` and
 
 | Tag | Meaning |
 | --- | --- |
+| `WorkerConfigurationError` | Invalid worker concurrency, timing, or processing options; includes `field`, `constraint`, and `actual`. |
+| `ProcessingConfigurationError` | Invalid lease or heartbeat options passed directly to queue processing; includes `field`, `constraint`, and `actual`. |
 | `TaskEngineConfigurationError` | `maintenanceBatchSize` is outside 1–1,000. |
 | `InvalidRedisConfiguration` | Standalone pool bounds or timeouts are invalid. |
 | `UnsupportedRedisTopology` | Redis Cluster was configured or detected. |
@@ -73,6 +79,7 @@ Built-in terminal task failures are tagged `~effectmq/Error/Stalled` and
 
 | Failure | Recovery |
 | --- | --- |
+| `TaskOptionsError` | Correct the reported numeric option before retrying. |
 | `IndeterminateWriteError` | Retry the same queue and task identity with `return-existing`. |
 | `CallerTimeout` | Continue waiting later with the same handle if the result retention window permits. |
 | `CursorExpired` | Reconcile durable state, then resume from an acceptable cursor. |

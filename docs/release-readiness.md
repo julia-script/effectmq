@@ -1,8 +1,56 @@
-# 0.3.0-rc.0 release record
+# 0.3.0-rc.1 release record
 
-Candidate status: published, provenance-verified, and production-ready as a
-release candidate. The `rc` tag points to `0.3.0-rc.0`; npm's `latest` tag
-intentionally remains on `0.2.0` until the observation period and an explicit
+Status checked on 2026-09-18: the version PR is merged and every required CI
+job passed for candidate commit `d014b10d9240b286b6d823bcf5d2485c23d194bf`.
+The [Release workflow](https://github.com/julia-script/effectmq/actions/runs/35383640669)
+is waiting for the protected `npm-production` environment approval.
+At this check, npm had not published `0.3.0-rc.1`: `rc` still resolved to
+`0.3.0-rc.0`, and `latest` to `0.2.0`.
+
+The candidate uses `effect`, `@effect/platform-node`, and `@effect/vitest`
+`4.0.0-rc.115`; its Effect peer minimum is `4.0.0-rc.115`. Install commands
+in the README and docs target this candidate and require its publication.
+
+## Candidate evidence
+
+[CI run 35383526029](https://github.com/julia-script/effectmq/actions/runs/35383526029)
+verified the exact main commit above:
+
+| Gate | Result |
+| --- | --- |
+| Formatting, lint, source/test/script/docs typechecks, architecture, Lua drift, docs, release configuration | Passed |
+| Effect test lifecycle | 4 tests passed |
+| Unit and Docker integration suite | 158 passed; 2 environment-gated tests skipped |
+| Separate restart/Sentinel fault suite | 3 tests passed |
+| Redis 7.2/7.4/8.0, RESP2/RESP3 | All six combinations passed |
+| Packed ESM consumer | Passed on Node 22 and 24 |
+| 15-second soak smoke | 7,058 offered and completed; zero Redis command errors |
+| Forced-GC heap growth | −2,973,600 bytes; unchanged 64 MiB limit |
+| Maximum maintenance batch | 1,000 processed; zero remaining due |
+| Exact-commit release gate | Passed |
+
+The new soak command exposes GC in the process running the workload and fails
+if GC is unavailable. See [Soak evidence](./soak.md). The historical performance,
+five-minute soak, and rollback figures below belong to rc.0; they have not been
+repeated for this exact rc.1 artifact. CI's short soak does not replace a
+five-minute run in the target environment.
+
+## Publication follow-through
+
+After environment approval and successful publication, record the registry
+integrity and provenance source SHA, verify that the `rc` tag advanced, and
+install the published tarball into a clean consumer. Do not treat the rc.0
+artifact digests or provenance below as evidence for rc.1. Follow
+[Releasing](./releasing.md) for the candidate checklist and promotion process.
+
+---
+
+# Historical 0.3.0-rc.0 release record
+
+This section preserves the previous release record and its dependency baseline;
+its evidence does not certify rc.1. At rc.0 publication, the `rc` tag pointed to
+`0.3.0-rc.0`; npm's `latest` tag
+intentionally remained on `0.2.0` until the observation period and an explicit
 stable promotion decision.
 
 Dependency baseline: `effect@4.0.0-beta.107` and

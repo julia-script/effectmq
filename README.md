@@ -22,8 +22,12 @@ a scheduled report. It provides:
 
 ## Install
 
+These docs target `0.3.0-rc.1` with Effect `4.0.0-rc.115`. Check the
+[current release record](./docs/release-readiness.md) for publication status
+before installing. `0.3.0-rc.0` uses the older Effect beta dependency set.
+
 ```bash
-pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
+pnpm add @effectmq/core@0.3.0-rc.1 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
 ```
 
 > [!IMPORTANT]
@@ -197,14 +201,14 @@ const watch = TaskQueue.stream(emails).pipe(
 );
 ```
 
-Because it's just a stream of terminal events, you can also *wait on a specific task*. `wait` blocks until a task id reaches a terminal state, resolving with its success value or failing with its typed error. `execute` is the offer-and-wait shortcut: enqueue a payload and get its outcome back in one call.
+You can also *wait on a specific generation*. `wait` reads durable state and consumes lifecycle events until that generation settles, returning its success value or a `TaskFailed` error whose `failure` contains the typed handler or built-in failure. Retriable failure events do not end the wait. `execute` is the offer-and-wait shortcut.
 
 ```ts docs-check=email
 // Offer + await the result in one call.
 const executeMessage = TaskQueue.execute(emails, {
   to: "ada@example.com",
   subject: "Welcome",
-}); // resolves with the success value, or fails with EmailRejected
+}); // resolves with the success value, or TaskFailed with an EmailRejected failure
 
 // Or await a task you already offered.
 const offerAndWait = Effect.gen(function* () {

@@ -30,7 +30,9 @@ Required pull-request gates run:
 - the ESM package consumer on Node 22 and 24;
 - Redis 7.2, 7.4, and 8.0 with RESP2 and RESP3;
 - standalone restart and a primary/replica/three-Sentinel failover, including
-  post-promotion `NOSCRIPT` reload.
+  post-promotion `NOSCRIPT` reload;
+- a 15-second soak smoke with forced-GC heap measurement, maximum maintenance
+  batch validation, and graceful shutdown.
 
 The lockfile is the tested dependency set. Renovation of Effect or node-redis
 must use a pull request and pass this entire matrix. An application may use a

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 const FULL_COMMAND =
-  "pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115";
+  "pnpm add @effectmq/core@0.3.0-rc.1 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115";
 
 export function InstallCommand() {
   const [status, setStatus] = useState<"idle" | "copied" | "error">("idle");
@@ -15,7 +15,7 @@ export function InstallCommand() {
     <div className="lp-install">
       <span className="lp-prompt">$</span>
       <span className="lp-pkg">
-        pnpm add <span className="lp-accent">@effectmq/core@rc</span>
+        pnpm add <span className="lp-accent">@effectmq/core@0.3.0-rc.1</span>
       </span>
       <button
         type="button"

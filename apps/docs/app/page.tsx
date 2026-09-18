@@ -258,7 +258,7 @@ export default function HomePage() {
         <div className="lp-container lp-footer-fine">
           <p>
             MIT · built on <a href="https://effect.website">Effect</a> ·
-            requires the Effect 4 beta · © 2026
+            requires Effect 4.0.0-rc.115 · © 2026
           </p>
         </div>
       </footer>

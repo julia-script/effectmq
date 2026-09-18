@@ -31,7 +31,7 @@ Create the project directory and start one Redis server:
 ```bash
 mkdir effectmq-hello
 cd effectmq-hello
-docker run --name effectmq-tutorial-redis --publish 6379:6379 --detach redis:8-alpine
+docker run --name effectmq-tutorial-redis --publish 6379:6379 --detach redis:8.0-alpine
 ```
 
 Confirm that Redis is ready:
@@ -56,11 +56,16 @@ PONG
 
 ## Create the project
 
+These examples target `0.3.0-rc.1` and Effect `4.0.0-rc.115`. Check the
+[release record](https://github.com/julia-script/effectmq/blob/main/docs/release-readiness.md)
+for publication status. If npm reports that `0.3.0-rc.1` is unavailable, wait
+for publication; do not substitute `0.3.0-rc.0`, which uses the older Effect beta.
+
 Initialize the package and install the pinned EffectMQ dependencies:
 
 ```bash
 pnpm init
-pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
+pnpm add @effectmq/core@0.3.0-rc.1 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
 pnpm add --save-dev tsx@4.22.4
 mkdir src
 ```
@@ -74,13 +79,12 @@ Create `src/main.ts`:
 ```ts
 import { NodeRuntime } from "@effect/platform-node"
 import {
-  NodeRedisPool,
   Task,
   TaskEngine,
   TaskQueue,
   Worker
 } from "@effectmq/core"
-import { Console, Effect, Layer, Schema } from "effect"
+import { Console, Effect, Schema } from "effect"
 
 const Greet = Task.make({
   name: "greet",
@@ -93,11 +97,9 @@ const Greet = Task.make({
 
 const greetings = TaskQueue.make("tutorial-greetings", Greet)
 
-const EngineLive = TaskEngine.layer().pipe(
-  Layer.provideMerge(
-    NodeRedisPool.layer({ url: "redis://127.0.0.1:6379" })
-  )
-)
+const EngineLive = TaskEngine.layer({
+  redis: { url: "redis://127.0.0.1:6379" }
+})
 
 const worker = Worker.make(
   greetings,

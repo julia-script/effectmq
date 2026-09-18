@@ -6,11 +6,14 @@
   },
   "changesets": [
     "clean-effect-contracts",
+    "current-release-docs",
+    "durable-named-events",
     "free-rabbits-clap",
     "fresh-effect-rc",
     "production-ready-core",
     "reviewed-runtime-correctness",
     "spotty-months-tan",
+    "task-progress-history",
     "tough-lions-repair"
   ]
 }

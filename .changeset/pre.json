@@ -5,7 +5,11 @@
     "@effectmq/core": "0.2.0"
   },
   "changesets": [
+    "clean-effect-contracts",
+    "free-rabbits-clap",
+    "fresh-effect-rc",
     "production-ready-core",
+    "reviewed-runtime-correctness",
     "spotty-months-tan",
     "tough-lions-repair"
   ]

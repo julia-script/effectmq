@@ -8,6 +8,12 @@
  * @module
  */
 
+/** Atomic storage service for durable application events. */
+export * as EventEngine from "./EventEngine.js";
+/** Durable typed application events and named subscriptions. */
+export * as EventQueue from "./EventQueue.js";
+/** Public durable event, subscription, and delivery models. */
+export * as EventRecord from "./EventRecord.js";
 /**
  * Scoped node-redis adapters for standalone Redis and Sentinel.
  *
@@ -22,10 +28,6 @@ export * as NodeRedisPool from "./NodeRedisPool.js";
  * @since 0.3.0
  */
 export * as Observability from "./Observability.js";
-/** Public schemas and codecs for typed task records. */
-export * as TaskRecord from "./TaskRecord.js";
-/** Public schemas for queue lifecycle events. */
-export * as TaskEvent from "./TaskEvent.js";
 /**
  * Minimal Redis command, script-cache, and workload-role services.
  *
@@ -68,6 +70,8 @@ export * as Task from "./Task.js";
  * @since 0.1.0
  */
 export * as TaskEngine from "./TaskEngine.js";
+/** Public schemas for queue lifecycle events. */
+export * as TaskEvent from "./TaskEvent.js";
 /**
  * A typed queue task handler.
  *
@@ -82,6 +86,8 @@ export type { TaskHandler } from "./TaskQueue.js";
  * @since 0.1.0
  */
 export * as TaskQueue from "./TaskQueue.js";
+/** Public schemas and codecs for typed task records. */
+export * as TaskRecord from "./TaskRecord.js";
 /**
  * Managed queue workers with bounded concurrency and graceful draining.
  *

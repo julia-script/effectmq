@@ -66,6 +66,18 @@
     "./Worker": {
       "types": "./dist/Worker.d.ts",
       "default": "./dist/Worker.js"
+    },
+    "./EventEngine": {
+      "types": "./dist/EventEngine.d.ts",
+      "default": "./dist/EventEngine.js"
+    },
+    "./EventQueue": {
+      "types": "./dist/EventQueue.d.ts",
+      "default": "./dist/EventQueue.js"
+    },
+    "./EventRecord": {
+      "types": "./dist/EventRecord.d.ts",
+      "default": "./dist/EventRecord.js"
     }
   },
   "files": [

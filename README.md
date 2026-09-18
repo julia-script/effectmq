@@ -18,7 +18,9 @@ a scheduled report. It provides:
 - at-least-once delivery with fenced attempts and stalled-worker recovery;
 - Effect `Schedule` retries, delayed offers, deduplication, and durable cron;
 - bounded local worker concurrency, graceful draining, and maintenance;
-- typed lifecycle streams plus `wait` and `execute` for durable results.
+- typed lifecycle streams plus `wait` and `execute` for durable results;
+- [durable application events](./docs/events.md) with named subscriptions, independent
+  acknowledgements, optional deadlines, and deletion or archival.
 
 ## Install
 

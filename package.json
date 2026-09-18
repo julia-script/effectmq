@@ -1,6 +1,6 @@
 {
   "name": "@effectmq/core",
-  "version": "0.3.0-rc.2",
+  "version": "0.3.0",
   "description": "Effect-based message queue",
   "repository": {
     "type": "git",

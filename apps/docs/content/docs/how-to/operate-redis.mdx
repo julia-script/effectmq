@@ -16,9 +16,9 @@ import { Config, Effect, Layer, Redacted } from "effect"
 
 const AppLive = Layer.unwrap(
   Config.all({
-    url: Config.string("REDIS_URL"),
-    username: Config.string("REDIS_USERNAME"),
-    password: Config.redacted("REDIS_PASSWORD")
+    url: Config.String("REDIS_URL"),
+    username: Config.String("REDIS_USERNAME"),
+    password: Config.Redacted("REDIS_PASSWORD")
   }).pipe(
     Effect.map(({ password, url, username }) =>
       TaskEngine.layer({

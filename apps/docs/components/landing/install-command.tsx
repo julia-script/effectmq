@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 const FULL_COMMAND =
-  "pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-beta.107 @effect/platform-node@4.0.0-beta.107";
+  "pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115";
 
 export function InstallCommand() {
   const [status, setStatus] = useState<"idle" | "copied" | "error">("idle");

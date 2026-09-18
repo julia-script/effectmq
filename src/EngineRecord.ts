@@ -13,7 +13,7 @@ import {
 
 export const TextFromBytes = Schema.Unknown.pipe(
   Schema.decodeTo(Schema.String, {
-    decode: SchemaGetter.transformOrFail((value: unknown, options) => {
+    decode: SchemaGetter.transformEffect((value: unknown, options) => {
       if (typeof value === "string") return Effect.succeed(value);
       if (!(value instanceof Uint8Array)) {
         return Effect.fail(
@@ -39,7 +39,7 @@ export const TextFromBytes = Schema.Unknown.pipe(
 );
 
 const numberFromText = (integer: boolean) =>
-  SchemaGetter.transformOrFail((value: string, options) => {
+  SchemaGetter.transformEffect((value: string, options) => {
     const pattern = integer
       ? /^-?(?:0|[1-9]\d*)$/
       : /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
@@ -77,7 +77,7 @@ export const IntegerFromBytes = TextFromBytes.pipe(
 
 export const BooleanFromBytes = TextFromBytes.pipe(
   Schema.decodeTo(Schema.Boolean, {
-    decode: SchemaGetter.transformOrFail((value, options) =>
+    decode: SchemaGetter.transformEffect((value, options) =>
       value === "1"
         ? Effect.succeed(true)
         : value === "0"

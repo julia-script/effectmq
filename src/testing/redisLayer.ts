@@ -7,6 +7,7 @@ import { RedisContainer } from "@testcontainers/redis";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schedule from "effect/Schedule";
@@ -245,7 +246,41 @@ export const redisContainerLayer = ({
         redisPool,
         redisPool,
       );
-      const redis = yield* Redis.make({ send });
+      const redis = yield* Redis.make({
+        send,
+        subscribe: (channel, onMessage) =>
+          Effect.gen(function* () {
+            const terminal = yield* Deferred.make<void, Redis.RedisError>();
+            const runSync = Effect.runSyncWith(yield* Effect.context<never>());
+            const subscriber = yield* acquireTracked(
+              registry,
+              "ioredis-subscriber",
+              Effect.try({
+                try: () => client.duplicate({ lazyConnect: true }),
+                catch: (cause) => new Redis.RedisError({ cause }),
+              }),
+              (subscriber) => Effect.sync(() => subscriber.disconnect()),
+            );
+            subscriber.on("message", (channel, message) => {
+              onMessage({ channel, message });
+            });
+            subscriber.on("end", () => {
+              runSync(
+                Deferred.fail(
+                  terminal,
+                  new Redis.RedisError({
+                    cause: "Redis subscription connection ended",
+                  }),
+                ),
+              );
+            });
+            yield* Effect.tryPromise({
+              try: () => subscriber.subscribe(channel),
+              catch: (cause) => new Redis.RedisError({ cause }),
+            });
+            return Deferred.await(terminal);
+          }),
+      });
       return Context.make(RedisPool.RedisPool, redisPool).pipe(
         Context.add(RedisPool.RedisConnectionRoles, roles),
         Context.add(Redis.Redis, redis),

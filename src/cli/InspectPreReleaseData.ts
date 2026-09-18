@@ -13,12 +13,12 @@ export interface InspectionConfig {
 }
 
 export const configuration: Config.Config<InspectionConfig> = Config.all({
-  redisUrl: Config.string("EFFECTMQ_REDIS_URL"),
-  match: Config.string("EFFECTMQ_SCAN_MATCH").pipe(
+  redisUrl: Config.String("EFFECTMQ_REDIS_URL"),
+  match: Config.String("EFFECTMQ_SCAN_MATCH").pipe(
     Config.withDefault("~effectmq:*"),
   ),
-  count: Config.number("EFFECTMQ_SCAN_COUNT").pipe(Config.withDefault(500)),
-  assertDrained: Config.boolean("EFFECTMQ_ASSERT_DRAINED").pipe(
+  count: Config.Number("EFFECTMQ_SCAN_COUNT").pipe(Config.withDefault(500)),
+  assertDrained: Config.Boolean("EFFECTMQ_ASSERT_DRAINED").pipe(
     Config.withDefault(false),
   ),
 });

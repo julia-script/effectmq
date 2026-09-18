@@ -12,7 +12,7 @@ security fixes, and is eligible for production incident reports.
 | Redis Cluster | unsupported | Fails startup with `UnsupportedRedisTopology` |
 | RESP | RESP2, RESP3 | Text and binary command paths tested on standalone |
 | node-redis | 6.1.x | The direct runtime client; upgrades require the full matrix |
-| Effect | 4.0.0-beta.107 through compatible 4.x | Peer dependency; the minimum is tested |
+| Effect | 4.0.0-rc.115 through compatible 4.x | Peer dependency; the minimum is tested |
 | Module system | Node ESM | CommonJS `require` is not a supported consumer boundary |
 
 Valkey, Dragonfly, KeyDB, managed “Redis-compatible” products, proxies, Redis

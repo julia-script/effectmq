@@ -9,3 +9,5 @@ out/
 .history/
 llms/
 .agents/
+.vercel
+.env*

@@ -59,7 +59,7 @@ docker run --rm -p 6391:6379 redis:8.0-alpine \
   redis-server --save '' --appendonly no --maxmemory-policy noeviction
 
 EFFECTMQ_REDIS_URL=redis://127.0.0.1:6391 \
-  node --expose-gc node_modules/tsx/dist/cli.mjs scripts/soak.ts
+  pnpm soak
 ```
 
 Override `EFFECTMQ_SOAK_DURATION_MS`, `EFFECTMQ_SOAK_CONCURRENCY`,

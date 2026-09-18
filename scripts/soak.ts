@@ -37,9 +37,10 @@ const infoNumber = (info: string, field: string) =>
   Number(new RegExp(`^${field}:(\\d+)$`, "m").exec(info)?.[1] ?? 0);
 const memorySnapshot = () => {
   const gc = (globalThis as { gc?: () => void }).gc;
-  gc?.();
-  gc?.();
-  gc?.();
+  if (!gc) throw new Error("Soak requires exposed GC; run pnpm soak");
+  gc();
+  gc();
+  gc();
   return process.memoryUsage();
 };
 

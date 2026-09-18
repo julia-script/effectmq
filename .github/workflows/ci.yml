@@ -125,7 +125,7 @@ jobs:
       - name: Soak and graceful shutdown smoke
         env:
           EFFECTMQ_SOAK_DURATION_MS: 15000
-        run: node --expose-gc node_modules/tsx/dist/cli.mjs scripts/soak.ts
+        run: pnpm soak
 
   release-gate:
     name: Exact-commit release gate

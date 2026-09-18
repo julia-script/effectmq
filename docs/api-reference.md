@@ -34,6 +34,20 @@ policies, `onDuplicate`, and
 before Redis is mutated. Processing options configure lease duration,
 heartbeat interval, and bounded heartbeat transport retry.
 
+## `EventQueue`, `EventEngine`, and `EventRecord`
+
+`EventQueue.make(name, payloadSchema, options?)` defines durable application events.
+`subscribe` registers an idempotent named recipient; `emit` captures the current
+recipient set. Use `processOne` for managed processing or `take`, `acknowledge`,
+`renew`, and `release` for explicit delivery control. `unsubscribe` waives that
+generation's outstanding obligations. Run `runMaintenance` for idle expiry and
+cleanup; `get` and `listArchived` inspect retained records.
+
+`EventEngine.layer()` supplies the standard Node Redis and Crypto graph;
+`layerNoDeps()` supports custom Redis pools. `EventRecord` owns public event,
+subscription, and delivery types. See [durable events](./events.md) for examples,
+retention policies, delivery guarantees, and operational bounds.
+
 ## `Worker`
 
 - `make(queue, handler, options?)` describes a managed worker.

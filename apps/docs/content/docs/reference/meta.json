@@ -3,6 +3,7 @@
   "pages": [
     "task",
     "task-queue",
+    "event-queue",
     "worker-and-scheduler",
     "redis-and-runtime",
     "errors"

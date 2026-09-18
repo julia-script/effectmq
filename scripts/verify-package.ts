@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
-  readFileSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -39,6 +39,7 @@ try {
     "package/dist/Worker.js",
     "package/dist/cli/inspect-pre-release-data.js",
     "package/src/lua/taskEngine.lua",
+    "package/src/lua/eventEngine.lua",
   ]) {
     if (!files.includes(required)) throw new Error(`Missing ${required}`);
   }
@@ -67,6 +68,9 @@ try {
     { cwd: consumer, stdio: "pipe" },
   );
   const subpaths = [
+    "EventEngine",
+    "EventQueue",
+    "EventRecord",
     "NodeRedisPool",
     "Observability",
     "RedisPool",

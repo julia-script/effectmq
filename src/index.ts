@@ -72,6 +72,8 @@ export * as Task from "./Task.js";
 export * as TaskEngine from "./TaskEngine.js";
 /** Public schemas for queue lifecycle events. */
 export * as TaskEvent from "./TaskEvent.js";
+/** Task-owned progress, lifecycle entries, cursors, and operational errors. */
+export * as TaskHistory from "./TaskHistory.js";
 /**
  * A typed queue task handler.
  *

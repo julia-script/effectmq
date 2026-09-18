@@ -26,6 +26,7 @@ import * as StorageProtocol from "./StorageProtocol.js";
 import type * as Task from "./Task.js";
 import * as TaskContext from "./TaskContext.js";
 import * as TaskEngine from "./TaskEngine.js";
+import * as TaskHistory from "./TaskHistory.js";
 import * as TaskInvariant from "./TaskInvariant.js";
 import {
   type CompletionPolicy,
@@ -50,10 +51,18 @@ export interface TaskQueue<
   Error extends Schema.Top = Schema.Never,
   R = never,
   IdentityR = Crypto.Crypto,
+  Progress extends Schema.Top = Schema.Never,
 > {
   readonly [TypeId]: typeof TypeId;
   readonly name: string;
-  readonly task: Task.TaskDefinition<Payload, Success, Error, R, IdentityR>;
+  readonly task: Task.TaskDefinition<
+    Payload,
+    Success,
+    Error,
+    R,
+    IdentityR,
+    Progress
+  >;
 }
 /**
  * Creates a typed queue descriptor from a stable name and task definition.
@@ -67,10 +76,18 @@ export const make = <
   Error extends Schema.Top = Schema.Never,
   R = never,
   IdentityR = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
   name: string,
-  taskDefinition: Task.TaskDefinition<Payload, Success, Error, R, IdentityR>,
-): TaskQueue<Payload, Success, Error, R, IdentityR> => {
+  taskDefinition: Task.TaskDefinition<
+    Payload,
+    Success,
+    Error,
+    R,
+    IdentityR,
+    Progress
+  >,
+): TaskQueue<Payload, Success, Error, R, IdentityR, Progress> => {
   return {
     [TypeId]: TypeId,
     name,
@@ -105,8 +122,9 @@ const takeAvailable = Effect.fnUntraced(function* <
   Error extends Schema.Top = Schema.Never,
   R = never,
   IdentityR = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR, Progress>,
   options?: TakeOptions,
 ): Effect.fn.Return<
   TaskAttempt<Payload, Success, Error> | null,
@@ -152,8 +170,9 @@ const takeUnsafe = Effect.fnUntraced(function* <
   Error extends Schema.Top = Schema.Never,
   R = never,
   IdentityR = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR, Progress>,
   options?: TakeOptions,
 ) {
   const attempt = yield* takeAvailable(queue, options);
@@ -345,6 +364,7 @@ export type OfferRequirements<
 
 /** Infrastructure and codec failures produced while completing an attempt. */
 export type CompleteError =
+  | TaskHistory.ProgressWriteError
   | StorageProtocol.StorageProtocolError
   | RetryPolicyError
   | TaskEngine.LeaseLost
@@ -483,8 +503,9 @@ export const offer = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   R = never,
   IdentityR = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR, Progress>,
   payload: Payload["Type"],
   options?: TaskOptions,
 ): Effect.fn.Return<
@@ -547,6 +568,8 @@ export const offer = Effect.fnUntraced(function* <
       maxErrorEntries: queue.task.storageLimits.maxErrorEntries,
       maxRelationships: queue.task.storageLimits.maxRelationships,
       maxEventEntries: queue.task.storageLimits.maxEventEntries,
+      historyEnabled: queue.task.progressSchema !== undefined,
+      maxHistoryEntries: queue.task.storageLimits.maxHistoryEntries ?? null,
       taskRecordRetentionMs: queue.task.retention.taskRecordMs,
       resultRetentionMs: queue.task.retention.resultMs,
       terminalIndexRetentionMs: queue.task.retention.terminalIndexMs,
@@ -629,8 +652,9 @@ const extendLock = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   R = never,
   IdentityR = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR, Progress>,
   attempt: TaskAttempt<Payload, Success, Error>,
   lockTimeout?: Duration.Input,
 ) {
@@ -653,8 +677,9 @@ const succeed = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   R = never,
   IdentityR = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR, Progress>,
   attempt: TaskAttempt<Payload, Success, Error>,
   success: Success["Type"],
 ) {
@@ -683,8 +708,9 @@ const fail = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   R = never,
   IdentityR = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, R, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR, Progress>,
   attempt: TaskAttempt<Payload, Success, Error>,
   failure: Error["Type"],
 ) {
@@ -774,9 +800,15 @@ export type TaskHandler<
   Success extends Schema.Top,
   Error extends Schema.Top,
   R = never,
+  Progress extends Schema.Top = Schema.Never,
 > = (
   task: Task.Task<Payload, Success, Error>,
-) => Effect.Effect<Success["Type"], Error["Type"], R>;
+  context: TaskHistory.Context<Progress>,
+) => Effect.Effect<
+  Success["Type"],
+  Error["Type"] | TaskHistory.ProgressWriteError,
+  R
+>;
 
 /**
  * Configures acquisition leases and bounded heartbeat recovery.
@@ -890,10 +922,11 @@ const processAttempt = Effect.fnUntraced(function* <
   TR = never,
   IdentityR = never,
   R = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
+  self: TaskQueue<Payload, Success, Error, TR, IdentityR, Progress>,
   attempt: TaskAttempt<Payload, Success, Error>,
-  handler: TaskHandler<Payload, Success, Error, R>,
+  handler: TaskHandler<Payload, Success, Error, R, Progress>,
   options: ResolvedProcessingOptions,
 ) {
   const { lockTimeout, lockRefresh, heartbeatRetryDelay, heartbeatRetryCount } =
@@ -913,7 +946,48 @@ const processAttempt = Effect.fnUntraced(function* <
     Effect.flatMap(() => Effect.never),
   );
 
-  const handlerResult = handler(attempt.task).pipe(
+  const engine = yield* TaskEngine.TaskEngine;
+  const identity: TaskHistory.Identity = {
+    queue: self.name,
+    taskId: attempt.task.id,
+    generation: attempt.task.generation,
+  };
+  const context: TaskHistory.Context<Progress> = {
+    progress: (value) =>
+      Effect.gen(function* () {
+        const schema = self.task.progressSchema;
+        if (schema === undefined || !attempt.task.historyEnabled) {
+          return yield* new TaskHistory.HistoryDisabled(identity);
+        }
+        const encoded = yield* StorageProtocol.encodeValue(
+          self.task.schemaId,
+          "progress",
+          yield* Schema.encodeEffect(schema)(value),
+          self.task.storageLimits,
+        );
+        return yield* engine.appendProgress(
+          identity,
+          self.task.schemaId,
+          attempt.leaseToken,
+          encoded,
+        );
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new TaskHistory.ProgressWriteError({
+              ...identity,
+              cause,
+              reason:
+                cause._tag === "TaskEngineError" &&
+                (cause.reason._tag === "IndeterminateCommit" ||
+                  cause.reason._tag === "InvalidReply")
+                  ? "IndeterminateWrite"
+                  : "WriteFailed",
+            }),
+        ),
+      ),
+  };
+  const handlerResult = handler(attempt.task, context).pipe(
     Effect.provideService(TaskContext.currentTask, {
       queue: self.name,
       id: attempt.task.id,
@@ -925,6 +999,8 @@ const processAttempt = Effect.fnUntraced(function* <
   if (Result.isSuccess(result)) {
     yield* succeed(self, attempt, result.success);
   } else {
+    if (result.failure instanceof TaskHistory.ProgressWriteError)
+      return yield* result.failure;
     yield* fail(self, attempt, result.failure);
   }
   return attempt.task.id;
@@ -976,10 +1052,11 @@ export const complete: {
     TR = never,
     IdentityR = never,
     R = never,
+    Progress extends Schema.Top = Schema.Never,
   >(
-    handler: TaskHandler<Payload, Success, Error, R>,
+    handler: TaskHandler<Payload, Success, Error, R, Progress>,
   ): (
-    self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
+    self: TaskQueue<Payload, Success, Error, TR, IdentityR, Progress>,
   ) => Effect.Effect<
     string,
     CompleteError,
@@ -992,9 +1069,10 @@ export const complete: {
     TR = never,
     IdentityR = never,
     R = never,
+    Progress extends Schema.Top = Schema.Never,
   >(
-    self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
-    handler: TaskHandler<Payload, Success, Error, R>,
+    self: TaskQueue<Payload, Success, Error, TR, IdentityR, Progress>,
+    handler: TaskHandler<Payload, Success, Error, R, Progress>,
   ): Effect.Effect<
     string,
     CompleteError,
@@ -1009,9 +1087,10 @@ export const complete: {
     TR = never,
     IdentityR = never,
     R = never,
+    Progress extends Schema.Top = Schema.Never,
   >(
-    self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
-    handler: TaskHandler<Payload, Success, Error, R>,
+    self: TaskQueue<Payload, Success, Error, TR, IdentityR, Progress>,
+    handler: TaskHandler<Payload, Success, Error, R, Progress>,
   ): Effect.fn.Return<
     string,
     CompleteError,
@@ -1040,9 +1119,10 @@ export const completeOne = Effect.fnUntraced(function* <
   TR = never,
   IdentityR = never,
   R = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  self: TaskQueue<Payload, Success, Error, TR, IdentityR>,
-  handler: TaskHandler<Payload, Success, Error, R>,
+  self: TaskQueue<Payload, Success, Error, TR, IdentityR, Progress>,
+  handler: TaskHandler<Payload, Success, Error, R, Progress>,
   options?: ProcessingOptions,
 ): Effect.fn.Return<
   boolean,
@@ -1084,8 +1164,9 @@ export const stream = <
   Error extends Schema.Top,
   QueueR,
   IdentityR,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR, Progress>,
   {
     cursor,
     pollInterval,
@@ -1101,8 +1182,9 @@ const streamEffect = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   QueueR,
   IdentityR,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR, Progress>,
   {
     cursor,
     pollInterval,
@@ -1210,8 +1292,9 @@ export const wait = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   QueueR,
   IdentityR,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR, Progress>,
   handle: TaskHandle<Success["Type"], Error["Type"]>,
   options: WaitOptions = {},
 ): Effect.fn.Return<
@@ -1430,8 +1513,9 @@ export const execute = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   QueueR,
   IdentityR,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR>,
+  queue: TaskQueue<Payload, Success, Error, QueueR, IdentityR, Progress>,
   payload: Payload["Type"],
   options?: TaskOptions,
 ): Effect.fn.Return<
@@ -1441,4 +1525,94 @@ export const execute = Effect.fnUntraced(function* <
 > {
   const offered = yield* offer(queue, payload, options);
   return yield* wait(queue, offered.handle);
+});
+
+/**
+ * Reads a task generation's progress and lifecycle history in append order.
+ *
+ * Start without `after`, then pass each returned cursor to resume exclusively.
+ * Page size defaults to 100 (maximum 1,000). Empty pages can be polled again.
+ * An explicit cursor that missed trimmed entries fails with HistoryCursorExpired;
+ * its earliestCursor resumes at the oldest retained entry. History disappears
+ * with the task record, even when a terminal result remains retained.
+ *
+ * @category Operations
+ * @since 0.3.0
+ */
+export const readEvents = Effect.fnUntraced(function* <
+  Payload extends Schema.Top,
+  Success extends Schema.Top,
+  Error extends Schema.Top,
+  R,
+  IdentityR,
+  Progress extends Schema.Top,
+>(
+  queue: TaskQueue<Payload, Success, Error, R, IdentityR, Progress>,
+  handle: TaskHandle<Success["Type"], Error["Type"]>,
+  options?: TaskHistory.ReadOptions,
+): Effect.fn.Return<
+  TaskHistory.Page<Progress["Type"]>,
+  TaskEngine.HistoryError | TaskHandleMismatch,
+  TaskEngine.TaskEngine | Progress["DecodingServices"]
+> {
+  yield* TaskInvariant.validate(queue.task);
+  if (handle.queue !== queue.name || handle.taskName !== queue.task.name) {
+    return yield* new TaskHandleMismatch({
+      expectedQueue: queue.name,
+      actualQueue: handle.queue,
+      expectedTaskName: queue.task.name,
+      actualTaskName: handle.taskName,
+    });
+  }
+  if (handle.schemaId !== queue.task.schemaId)
+    return yield* new StorageProtocol.SchemaIdentityMismatch({
+      expected: queue.task.schemaId,
+      encountered: handle.schemaId,
+    });
+  if (handle.protocolVersion !== 1)
+    return yield* new StorageProtocol.UnsupportedProtocolVersion({
+      encountered: handle.protocolVersion,
+      supported: [1],
+    });
+  const identity = {
+    queue: queue.name,
+    taskId: handle.taskId,
+    generation: handle.generation,
+  };
+  const schema = queue.task.progressSchema;
+  if (schema === undefined)
+    return yield* new TaskHistory.HistoryDisabled(identity);
+  const engine = yield* TaskEngine.TaskEngine;
+  const page = yield* engine.readHistory(
+    identity,
+    queue.task.schemaId,
+    options,
+  );
+  const entries = yield* Effect.forEach(
+    page.entries,
+    (
+      entry,
+    ): Effect.Effect<
+      TaskHistory.Entry<Progress["Type"]>,
+      StorageProtocol.StorageProtocolError | Schema.SchemaError,
+      Progress["DecodingServices"]
+    > =>
+      Effect.gen(function* () {
+        if (entry.event._tag === "Lifecycle")
+          return { ...entry, event: entry.event };
+        const value = yield* StorageProtocol.decodeValue(
+          entry.event.data,
+          queue.task.schemaId,
+          "progress",
+        );
+        return {
+          ...entry,
+          event: {
+            _tag: "Progress" as const,
+            data: yield* Schema.decodeUnknownEffect(schema)(value),
+          },
+        };
+      }),
+  );
+  return { ...page, entries };
 });

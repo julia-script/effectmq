@@ -41,3 +41,23 @@ because restoring Redis can remove acknowledged recent offers.
 The release rehearsal must record exact commits, package integrity, backup and
 restore points, start/stop order, queue/result samples, duration, and whether
 any write was indeterminate. See the [operations runbook](./operations.md).
+
+## Enabling task progress history
+
+The v1 history feature requires every producer, worker, scheduler, and
+maintenance process to run the upgraded engine **before** any task definition
+opts in with `progress`. Sharing storage protocol v1 alone does not make an old
+engine safe for enabled generations: it cannot append lifecycle history or
+remove the extra keys. Legacy records missing history metadata remain disabled,
+even if a later duplicate offer uses a progress-enabled definition.
+
+Before rolling back to an engine without history support, stop creating enabled
+generations, drain enabled work, and dispose of retained enabled records through
+the upgraded engine. Release holds first or explicitly use administrative force
+removal when that is intended. Verify their generation-specific history keys
+are gone before starting old processes. Do not delete only the task hash.
+
+The history compatibility tests rehearse legacy records, generation replacement,
+`SCRIPT FLUSH`/`NOSCRIPT` reload, and disposal with the upgraded engine. Script
+loading remains content-addressed `SCRIPT LOAD`/`EVALSHA`; there is no global
+function replacement that upgrades running old processes automatically.

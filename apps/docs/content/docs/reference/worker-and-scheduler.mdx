@@ -10,6 +10,11 @@ Worker.make(queue, handler, options?): Worker
 ```
 
 Creates a descriptor without starting fibers or acquiring Redis connections.
+The handler receives `(task, context)`. For progress-enabled tasks,
+`context.progress(value)` emits typed progress with the current attempt lease.
+Progress encoding services become handler requirements; uncaught
+`ProgressWriteError` is operational and leaves the attempt for lease recovery.
+See [reporting progress](/docs/how-to/report-task-progress).
 
 | Option | Type | Default |
 | --- | --- | ---: |

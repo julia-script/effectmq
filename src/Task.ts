@@ -1,6 +1,6 @@
 /**
  * Typed task definitions: the schema-bearing description of a unit of work
- * (payload, success, and error types) that a `TaskQueue` processes.
+ * (payload, success, error, and optional progress types) that a `TaskQueue` processes.
  *
  * @module
  */
@@ -79,7 +79,7 @@ export type { Task } from "./TaskRecord.js";
 /**
  * The schema-bearing definition of one task family.
  *
- * A definition owns payload, success, and failure schemas; retry behavior;
+ * A definition owns payload, success, failure, and optional progress schemas; retry behavior;
  * storage and retention limits; and the idempotency-key function used by
  * `TaskQueue.offer`.
  *
@@ -92,15 +92,18 @@ export interface TaskDefinition<
   Error extends Schema.Top = Schema.Never,
   R = never,
   IdentityR = Crypto.Crypto,
+  Progress extends Schema.Top = Schema.Never,
 > {
   readonly [TypeId]: typeof TypeId;
 
   readonly name: string;
-  /** Stable identity of this payload/success/failure schema family. */
+  /** Stable identity of this payload/success/failure/progress schema family. */
   readonly schemaId: string;
   readonly payloadSchema: Payload;
   readonly successSchema: Success;
   readonly errorSchema: Error;
+  /** Presence enables custom progress and automatic lifecycle history for new generations. */
+  readonly progressSchema?: Progress;
   readonly retrySchedule?: Schedule.Schedule<
     unknown,
     NoInfer<Error["Type"]>,
@@ -153,11 +156,13 @@ const makeInternal = <
   Error extends Schema.Top = Schema.Never,
   R = never,
   IdentityR = Crypto.Crypto,
+  Progress extends Schema.Top = Schema.Never,
 >(config: {
   name: string;
   schemaId?: string;
   success: Success;
   error: Error;
+  progress?: Progress;
   payload: Payload;
   maxRetries?: number | null;
   storageLimits?: Partial<StorageLimits>;
@@ -166,13 +171,21 @@ const makeInternal = <
     payload: ResolvePayload<Payload>["Type"],
   ) => Effect.Effect<string, TaskIdentityGenerationError, IdentityR>;
   retrySchedule?: Schedule.Schedule<any, NoInfer<Error["Type"]>, any, R>;
-}): TaskDefinition<ResolvePayload<Payload>, Success, Error, R, IdentityR> => ({
+}): TaskDefinition<
+  ResolvePayload<Payload>,
+  Success,
+  Error,
+  R,
+  IdentityR,
+  Progress
+> => ({
   [TypeId]: TypeId,
   name: config.name,
   schemaId: config.schemaId ?? config.name,
   payloadSchema: resolvePayloadSchema(config.payload),
   successSchema: (config.success ?? Schema.Void) as Success,
   errorSchema: (config.error ?? Schema.Never) as Error,
+  progressSchema: config.progress,
   retrySchedule: config.retrySchedule,
   // unset → default cap of 5; null → unbounded; a number → that number
   maxRetries:
@@ -232,11 +245,13 @@ export const make: {
     R1 = never,
     R2 = never,
     R3 = never,
+    Progress extends Schema.Top = Schema.Never,
   >(config: {
     name: string;
     schemaId?: string;
     success: Success;
     error: Error;
+    progress?: Progress;
     payload: Payload;
     maxRetries?: number | null;
     storageLimits?: Partial<StorageLimits>;
@@ -263,7 +278,8 @@ export const make: {
     Success,
     Error,
     R1 | R2 | R3,
-    never
+    never,
+    Progress
   >;
 
   <
@@ -273,11 +289,13 @@ export const make: {
     R1 = never,
     R2 = never,
     R3 = never,
+    Progress extends Schema.Top = Schema.Never,
   >(config: {
     name: string;
     schemaId?: string;
     success: Success;
     error: Error;
+    progress?: Progress;
     payload: Payload;
     maxRetries?: number | null;
     storageLimits?: Partial<StorageLimits>;
@@ -304,7 +322,8 @@ export const make: {
     Success,
     Error,
     R1 | R2 | R3,
-    Crypto.Crypto
+    Crypto.Crypto,
+    Progress
   >;
 
   <
@@ -312,12 +331,14 @@ export const make: {
     Success extends Schema.Top = Schema.Void,
     Error extends Schema.Top = Schema.Never,
     Env = never,
+    Progress extends Schema.Top = Schema.Never,
   >(config: {
     name: string;
     schemaId?: string;
     payload: Payload;
     success: Success;
     error: Error;
+    progress?: Progress;
     maxRetries?: number | null;
     storageLimits?: Partial<StorageLimits>;
     retention?: Partial<RetentionPolicy>;
@@ -328,19 +349,28 @@ export const make: {
       NoInfer<Error["Type"]>,
       Env
     >;
-  }): TaskDefinition<ResolvePayload<Payload>, Success, Error, Env, never>;
+  }): TaskDefinition<
+    ResolvePayload<Payload>,
+    Success,
+    Error,
+    Env,
+    never,
+    Progress
+  >;
 
   <
     Payload extends AnyStructSchema | Schema.Struct.Fields,
     Success extends Schema.Top = Schema.Void,
     Error extends Schema.Top = Schema.Never,
     Env = never,
+    Progress extends Schema.Top = Schema.Never,
   >(config: {
     name: string;
     schemaId?: string;
     payload: Payload;
     success: Success;
     error: Error;
+    progress?: Progress;
     maxRetries?: number | null;
     storageLimits?: Partial<StorageLimits>;
     retention?: Partial<RetentionPolicy>;
@@ -356,7 +386,8 @@ export const make: {
     Success,
     Error,
     Env,
-    Crypto.Crypto
+    Crypto.Crypto,
+    Progress
   >;
 } = (({
   name,
@@ -364,6 +395,7 @@ export const make: {
   payload,
   success,
   error,
+  progress,
   maxRetries,
   storageLimits,
   retention,
@@ -375,6 +407,7 @@ export const make: {
   payload: AnyStructSchema | Schema.Struct.Fields;
   success: Schema.Top;
   error: Schema.Top;
+  progress?: Schema.Top;
   maxRetries?: number | null;
   storageLimits?: Partial<StorageLimits>;
   retention?: Partial<RetentionPolicy>;
@@ -413,6 +446,7 @@ export const make: {
     schemaId,
     success,
     error,
+    progress,
     payload,
     maxRetries,
     storageLimits,

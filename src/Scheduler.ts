@@ -51,7 +51,17 @@ const validateConfig = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   QueueR,
   QueueIdentityR,
->(config: SchedulerConfig<Payload, Success, Error, QueueR, QueueIdentityR>) {
+  Progress extends Schema.Top = Schema.Never,
+>(
+  config: SchedulerConfig<
+    Payload,
+    Success,
+    Error,
+    QueueR,
+    QueueIdentityR,
+    Progress
+  >,
+) {
   if (
     config.missed._tag === "backfill" &&
     (!Number.isSafeInteger(config.missed.maxBackfill) ||
@@ -80,6 +90,7 @@ export interface SchedulerConfig<
   Error extends Schema.Top,
   QueueR = never,
   QueueIdentityR = Crypto.Crypto,
+  Progress extends Schema.Top = Schema.Never,
 > {
   readonly name: string;
   /** Cron rule including its optional IANA time zone. */
@@ -89,7 +100,8 @@ export interface SchedulerConfig<
     Success,
     Error,
     QueueR,
-    QueueIdentityR
+    QueueIdentityR,
+    Progress
   >;
   readonly payload: (tick: Tick) => Payload["Type"];
   readonly missed: MissedTickPolicy;
@@ -177,8 +189,16 @@ export const materializeDue = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   QueueR,
   QueueIdentityR,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  config: SchedulerConfig<Payload, Success, Error, QueueR, QueueIdentityR>,
+  config: SchedulerConfig<
+    Payload,
+    Success,
+    Error,
+    QueueR,
+    QueueIdentityR,
+    Progress
+  >,
   now?: Date,
 ) {
   yield* validateConfig(config);
@@ -276,8 +296,16 @@ export const make = <
   Error extends Schema.Top,
   QueueR = never,
   QueueIdentityR = Crypto.Crypto,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  config: SchedulerConfig<Payload, Success, Error, QueueR, QueueIdentityR>,
+  config: SchedulerConfig<
+    Payload,
+    Success,
+    Error,
+    QueueR,
+    QueueIdentityR,
+    Progress
+  >,
 ): Scheduler<Payload, Success, Error, QueueIdentityR> => {
   const execute = Effect.gen(function* () {
     let next = yield* materializeDue(config);

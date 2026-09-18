@@ -20,10 +20,11 @@ services, or validate runtime invariants.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | `string` | required | Task-family name. |
-| `schemaId` | `string` | `name` | Stable identity of the payload, success, and failure schema family. |
+| `schemaId` | `string` | `name` | Stable identity of the payload, success, failure, and progress schema family. |
 | `payload` | `Schema.Struct` or struct fields | required | Payload schema. Bare fields are wrapped with `Schema.Struct`. |
 | `success` | `Schema.Top` | required | Handler success schema. Use `Schema.Void` for no value. |
 | `error` | `Schema.Top` | required | Handler failure schema. Use `Schema.Never` for an infallible handler. |
+| `progress` | `Schema.Top` | unset | Opts new generations into custom progress and automatic lifecycle history. `Schema.Never` enables lifecycle-only history. |
 | `idempotencyKey` | `(payload) => string` | random UUID | Derives the logical task id. Supplying it removes the `Crypto` requirement from identity generation. |
 | `retry` | `Schedule` or retry options | none | Determines whether and when a typed handler failure is retried. |
 | `maxRetries` | `number \| null` | `5` | Independent retry cap. `null` means unbounded. |
@@ -44,7 +45,7 @@ later fail with `TaskIdentityGenerationError` if UUID generation fails.
 ## `TaskDefinition`
 
 ```text
-TaskDefinition<Payload, Success, Error, RetryR, IdentityR>
+TaskDefinition<Payload, Success, Error, RetryR, IdentityR, Progress = Schema.Never>
 ```
 
 | Property | Description |
@@ -54,6 +55,7 @@ TaskDefinition<Payload, Success, Error, RetryR, IdentityR>
 | `payloadSchema` | Resolved payload schema. |
 | `successSchema` | Terminal success schema. |
 | `errorSchema` | Typed handler failure schema. |
+| `progressSchema` | Optional custom progress schema; presence enables history. |
 | `retrySchedule` | Normalized Effect Schedule, when configured. |
 | `maxRetries` | Effective definition-level retry cap. |
 | `storageLimits` | Fully resolved storage limits. |
@@ -85,9 +87,13 @@ result can expire before its task record.
 | `maxErrorEntries` | 100 |
 | `maxRelationships` | 1,000 |
 | `maxEventEntries` | 10,000 |
+| `maxHistoryEntries` | `null` (unlimited) |
 
-`maxEventEntries` must be at least 1. Other storage limits and all retention
-durations must be non-negative safe integers.
+`maxEventEntries` must be at least 1. `maxHistoryEntries` must be null, omitted,
+or a positive safe integer; a finite cap trims oldest task-history entries.
+Other storage limits and all retention durations must be non-negative safe
+integers. History follows task-record disposal and has no separate TTL.
+See [reporting progress](/docs/how-to/report-task-progress).
 
 ## `Task.resolvePayloadSchema`
 

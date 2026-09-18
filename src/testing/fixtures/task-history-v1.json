@@ -1,0 +1,20 @@
+{
+  "identity": {
+    "queue": "fixture",
+    "taskId": "task",
+    "generation": 1
+  },
+  "schemaId": "history-fixture/v1",
+  "id": "1000000-0",
+  "fields": {
+    "taskId": "task",
+    "generation": "1",
+    "attempt": "1",
+    "timestamp": "1000000",
+    "sequence": "1",
+    "protocolVersion": "1",
+    "schemaId": "history-fixture/v1",
+    "kind": "Progress",
+    "data": "effectmq:v1:lAGyaGlzdG9yeS1maXh0dXJlL3YxqHByb2dyZXNz3gACpF90YWenTWVzc2FnZaR0ZXh0p3dvcmtpbmc="
+  }
+}

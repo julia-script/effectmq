@@ -42,7 +42,7 @@ export const builtInErrorTags = {
  * @category Protocol
  * @since 0.3.0
  */
-export type ValueKind = "payload" | "success" | "failure";
+export type ValueKind = "payload" | "success" | "failure" | "progress";
 
 /**
  * Bounds persisted values and queue-owned collections.
@@ -55,13 +55,16 @@ export interface StorageLimits {
   readonly maxErrorEntries: number;
   readonly maxRelationships: number;
   readonly maxEventEntries: number;
+  /** Per-task history count; omitted or null keeps all entries until task disposal. */
+  readonly maxHistoryEntries?: number | null;
 }
 
 /**
  * Production defaults for storage bytes, error history, relationships, and events.
  *
  * Values are limited to 1 MiB, error history to 100 entries, retention
- * relationships to 1,000, and event history to 10,000 entries.
+ * relationships to 1,000, and queue event history to 10,000 entries.
+ * Task-owned history has no count limit by default.
  *
  * @category Configuration
  * @since 0.3.0
@@ -71,6 +74,7 @@ export const defaultStorageLimits: StorageLimits = {
   maxErrorEntries: 100,
   maxRelationships: 1000,
   maxEventEntries: 10_000,
+  maxHistoryEntries: null,
 };
 
 /**

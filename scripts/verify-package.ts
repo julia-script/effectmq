@@ -37,6 +37,8 @@ try {
     "package/dist/index.d.ts",
     "package/dist/NodeRedisPool.js",
     "package/dist/Worker.js",
+    "package/dist/TaskHistory.js",
+    "package/dist/TaskHistory.d.ts",
     "package/dist/cli/inspect-pre-release-data.js",
     "package/src/lua/taskEngine.lua",
     "package/src/lua/eventEngine.lua",
@@ -79,6 +81,7 @@ try {
     "Task",
     "TaskEngine",
     "TaskEvent",
+    "TaskHistory",
     "TaskQueue",
     "TaskRecord",
     "Worker",
@@ -98,7 +101,28 @@ try {
     join(consumer, "index.mjs"),
     consumerSource + removedSubpathCheck,
   );
-  writeFileSync(join(consumer, "index.ts"), consumerSource);
+  writeFileSync(
+    join(consumer, "index.ts"),
+    consumerSource +
+      `
+import { Effect, Schema } from "effect";
+const Progress = Schema.Struct({ message: Schema.String });
+const definition = Task.make({ name: "packed-progress", payload: {}, success: Schema.String, error: Schema.Never, progress: Progress });
+const queue = TaskQueue.make("packed-progress", definition);
+const program = Effect.gen(function* () {
+  const { handle } = yield* TaskQueue.offer(queue, {}, { onSuccessPolicy: "keep" });
+  yield* TaskQueue.completeOne(queue, (_, context) => context.progress({ message: "working" }).pipe(Effect.as("done")));
+  const page: TaskHistory.Page<typeof Progress.Type> = yield* TaskQueue.readEvents(queue, handle);
+  for (const entry of page.entries) {
+    if (entry.event._tag === "Progress") {
+      const message: string = entry.event.data.message;
+      yield* Effect.log(message);
+    }
+  }
+});
+void program;
+`,
+  );
   writeFileSync(
     join(consumer, "tsconfig.json"),
     JSON.stringify({

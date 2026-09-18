@@ -107,6 +107,8 @@ decodeValue(encoded, expectedSchemaId, expectedKind): Effect<unknown, StorageErr
 
 Supported values are `null`, strings, booleans, finite safe numbers,
 `Uint8Array`, arrays, and plain objects composed recursively from those values.
+A top-level `undefined` success is also supported for `Schema.Void`; it is
+rejected in payloads, failures, and nested values. Negative zero is rejected.
 The byte limit applies before base64 encoding.
 
 ## `Observability`

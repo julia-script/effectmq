@@ -19,12 +19,16 @@ Creates a descriptor without starting fibers or acquiring Redis connections.
 | `drainTimeout` | `Duration.Input` | 30 seconds |
 | `processing` | `TaskQueue.ProcessingOptions` | processing defaults |
 
-Concurrency is normalized with `Math.max(1, Math.floor(value))`.
+Concurrency must be a safe integer from 1 through 1,000; it is not rounded or
+clamped. Poll, maintenance, and heartbeat-retry delays must be finite and
+positive. `drainTimeout` may be zero. Lease durations must be positive safe
+integer milliseconds, with `lockRefresh < lockTimeout`; `heartbeatRetryCount`
+must be a non-negative safe integer.
 
 ## `Worker.run`
 
 ```text
-Worker.run(worker): Effect<never, never, WorkerRequirements>
+Worker.run(worker): Effect<never, WorkerConfigurationError, WorkerRequirements>
 ```
 
 Runs acquisition slots and bounded maintenance until interrupted. Attempt and
@@ -33,7 +37,9 @@ new acquisitions, waits for active handlers up to `drainTimeout`, then
 interrupts the remainder.
 
 The worker checks its task definition before acquiring Redis roles or starting
-fibers. Invalid programmer-authored configuration is a defect.
+fibers. Invalid task-definition invariants are defects. Invalid worker or
+processing options fail with `WorkerConfigurationError`, carrying `field`,
+`constraint`, and `actual`, before any worker fibers start.
 
 The required environment includes `RedisConnectionRoles`, `Crypto`, queue
 retry services, handler services, payload decoding services, and terminal

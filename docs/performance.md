@@ -1,6 +1,7 @@
 # Performance evidence
 
-This is the release-candidate baseline, not a universal capacity claim. It is
+This is the historical `0.3.0-rc.0` / Effect beta.107 baseline, not a
+measurement of `0.3.0-rc.1` or a universal capacity claim. It is
 committed so regressions and operational choices can be compared against an
 exact workload. The runner is `scripts/benchmark-maintenance.ts` and emits
 machine-readable JSON including its environment and parameters.

@@ -105,7 +105,7 @@
     "gen:lua": "tsx scripts/gen-lua.ts",
     "storage:inspect": "tsx src/cli/inspect-pre-release-data.ts",
     "bench:maintenance": "tsx scripts/benchmark-maintenance.ts",
-    "soak": "tsx scripts/soak.ts",
+    "soak": "node --expose-gc --import tsx scripts/soak.ts",
     "rehearse:rollback": "tsx scripts/rehearse-rollback.ts",
     "verify:package": "pnpm build && tsx scripts/verify-package.ts"
   },

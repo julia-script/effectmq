@@ -1,5 +1,40 @@
 # @effectmq/core
 
+## 0.3.0-rc.1
+
+### Patch Changes
+
+- d485338: Make public Effect contracts honest and restructure the package around focused
+  task-record and task-event modules. Task, queue, worker, and scheduler
+  definitions remain pure while programmer-authored definition invariants become
+  defects at their first runtime use. TaskEngine errors use semantic reason tags,
+  the standard `TaskEngine.layer` is fully wired, and malformed codec/Redis inputs
+  remain in typed error channels.
+- c42c4be: Upgrade Effect, @effect/platform-node, and @effect/vitest to 4.0.0-rc.115,
+  and raise the Effect peer dependency minimum to the same release candidate.
+  Adapt schema codecs and configuration to the RC APIs, preserve scoped Redis
+  subscriptions in the live and test adapters, and update the matching test
+  integration to Vitest 5.
+- e13bdb8: Fix queue correctness and boundary validation found during a repository-wide
+  review:
+
+  - allow `Schema.Void` tasks to persist and recover successful completion;
+  - keep `wait` and `execute` subscribed across retryable failures;
+  - reject queue/task descriptors that do not match a persisted handle;
+  - validate numeric offer, lease, and retry-timestamp inputs before mutating
+    Redis;
+  - validate decoded storage values, preserve prototype-sensitive object keys,
+    and reject corrupt Redis numbers and cursors in typed error channels;
+  - schema-validate built-in failure events and keep their public type precise;
+  - keep stalled-attempt history out of handler retry schedules, settle attempts
+    when retry-policy evaluation fails, stop safely when retained history is too
+    short to replay, and retain terminal failures even when error history is
+    disabled;
+  - preserve retry-policy interruption for lease recovery and avoid full
+    wait-list scans on creation, acquisition, and non-waiting transitions; and
+  - reject unsafe worker concurrency, timing, and lease supervision options
+    before acquiring work or starting fibers.
+
 ## 0.3.0-rc.0
 
 ### Minor Changes
@@ -28,6 +63,7 @@
     at-least-once.
   - Support standalone Redis and Sentinel with explicit TLS/ACL/timeout/pool
     configuration and fail startup for Redis Cluster.
+
 - Add compatibility, property, fault, restart/failover, package-consumer,
   benchmark, soak, documentation, and provenance-bearing release gates.
 - Refresh `effect` and direct `@effect/*` development dependencies to

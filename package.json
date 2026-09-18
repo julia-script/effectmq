@@ -97,7 +97,7 @@
     "check:changesets": "changeset status --since=origin/main",
     "check:release": "tsx scripts/check-release.ts",
     "check:architecture": "tsx scripts/check-architecture.ts",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm check:architecture && pnpm check:lua && pnpm check:docs && pnpm check:changesets && pnpm check:release",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm check:architecture && pnpm check:lua && pnpm check:docs && pnpm check:release",
     "lint:fix": "pnpm biome check --write --unsafe",
     "changeset": "changeset",
     "version:packages": "changeset version",

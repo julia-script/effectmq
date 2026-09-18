@@ -113,23 +113,23 @@
   "author": "",
   "license": "MIT",
   "peerDependencies": {
-    "effect": ">=4.0.0-beta.107"
+    "effect": ">=4.0.0-rc.115"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.1",
     "@changesets/cli": "^2.31.0",
-    "@effect/vitest": "4.0.0-beta.107",
+    "@effect/vitest": "4.0.0-rc.115",
     "@testcontainers/redis": "^12.0.3",
     "@types/node": "^22.0.0",
-    "effect": "4.0.0-beta.107",
+    "effect": "4.0.0-rc.115",
     "ioredis": "^5.11.1",
     "testcontainers": "^12.0.3",
     "tsx": "^4.22.4",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.9"
+    "vitest": "^5.0.1"
   },
   "dependencies": {
-    "@effect/platform-node": "4.0.0-beta.107",
+    "@effect/platform-node": "4.0.0-rc.115",
     "msgpackr": "^2.0.4",
     "redis": "^6.1.0"
   }

@@ -59,8 +59,8 @@ try {
       "add",
       "--ignore-workspace",
       tarball,
-      "effect@4.0.0-beta.107",
-      "@effect/platform-node@4.0.0-beta.107",
+      "effect@4.0.0-rc.115",
+      "@effect/platform-node@4.0.0-rc.115",
       "typescript@7.0.2",
       "@types/node@22",
     ],
@@ -88,7 +88,7 @@ try {
         `if (Object.keys(${name}).length === 0) throw new Error("empty ${name} export");`,
     )
     .join("\n");
-  const consumerSource = `import * as Core from "@effectmq/core";\nimport { NodeRuntime } from "@effect/platform-node";\n${imports}\nif (Object.keys(Core).length < 9) throw new Error("incomplete root export");\nif (NodeRuntime === undefined) throw new Error("platform-node beta is incompatible");\n${assertions}\nconsole.log("packed ESM exports load");\n`;
+  const consumerSource = `import * as Core from "@effectmq/core";\nimport { NodeRuntime } from "@effect/platform-node";\n${imports}\nif (Object.keys(Core).length < 9) throw new Error("incomplete root export");\nif (NodeRuntime === undefined) throw new Error("platform-node RC is incompatible");\n${assertions}\nconsole.log("packed ESM exports load");\n`;
   const removedSubpathCheck = `\nfor (const path of ["@effectmq/core/MessagePack", "@effectmq/core/EngineRecord", "@effectmq/core/RetrySchedule", "@effectmq/core/Schemas"]) {\n  try {\n    await import(path);\n    throw new Error(\`removed subpath loaded: \${path}\`);\n  } catch (error) {\n    if (error instanceof Error && error.message.startsWith("removed subpath loaded:")) throw error;\n  }\n}\n`;
   writeFileSync(
     join(consumer, "index.mjs"),

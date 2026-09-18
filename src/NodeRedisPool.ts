@@ -10,6 +10,7 @@
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
@@ -17,6 +18,7 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Redis from "effect/unstable/persistence/Redis";
 import {
+  createClient,
   createClientPool,
   createSentinel,
   RESP_TYPES,
@@ -454,6 +456,59 @@ const makeClient = Effect.fnUntraced(function* (
   return { redisPool, send } as const;
 });
 
+// Pub/sub owns a dedicated connection so RESP2 subscriptions cannot occupy a
+// command pool connection. The caller's scope owns connection cleanup, including
+// partial acquisition; node-redis restores subscriptions after reconnecting.
+const subscribe = Effect.fnUntraced(function* (
+  config: Exclude<RedisConfig, ClusterRedisConfig>,
+  channel: string,
+  onMessage: (message: Redis.RedisMessage) => void,
+) {
+  const terminal = yield* Deferred.make<void, Redis.RedisError>();
+  const runSync = Effect.runSyncWith(yield* Effect.context<never>());
+  const subscriber = yield* Effect.acquireRelease(
+    Effect.try({
+      try: () => {
+        if (config.topology === "sentinel") {
+          return createSentinel(config.sentinel);
+        }
+        const { topology: _topology, pool: _pool, ...options } = config;
+        return createClient(options);
+      },
+      catch: (cause) => new Redis.RedisError({ cause }),
+    }),
+    (client) =>
+      Effect.promise(async () => {
+        if (client.isOpen) await client.destroy();
+      }),
+  );
+  const onError = (cause: unknown) => {
+    if (!subscriber.isOpen) {
+      runSync(Deferred.fail(terminal, new Redis.RedisError({ cause })));
+    }
+  };
+  const onEnd = () => {
+    runSync(
+      Deferred.fail(
+        terminal,
+        new Redis.RedisError({ cause: "Redis subscription connection ended" }),
+      ),
+    );
+  };
+  subscriber.on("error", onError);
+  subscriber.on("end", onEnd);
+  yield* Effect.tryPromise({
+    try: async () => {
+      await subscriber.connect();
+      await subscriber.subscribe(channel, (message, channel) => {
+        onMessage({ channel, message });
+      });
+    },
+    catch: (cause) => new Redis.RedisError({ cause }),
+  });
+  return Deferred.await(terminal);
+});
+
 const make = Effect.fnUntraced(function* (config: RedisConfig = {}) {
   if (config.topology === "cluster") yield* unsupportedCluster();
   if ((config.topology ?? "standalone") === "standalone") {
@@ -473,7 +528,10 @@ const make = Effect.fnUntraced(function* (config: RedisConfig = {}) {
   const producer = yield* makeClient(supported, "producer", health);
   const worker = yield* makeClient(supported, "worker", health);
   const maintenance = yield* makeClient(supported, "maintenance", health);
-  const redis = yield* Redis.make({ send: producer.send });
+  const redis = yield* Redis.make({
+    send: producer.send,
+    subscribe: (channel, onMessage) => subscribe(supported, channel, onMessage),
+  });
   const snapshot = Ref.get(health).pipe(
     Effect.map(
       (current): RedisHealthSnapshot => ({

@@ -10,7 +10,7 @@ const packr = new Packr({ useRecords: false, int64AsType: "number" });
 /** MessagePack bytes to and from an unknown decoded value. */
 export const UnknownFromMsgpack = Schema.Uint8Array.pipe(
   Schema.decodeTo(Schema.Unknown, {
-    decode: SchemaGetter.transformOrFail(
+    decode: SchemaGetter.transformEffect(
       (bytes: Uint8Array, options): Effect.Effect<unknown, SchemaIssue.Issue> =>
         Effect.try({
           try: () => packr.unpack(bytes),
@@ -22,7 +22,7 @@ export const UnknownFromMsgpack = Schema.Uint8Array.pipe(
             ),
         }),
     ),
-    encode: SchemaGetter.transformOrFail(
+    encode: SchemaGetter.transformEffect(
       (value: unknown, options): Effect.Effect<Uint8Array, SchemaIssue.Issue> =>
         Effect.try({
           try: () => packr.pack(value),

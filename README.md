@@ -23,11 +23,11 @@ a scheduled report. It provides:
 ## Install
 
 ```bash
-pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-beta.107 @effect/platform-node@4.0.0-beta.107
+pnpm add @effectmq/core@0.3.0-rc.0 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
 ```
 
 > [!IMPORTANT]
-> effectmq currently targets the Effect 4 beta and is not compatible with the
+> effectmq currently targets the Effect 4 release candidate and is not compatible with the
 > stable Effect 3 release. Pin the versions shown above. Node.js 22.19 or newer
 > is required; CI verifies Node.js 22 and 24.
 

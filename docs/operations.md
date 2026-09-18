@@ -19,9 +19,9 @@ import { Config, Effect, Layer, Redacted } from "effect"
 
 const RedisLive = Layer.unwrap(
   Config.all({
-    url: Config.string("REDIS_URL"),
-    username: Config.string("REDIS_USERNAME"),
-    password: Config.redacted("REDIS_PASSWORD")
+    url: Config.String("REDIS_URL"),
+    username: Config.String("REDIS_USERNAME"),
+    password: Config.Redacted("REDIS_PASSWORD")
   }).pipe(
     Effect.map(({ password, url, username }) =>
       NodeRedisPool.layer({
@@ -57,10 +57,10 @@ import { Config, Effect, Layer, Redacted } from "effect"
 
 const SentinelRedisLive = Layer.unwrap(
   Config.all({
-    redisUsername: Config.string("REDIS_USERNAME"),
-    redisPassword: Config.redacted("REDIS_PASSWORD"),
-    sentinelUsername: Config.string("SENTINEL_USERNAME"),
-    sentinelPassword: Config.redacted("SENTINEL_PASSWORD")
+    redisUsername: Config.String("REDIS_USERNAME"),
+    redisPassword: Config.Redacted("REDIS_PASSWORD"),
+    sentinelUsername: Config.String("SENTINEL_USERNAME"),
+    sentinelPassword: Config.Redacted("SENTINEL_PASSWORD")
   }).pipe(
     Effect.map(
       ({

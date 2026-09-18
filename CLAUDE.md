@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`@effectmq/core` — a Redis-backed task queue built on **Effect 4 beta** (pinned to `effect@4.0.0-beta.107`; it does not work with stable Effect 3.x). Typed payloads/results/errors via schemas, with retries, delays, idempotency, and cron schedules. Single package, pnpm, ESM (`"type": "module"`, `nodenext` resolution — internal imports use `.js` extensions).
+`@effectmq/core` — a Redis-backed task queue built on **Effect 4 release candidate** (pinned to `effect@4.0.0-rc.115`; it does not work with stable Effect 3.x). Typed payloads/results/errors via schemas, with retries, delays, idempotency, and cron schedules. Single package, pnpm, ESM (`"type": "module"`, `nodenext` resolution — internal imports use `.js` extensions).
 
 ## Commands
 
@@ -56,9 +56,9 @@ application boundary.
 
 ## Conventions
 
-- **Effect 4 beta idioms**: `Context.Service` classes for services, `Schema.TaggedError` for schema-backed errors, `Effect.fnUntraced` for functions, `Data.TaggedError` for engine errors, imports from `effect/unstable/*` where needed (e.g. `effect/unstable/persistence/Redis`). Match these when adding code.
+- **Effect 4 release candidate idioms**: `Context.Service` classes for services, `Schema.TaggedError` for schema-backed errors, `Effect.fnUntraced` for functions, `Data.TaggedError` for engine errors, imports from `effect/unstable/*` where needed (e.g. `effect/unstable/persistence/Redis`). Match these when adding code.
 - Service identifiers use `@effectmq/core/<Service>`; nominal type IDs and built-in error tags use the `~effectmq/...` namespace.
-- `effect` is a **peerDependency** (`>=4.0.0-beta.107`) and devDependency. `@effect/platform-node` is a runtime dependency for the standard live graph; all Effect packages use the same beta baseline.
+- `effect` is a **peerDependency** (`>=4.0.0-rc.115`) and devDependency. `@effect/platform-node` is a runtime dependency for the standard live graph; all Effect packages use the same RC baseline.
 - Public API (everything re-exported from `src/index.ts` as namespace exports) carries TSDoc, including `@module` headers per file. Keep new exports documented.
 - Formatting/linting is Biome (2-space indent); config in `biome.json`.
 

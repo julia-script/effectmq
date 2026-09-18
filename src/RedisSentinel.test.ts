@@ -8,7 +8,9 @@ import { expect, it, layer } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
+import * as Redis from "effect/unstable/persistence/Redis";
 import { Redis as IORedis } from "ioredis";
 import { NodeRedisPool, RedisPool } from "./index.js";
 import * as FaultInjection from "./testing/FaultInjection.js";
@@ -243,6 +245,14 @@ if (process.env.EFFECTMQ_TEST_SENTINEL === "local") {
           const result = yield* Effect.gen(function* () {
             const redis = yield* RedisPool.RedisPool;
             const health = yield* NodeRedisPool.RedisConnectionHealth;
+            const persistence = yield* Redis.Redis;
+            const channel = "effectmq:sentinel:subscription";
+            const messages = yield* persistence.subscribe(channel);
+            expect(yield* redis.send("PUBLISH", channel, "before")).toBe(1);
+            expect(yield* Queue.take(messages)).toEqual({
+              channel,
+              message: "before",
+            });
             const fault = yield* FaultInjection.make({
               "sentinel-failover": 1,
             });
@@ -326,6 +336,17 @@ if (process.env.EFFECTMQ_TEST_SENTINEL === "local") {
                   times: 200,
                 }),
               );
+            yield* redis.send<number>("PUBLISH", channel, "after").pipe(
+              Effect.repeat({
+                schedule: Schedule.spaced("100 millis"),
+                until: (subscribers) => subscribers > 0,
+              }),
+              Effect.timeout("10 seconds"),
+            );
+            expect(yield* Queue.take(messages)).toEqual({
+              channel,
+              message: "after",
+            });
             const snapshot = yield* health.snapshot;
             return { after, snapshot };
           }).pipe(

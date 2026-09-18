@@ -1,5 +1,6 @@
 import { expect, layer } from "@effect/vitest";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Queue, Schedule } from "effect";
+import * as Redis from "effect/unstable/persistence/Redis";
 import { NodeRedisPool, RedisPool, TaskEngine } from "./index.js";
 import { TestLayer, TestRedisAddress } from "./testing/redisLayer.js";
 
@@ -28,6 +29,70 @@ layer(TestLayer, { excludeTestServices: true, timeout: "60 seconds" })(
           }).pipe(Effect.provide(NodeRedisPool.layer(address)));
           expect(result).toBe("pong");
         }),
+    );
+
+    for (const RESP of [2, 3] as const) {
+      it.effect(
+        `scopes Redis subscriptions without blocking RESP${RESP} commands`,
+        () =>
+          Effect.gen(function* () {
+            const address = yield* TestRedisAddress;
+            yield* Effect.gen(function* () {
+              const redis = yield* Redis.Redis;
+              const channel = `effectmq:subscription:resp${RESP}`;
+              yield* Effect.scoped(
+                Effect.gen(function* () {
+                  const messages = yield* redis.subscribe(channel);
+                  expect(yield* redis.send("PING")).toBe("PONG");
+                  expect(yield* redis.send("PUBLISH", channel, "hello")).toBe(
+                    1,
+                  );
+                  expect(yield* Queue.take(messages)).toEqual({
+                    channel,
+                    message: "hello",
+                  });
+                }),
+              );
+              const subscribers = yield* redis
+                .send<[string, number]>("PUBSUB", "NUMSUB", channel)
+                .pipe(
+                  Effect.repeat({
+                    schedule: Schedule.spaced("10 millis"),
+                    until: ([, count]) => count === 0,
+                  }),
+                  Effect.timeout("3 seconds"),
+                );
+              expect(subscribers).toEqual([channel, 0]);
+            }).pipe(Effect.provide(NodeRedisPool.layer({ ...address, RESP })));
+          }),
+      );
+    }
+
+    it.effect("the test Redis adapter scopes subscriptions", () =>
+      Effect.gen(function* () {
+        const redis = yield* Redis.Redis;
+        const channel = "effectmq:test-adapter:subscription";
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const messages = yield* redis.subscribe(channel);
+            expect(yield* redis.send("PUBLISH", channel, "hello")).toBe(1);
+            expect(yield* Queue.take(messages)).toEqual({
+              channel,
+              message: "hello",
+            });
+          }),
+        );
+        const subscribers = yield* redis
+          .send<[string, number]>("PUBSUB", "NUMSUB", channel)
+          .pipe(
+            Effect.repeat({
+              schedule: Schedule.spaced("10 millis"),
+              until: ([, count]) => count === 0,
+            }),
+            Effect.timeout("3 seconds"),
+          );
+        expect(subscribers).toEqual([channel, 0]);
+      }),
     );
 
     it.effect("fails before connecting when Redis Cluster is configured", () =>

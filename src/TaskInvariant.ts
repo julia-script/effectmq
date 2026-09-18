@@ -22,7 +22,17 @@ export const validate = Effect.fnUntraced(function* <
   Error extends Schema.Top,
   R,
   IdentityR,
->(definition: Task.TaskDefinition<Payload, Success, Error, R, IdentityR>) {
+  Progress extends Schema.Top,
+>(
+  definition: Task.TaskDefinition<
+    Payload,
+    Success,
+    Error,
+    R,
+    IdentityR,
+    Progress
+  >,
+) {
   if (
     definition.maxRetries !== Infinity &&
     (!Number.isSafeInteger(definition.maxRetries) || definition.maxRetries < 0)
@@ -36,7 +46,9 @@ export const validate = Effect.fnUntraced(function* <
   }
 
   for (const [field, actual] of Object.entries(definition.storageLimits)) {
-    const minimum = field === "maxEventEntries" ? 1 : 0;
+    if (field === "maxHistoryEntries" && actual == null) continue;
+    const minimum =
+      field === "maxEventEntries" || field === "maxHistoryEntries" ? 1 : 0;
     if (!Number.isSafeInteger(actual) || actual < minimum) {
       return yield* invalid(
         definition.name,

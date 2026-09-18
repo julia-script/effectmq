@@ -78,6 +78,10 @@
     "./EventRecord": {
       "types": "./dist/EventRecord.d.ts",
       "default": "./dist/EventRecord.js"
+    },
+    "./TaskHistory": {
+      "types": "./dist/TaskHistory.d.ts",
+      "default": "./dist/TaskHistory.js"
     }
   },
   "files": [

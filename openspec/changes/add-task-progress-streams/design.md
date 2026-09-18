@@ -145,15 +145,15 @@ task-owned cleanup.
 
 ### 5. Fence appends and share the existing disposal paths
 
-Add a Redis function for custom progress that checks record existence, exact
+Add a Redis Lua script for custom progress that checks record existence, exact
 generation, schema identity, enabled history, leased state, current token, and
 lease deadline against authoritative engine time before appending. Check the
 deadline even if maintenance has not recovered the expired lease. Do not renew
 the lease or change retry counters as a side effect of progress.
 
-Lifecycle appends run in the same Redis function as their transition. Validate
+Lifecycle appends run in the same Redis Lua script as their transition. Validate
 expected arguments and history key types before mutating execution state;
-Redis function atomicity prevents interleaving but does not roll back commands
+Redis Lua script atomicity prevents interleaving but does not roll back commands
 after a script error. Do not introduce a new count-cap failure at settlement.
 
 Extend `deleteTask` to remove the generation's history with the record. Audit
@@ -206,7 +206,7 @@ trimmed-through sequence. Include an `earliestCursor` at that boundary so a
 reader can explicitly resume. A cursor exactly at that boundary is valid,
 even though its own event was removed. Reject inconsistent sequence/ID pairs
 or future positions. The identity/state check, watermark check, and page read
-execute in one Redis function so concurrent trimming cannot hide a gap.
+execute in one Redis Lua script so concurrent trimming cannot hide a gap.
 
 Without `after`, begin at that boundary and set `truncated` if any earlier
 entries were removed. The indicator describes the history, not just this page.
@@ -257,9 +257,10 @@ but there is no producer deduplication key or exactly-once guarantee here.
    unchanged.
 2. Upgrade all producers, workers, and maintenance/scheduler processes for an
    affected queue before offering progress-enabled generations. Verify how the
-   existing Redis function loader replaces libraries and exercise the upgrade
-   with retained legacy records. Do not enable history while older runtimes can
-   reload incompatible functions or process enabled generations.
+   existing loader uses content-addressed SCRIPT LOAD/EVALSHA and reloads after
+   NOSCRIPT; it does not replace global Redis function libraries. Rehearse the
+   upgrade with retained legacy records. Do not enable history while older
+   runtimes can process enabled generations using their own script digests.
 3. Enable `progress` declarations using an appropriate task schema identity and
    explicitly choose completion retention for applications needing history after
    completion. No in-place history enablement for existing generations.

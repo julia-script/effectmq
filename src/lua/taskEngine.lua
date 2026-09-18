@@ -64,6 +64,75 @@ end
 local function retentionContinuationKey(prefix) return prefix .. ":retention-release-continuations" end
 local function maintenanceCursorKey(prefix) return prefix .. ":maintenance:cursor" end
 
+-- Per-generation task history. Disabled tasks perform no history writes.
+local function historyKey(prefix, id, generation)
+  return taskHash(prefix, id) .. ":" .. generation .. ":history"
+end
+
+local function assertHistory(prefix, id)
+  local hash = taskHash(prefix, id)
+  if redis.call("HGET", hash, "historyEnabled") ~= "1" then return end
+  local key = historyKey(prefix, id, redis.call("HGET", hash, "generation"))
+  local kind = redis.call("TYPE", key).ok
+  if kind ~= "none" and kind ~= "stream" then error("CORRUPT_HISTORY wrong key type") end
+  local sequence = tonumber(redis.call("HGET", hash, "historySequence") or "0")
+  if not sequence or sequence < 0 or sequence >= 9007199254740991 or math.floor(sequence) ~= sequence then
+    error("CORRUPT_HISTORY invalid sequence")
+  end
+  local limit = tonumber(redis.call("HGET", hash, "maxHistoryEntries") or "0")
+  local trimmed = tonumber(redis.call("HGET", hash, "historyTrimmed") or "0")
+  if not limit or limit < 0 or limit > 9007199254740991 or math.floor(limit) ~= limit
+    or not trimmed or trimmed < 0 or trimmed > sequence or math.floor(trimmed) ~= trimmed then
+    error("CORRUPT_HISTORY invalid limits or trim metadata")
+  end
+  if redis.call("XLEN", key) ~= sequence - trimmed then
+    error("CORRUPT_HISTORY inconsistent stream length")
+  end
+end
+
+local function appendHistory(prefix, id, kind, data, attempt)
+  local hash = taskHash(prefix, id)
+  if redis.call("HGET", hash, "historyEnabled") ~= "1" then return nil end
+  assertHistory(prefix, id)
+  local generation = redis.call("HGET", hash, "generation")
+  local key = historyKey(prefix, id, generation)
+  local sequence = tonumber(redis.call("HGET", hash, "historySequence") or "0") + 1
+  local entry = redis.call("XADD", key, "*",
+    "taskId", id, "generation", generation, "protocolVersion", "1",
+    "schemaId", redis.call("HGET", hash, "schemaId"),
+    "attempt", attempt or redis.call("HGET", hash, "attempt") or "0",
+    "timestamp", string.format("%.0f", now),
+    "sequence", string.format("%.0f", sequence), "kind", kind, "data", data)
+  redis.call("HSET", hash, "historySequence", string.format("%.0f", sequence))
+  local limit = tonumber(redis.call("HGET", hash, "maxHistoryEntries") or "0")
+  if limit > 0 and redis.call("XLEN", key) > limit then
+    -- The immutable cap means one append has at most one entry to evict.
+    local oldest = redis.call("XRANGE", key, "-", "+", "COUNT", 1)[1]
+    redis.call("XTRIM", key, "MAXLEN", "=", limit)
+    redis.call("HSET", hash, "historyTrimmed", string.format("%.0f", sequence - limit),
+      "historyTrimmedId", oldest[1])
+  end
+  return entry
+end
+
+local function publishHistoryLifecycle(prefix, id, tag, fields, failureKind, attempt)
+  if redis.call("HGET", taskHash(prefix, id), "historyEnabled") ~= "1" then return end
+  local data = { _tag = tag }
+  local allowed = { previousState = true, newState = true, from = true, to = true,
+    terminal = true, retryAt = true, failureKind = true, policy = true }
+  for i = 1, #fields, 2 do
+    local key, value = fields[i], fields[i + 1]
+    if allowed[key] then
+      if key == "terminal" then value = value == "1"
+      elseif key == "retryAt" then value = tonumber(value) end
+      data[key] = value
+    end
+  end
+  if failureKind then data.failureKind = failureKind end
+  if tag == "task.completed" then data.terminal = true end
+  appendHistory(prefix, id, "Lifecycle", cjson.encode(data), attempt)
+end
+
 -- list membership -----------------------------------------------------------
 
 local function removeFromFailedList(prefix, id) return redis.call("ZREM", failedList(prefix), id) end
@@ -78,7 +147,8 @@ local function removeFromActiveLists(prefix, id) return redis.call("ZREM", activ
 -- individual stream fields (not one packed document) so that raw msgpack
 -- values (payload, success) are carried as binary-safe bulk strings — nesting
 -- them inside another msgpack document would corrupt them on decode.
-local function publishEvent(prefix, id, eventType, fields)
+local function publishEvent(prefix, id, eventType, fields, historyFailureKind, historyAttempt)
+  publishHistoryLifecycle(prefix, id, eventType, fields, historyFailureKind, historyAttempt)
   local generation = redis.call("HGET", taskHash(prefix, id), "generation") or "0"
   local protocolVersion = redis.call("HGET", taskHash(prefix, id), "protocolVersion") or "1"
   local schemaId = redis.call("HGET", taskHash(prefix, id), "schemaId") or "unknown"
@@ -202,7 +272,8 @@ end
 
 -- the add* helpers do not clear other lists; moveToList is the single entry
 -- point that removes from the current list, adds to the target, and emits task.moved
-local function moveToList(prefix, id, list, readyAt, sourceKnownEmpty)
+local function moveToList(prefix, id, list, readyAt, sourceKnownEmpty, historyAttempt)
+  assertHistory(prefix, id)
   local currentList = nil
   if not sourceKnownEmpty then currentList = removeFromCurrentLists(prefix, id) end
   if list == "wait" then
@@ -253,13 +324,14 @@ local function moveToList(prefix, id, list, readyAt, sourceKnownEmpty)
   fields[#fields + 1] = redis.call("HGET", taskHash(prefix, id), "handlerFailureCount") or "0"
   fields[#fields + 1] = "stalledAttemptCount"
   fields[#fields + 1] = redis.call("HGET", taskHash(prefix, id), "stalledAttemptCount") or "0"
-  publishEvent(prefix, id, "task.moved", fields)
+  publishEvent(prefix, id, "task.moved", fields, nil, historyAttempt)
 end
 
 local function deleteTask(prefix, id, sourceKnownEmpty)
   local generation = redis.call("HGET", taskHash(prefix, id), "generation")
   moveToList(prefix, id, nil, nil, sourceKnownEmpty)
   if generation then
+    redis.call("DEL", historyKey(prefix, id, generation))
     local member = cmsgpack.pack({ prefix, id, tonumber(generation) })
     redis.call("ZREM", taskExpiryIndex(prefix), member)
     redis.call("ZREM", terminalExpiryIndex(prefix), member)
@@ -329,7 +401,9 @@ end
 
 local function exists(key) return redis.call("EXISTS", key) end
 local function lockTask(prefix, id, leaseToken, lockTimeout)
-  moveToList(prefix, id, "active", now + lockTimeout)
+  assertHistory(prefix, id)
+  local attempt = tonumber(redis.call("HGET", taskHash(prefix, id), "attempt") or "0") + 1
+  moveToList(prefix, id, "active", now + lockTimeout, nil, attempt)
   redis.call("HINCRBY", taskHash(prefix, id), "attempt", 1)
   return redis.call("SET", lockHash(prefix, id), leaseToken, "PX", lockTimeout)
 end
@@ -534,6 +608,7 @@ local function settleTask(prefix, id, terminalFailure)
 end
 
 local function failTask(prefix, id, error, retryAt, failureKind)
+  assertHistory(prefix, id)
   unlockTask(prefix, id)
 
   if failureKind == "stall" then
@@ -562,7 +637,8 @@ local function failTask(prefix, id, error, retryAt, failureKind)
     fields[#fields + 1] = "retryAt"
     fields[#fields + 1] = retryAt
   end
-  publishEvent(prefix, id, "task.failed", fields)
+  publishEvent(prefix, id, "task.failed", fields,
+    errorTag == "~effectmq/Error/Canceled" and "canceled" or failureKind)
   if willRetry then
     if retryAt > now then
       moveToList(prefix, id, "scheduled", retryAt)
@@ -786,6 +862,12 @@ register("effectmq_createTask", function(args)
   local terminalIndexRetentionMs = tonumber(args[21])
   local deadLetterRetentionMs = tonumber(args[22])
   local eventRetentionMs = tonumber(args[23])
+  local historyEnabled = args[24] == "1"
+  local maxHistoryEntries = tonumber(args[25] or "0")
+  if not maxHistoryEntries or maxHistoryEntries < 0 or maxHistoryEntries > 9007199254740991
+    or math.floor(maxHistoryEntries) ~= maxHistoryEntries then
+    return redis.error_reply("invalid maxHistoryEntries")
+  end
   local maxSafeInteger = 9007199254740991
   if not delay or delay ~= delay or delay < 0 or math.abs(delay) > maxSafeInteger then
     return redis.error_reply("invalid delay")
@@ -812,6 +894,12 @@ register("effectmq_createTask", function(args)
   syncAll(prefix)
   local existingTask = getTask(prefix, id)
   local replacedTask = nil
+  if historyEnabled and (not existingTask or onDuplicate == "new-generation") then
+    local nextGeneration = tonumber(redis.call("HGET", generationHash(prefix), id) or "0") + 1
+    if redis.call("EXISTS", historyKey(prefix, id, nextGeneration)) == 1 then
+      return redis.error_reply("CORRUPT_HISTORY unexpected generation stream")
+    end
+  end
 
   if retentionHolder then
     local holderError = validateLiveHolder(retentionHolder)
@@ -876,6 +964,10 @@ register("effectmq_createTask", function(args)
     "onFailurePolicy", onFailurePolicy,
     "errors", EMPTY_LIST
   )
+  if historyEnabled then
+    setTask(prefix, id, "historyEnabled", "1", "maxHistoryEntries", maxHistoryEntries,
+      "historySequence", "0", "historyTrimmed", "0", "historyTrimmedId", "0-0")
+  end
   redis.call("ZADD", createdList(prefix), now, id)
   if creator ~= "" then
     setTask(prefix, id, "creator", creator)
@@ -945,6 +1037,7 @@ register("effectmq_writeSuccess", function(args)
   if not isLockedBy(prefix, id, leaseToken) then
     return redis.error_reply("LEASE_LOST")
   end
+  assertHistory(prefix, id)
   unlockTask(prefix, id)
   setTask(prefix, id, "success", result, "outcome", "success")
   local successPolicy = getTaskField(prefix, id, "onSuccessPolicy")
@@ -1050,6 +1143,63 @@ register("effectmq_takeTask", function(args)
     return nil
   end
   return { leaseToken, getTask(prefix, taskId) }
+end)
+
+local function historyIdentity(prefix, id, generation, schemaId)
+  local hash = taskHash(prefix, id)
+  if redis.call("HGET", hash, "generation") ~= generation then return { "unavailable" } end
+  if redis.call("HGET", hash, "schemaId") ~= schemaId then
+    return { "schema", redis.call("HGET", hash, "schemaId") }
+  end
+  if redis.call("HGET", hash, "protocolVersion") ~= "1" then
+    return { "version", redis.call("HGET", hash, "protocolVersion") or "0" }
+  end
+  if redis.call("HGET", hash, "historyEnabled") ~= "1" then return { "disabled" } end
+  assertHistory(prefix, id)
+  return nil
+end
+
+register("effectmq_appendProgress", function(args)
+  local prefix, id, generation, schemaId, token, data = args[2], args[3], args[4], args[5], args[6], args[7]
+  local invalid = historyIdentity(prefix, id, generation, schemaId)
+  if invalid then return invalid end
+  local deadline = tonumber(redis.call("ZSCORE", activeList(prefix), id) or "0")
+  if not isLockedBy(prefix, id, token) or deadline <= now
+    or getTaskField(prefix, id, "currentList") ~= "active"
+    or getTaskField(prefix, id, "outcome") then
+    return redis.error_reply("LEASE_LOST")
+  end
+  return { "ok", appendHistory(prefix, id, "Progress", data) }
+end)
+
+register("effectmq_readHistory", function(args)
+  local prefix, id, generation, schemaId = args[2], args[3], args[4], args[5]
+  local invalid = historyIdentity(prefix, id, generation, schemaId)
+  if invalid then return invalid end
+  local hash = taskHash(prefix, id)
+  local key = historyKey(prefix, id, generation)
+  local trimmed = tonumber(redis.call("HGET", hash, "historyTrimmed") or "0")
+  local boundaryId = redis.call("HGET", hash, "historyTrimmedId") or "0-0"
+  local latest = tonumber(redis.call("HGET", hash, "historySequence") or "0")
+  local count = tonumber(args[8])
+  if not isPositiveSafeInteger(count) or count > 1000 then return { "invalid" } end
+  local sequence = args[6] ~= "" and tonumber(args[6]) or trimmed
+  local position = args[7] ~= "" and args[7] or boundaryId
+  if not sequence or sequence < 0 or math.floor(sequence) ~= sequence or sequence > latest then return { "invalid" } end
+  if sequence < trimmed then return { "expired", string.format("%.0f", trimmed), boundaryId } end
+  if sequence == trimmed then
+    if position ~= boundaryId then return { "invalid" } end
+  else
+    local entry = redis.call("XRANGE", key, position, position, "COUNT", 1)[1]
+    if not entry then return { "invalid" } end
+    local matched = false
+    for i = 1, #entry[2], 2 do
+      if entry[2][i] == "sequence" and tonumber(entry[2][i + 1]) == sequence then matched = true end
+    end
+    if not matched then return { "invalid" } end
+  end
+  local entries = redis.call("XRANGE", key, "(" .. position, "+", "COUNT", count + 1)
+  return { "ok", string.format("%.0f", trimmed), boundaryId, string.format("%.0f", sequence), position, entries }
 end)
 
 register("effectmq_extendLock", function(args)

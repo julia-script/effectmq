@@ -55,6 +55,7 @@ export interface Worker<
   QueueR = never,
   QueueIdentityR = never,
   HandlerR = never,
+  Progress extends Schema.Top = Schema.Never,
 > {
   readonly [TypeId]: typeof TypeId;
   readonly queue: TaskQueue.TaskQueue<
@@ -62,9 +63,16 @@ export interface Worker<
     Success,
     Error,
     QueueR,
-    QueueIdentityR
+    QueueIdentityR,
+    Progress
   >;
-  readonly handler: TaskQueue.TaskHandler<Payload, Success, Error, HandlerR>;
+  readonly handler: TaskQueue.TaskHandler<
+    Payload,
+    Success,
+    Error,
+    HandlerR,
+    Progress
+  >;
   readonly options: WorkerOptions;
 }
 
@@ -101,11 +109,27 @@ export const make = <
   QueueR = never,
   QueueIdentityR = never,
   HandlerR = never,
+  Progress extends Schema.Top = Schema.Never,
 >(
-  queue: TaskQueue.TaskQueue<Payload, Success, Error, QueueR, QueueIdentityR>,
-  handler: TaskQueue.TaskHandler<Payload, Success, Error, HandlerR>,
+  queue: TaskQueue.TaskQueue<
+    Payload,
+    Success,
+    Error,
+    QueueR,
+    QueueIdentityR,
+    Progress
+  >,
+  handler: TaskQueue.TaskHandler<Payload, Success, Error, HandlerR, Progress>,
   options: WorkerOptions = {},
-): Worker<Payload, Success, Error, QueueR, QueueIdentityR, HandlerR> => ({
+): Worker<
+  Payload,
+  Success,
+  Error,
+  QueueR,
+  QueueIdentityR,
+  HandlerR,
+  Progress
+> => ({
   [TypeId]: TypeId,
   queue,
   handler,
@@ -271,8 +295,17 @@ export const run = Effect.fnUntraced(function* <
   QueueR,
   QueueIdentityR,
   HandlerR,
+  Progress extends Schema.Top,
 >(
-  worker: Worker<Payload, Success, Error, QueueR, QueueIdentityR, HandlerR>,
+  worker: Worker<
+    Payload,
+    Success,
+    Error,
+    QueueR,
+    QueueIdentityR,
+    HandlerR,
+    Progress
+  >,
 ): Effect.fn.Return<
   never,
   WorkerConfigurationError,

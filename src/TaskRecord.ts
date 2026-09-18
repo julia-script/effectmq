@@ -88,6 +88,9 @@ export interface Task<
   readonly maxErrorEntries: number;
   readonly maxRelationships: number;
   readonly maxEventEntries: number;
+  readonly historyEnabled?: boolean;
+  /** Zero in a decoded record represents unlimited history. */
+  readonly maxHistoryEntries?: number;
   readonly taskRecordRetentionMs: number;
   readonly resultRetentionMs: number;
   readonly terminalIndexRetentionMs: number;
@@ -113,6 +116,9 @@ export interface StoredTaskRecord {
   readonly maxErrorEntries: number;
   readonly maxRelationships: number;
   readonly maxEventEntries: number;
+  readonly historyEnabled?: boolean;
+  /** Zero in a decoded record represents unlimited history. */
+  readonly maxHistoryEntries?: number;
   readonly taskRecordRetentionMs: number;
   readonly resultRetentionMs: number;
   readonly terminalIndexRetentionMs: number;
@@ -159,6 +165,8 @@ export const makeTaskSchema = <
     maxErrorEntries: Schema.Number,
     maxRelationships: Schema.Number,
     maxEventEntries: Schema.Number,
+    historyEnabled: Schema.optional(Schema.Boolean),
+    maxHistoryEntries: Schema.optional(Schema.Number),
     taskRecordRetentionMs: Schema.Number,
     resultRetentionMs: Schema.Number,
     terminalIndexRetentionMs: Schema.Number,

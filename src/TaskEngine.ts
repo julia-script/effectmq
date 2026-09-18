@@ -32,7 +32,9 @@ import { UnknownFromMsgpack } from "./MessagePack.js";
 import * as NodeRedisPool from "./NodeRedisPool.js";
 import * as Observability from "./Observability.js";
 import { RedisPool, type RedisPoolService } from "./RedisPool.js";
+import * as StorageProtocol from "./StorageProtocol.js";
 import { type Event, EventSchema } from "./TaskEvent.js";
+import * as TaskHistory from "./TaskHistory.js";
 
 const TypeId = "~effectmq/TaskEngine" as const;
 
@@ -131,6 +133,17 @@ export class TaskEngineError extends Data.TaggedError("TaskEngineError")<{
       });
   }
 }
+
+/** Failures of generation-owned history operations. */
+export type HistoryError =
+  | TaskEngineError
+  | Schema.SchemaError
+  | StorageProtocol.StorageProtocolError
+  | TaskHistory.HistoryUnavailable
+  | TaskHistory.HistoryDisabled
+  | TaskHistory.InvalidHistoryCursor
+  | TaskHistory.HistoryCursorExpired
+  | TaskHistory.CorruptHistory;
 
 /**
  * Reports whether an offer created a generation or returned an existing one.
@@ -333,6 +346,20 @@ export class TaskEngine extends Context.Service<
   TaskEngine,
   {
     readonly [TypeId]: typeof TypeId;
+    /** Append an opaque progress envelope using the current attempt's lease. */
+    readonly appendProgress: (
+      identity: TaskHistory.Identity,
+      schemaId: string,
+      leaseToken: string,
+      data: string,
+    ) => Effect.Effect<string, HistoryError | LeaseLost>;
+    /** Read one generation-consistent history page; progress data remains encoded. */
+    readonly readHistory: (
+      identity: TaskHistory.Identity,
+      schemaId: string,
+      options?: TaskHistory.ReadOptions,
+    ) => Effect.Effect<TaskHistory.Page<string>, HistoryError>;
+
     /** Compatibility offer that returns only the created or existing task. */
     readonly createTask: (
       task: EngineTaskInsert,
@@ -688,6 +715,50 @@ export const makeWithRedis = (
     const listTasksFn = call("effectmq_listTasks");
     const maintainFn = call("effectmq_maintain", true);
     const eventCursorsFn = call("effectmq_eventCursors");
+    const appendProgressFn = call("effectmq_appendProgress", true);
+    const readHistoryFn = callBinary("effectmq_readHistory");
+    const historyReply = Effect.fnUntraced(function* (
+      identity: TaskHistory.Identity,
+      schemaId: string,
+      reply: unknown,
+      requested?: string,
+    ) {
+      const fields = yield* decodeArray("history", reply);
+      const status = yield* decodeText("history.status", fields[0]);
+      if (status === "unavailable")
+        return yield* new TaskHistory.HistoryUnavailable(identity);
+      if (status === "disabled")
+        return yield* new TaskHistory.HistoryDisabled(identity);
+      if (status === "schema")
+        return yield* new StorageProtocol.SchemaIdentityMismatch({
+          expected: schemaId,
+          encountered: yield* decodeText("history.schemaId", fields[1]),
+        });
+      if (status === "version")
+        return yield* new StorageProtocol.UnsupportedProtocolVersion({
+          encountered: yield* decodeNumber(
+            "history.protocolVersion",
+            fields[1],
+          ),
+          supported: [1],
+        });
+      if (status === "expired")
+        return yield* new TaskHistory.HistoryCursorExpired({
+          requested: requested ?? "",
+          earliestCursor: TaskHistory.cursor(identity, {
+            sequence: yield* decodeNumber("history.trimmed", fields[1]),
+            id: yield* decodeText("history.trimmedId", fields[2]),
+          }),
+        });
+      if (status === "invalid")
+        return yield* new TaskHistory.InvalidHistoryCursor({
+          cursor: requested,
+          reason: "Cursor position does not match this history",
+        });
+      if (status !== "ok")
+        return yield* invalidReply("history", "history status", status);
+      return fields;
+    });
 
     const withLeaseFence = <A>(
       operation: Effect.Effect<A, TaskEngineError>,
@@ -719,6 +790,21 @@ export const makeWithRedis = (
       );
 
     const offerTask = Effect.fnUntraced(function* (task: EngineTaskInsert) {
+      if (
+        task.maxHistoryEntries != null &&
+        (!Number.isSafeInteger(task.maxHistoryEntries) ||
+          task.maxHistoryEntries < 1)
+      ) {
+        return yield* new TaskEngineError({
+          reason: {
+            _tag: "InvalidInput",
+            operation: "effectmq_createTask",
+            field: "maxHistoryEntries",
+            constraint: "null or a positive safe integer",
+          },
+          cause: task.maxHistoryEntries,
+        });
+      }
       const numericFields: ReadonlyArray<
         readonly [keyof EngineTaskInsert, number, boolean]
       > = [
@@ -804,6 +890,8 @@ export const makeWithRedis = (
         String(task.terminalIndexRetentionMs ?? 7 * 24 * 60 * 60 * 1000),
         String(task.deadLetterRetentionMs ?? 30 * 24 * 60 * 60 * 1000),
         String(task.eventRetentionMs ?? 7 * 24 * 60 * 60 * 1000),
+        task.historyEnabled ? "1" : "0",
+        String(task.maxHistoryEntries ?? 0),
       );
       const [rawStatus, rawCursor, rawTask] = yield* decodeTuple(
         "effectmq_createTask",
@@ -828,6 +916,104 @@ export const makeWithRedis = (
     return TaskEngine.of({
       [TypeId]: TypeId,
       offerTask,
+      appendProgress: Effect.fnUntraced(function* (
+        identity: TaskHistory.Identity,
+        schemaId: string,
+        leaseToken: string,
+        data: string,
+      ) {
+        const reply = yield* withLeaseFence(
+          appendProgressFn(
+            withPrefix(identity.queue),
+            identity.taskId,
+            String(identity.generation),
+            schemaId,
+            leaseToken,
+            data,
+          ),
+          identity.queue,
+          identity.taskId,
+        );
+        const fields = yield* historyReply(identity, schemaId, reply);
+        return yield* decodeText("history.append.id", fields[1]);
+      }),
+      readHistory: Effect.fnUntraced(function* (
+        identity: TaskHistory.Identity,
+        schemaId: string,
+        options: TaskHistory.ReadOptions = {},
+      ) {
+        const limit = options.limit ?? 100;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+          return yield* new TaskHistory.InvalidHistoryCursor({
+            reason: "Page size must be an integer from 1 to 1000",
+          });
+        }
+        const position =
+          options.after === undefined
+            ? undefined
+            : yield* TaskHistory.parseCursor(identity, options.after);
+        const reply = yield* readHistoryFn(
+          withPrefix(identity.queue),
+          identity.taskId,
+          String(identity.generation),
+          schemaId,
+          position === undefined ? "" : String(position.sequence),
+          position?.id ?? "",
+          String(limit),
+        );
+        const fields = yield* historyReply(
+          identity,
+          schemaId,
+          reply,
+          options.after,
+        );
+        if (fields.length !== 6)
+          return yield* invalidReply("history.page", "six fields", fields);
+        const trimmed = yield* decodeNumber("history.trimmed", fields[1]);
+        let sequence = yield* decodeNumber("history.sequence", fields[3]);
+        let lastId = yield* decodeText("history.position", fields[4]);
+        const rawEntries = yield* decodeArray("history.entries", fields[5]);
+        if (
+          rawEntries.length > limit + 1 ||
+          !Number.isSafeInteger(sequence) ||
+          sequence < trimmed ||
+          !Number.isSafeInteger(trimmed) ||
+          trimmed < 0
+        ) {
+          return yield* invalidReply(
+            "history.page",
+            "bounded page and valid counters",
+            fields,
+          );
+        }
+        const entries: TaskHistory.Entry<string>[] = [];
+        for (const rawEntry of rawEntries.slice(0, limit)) {
+          const pair = yield* decodeTuple("history.entry", rawEntry, 2);
+          const id = yield* decodeText("history.entry.id", pair[0]);
+          const decoded = yield* TaskHistory.decodeRecord(
+            identity,
+            schemaId,
+            id,
+            yield* entriesToRecord("history.entry.fields", pair[1]),
+          );
+          if (decoded.sequence !== sequence + 1)
+            return yield* new TaskHistory.CorruptHistory({
+              cause: "Noncontiguous history",
+            });
+          entries.push(decoded.entry);
+          sequence = decoded.sequence;
+          lastId = id;
+        }
+        return {
+          entries,
+          cursor:
+            entries.length === 0 && options.after !== undefined
+              ? options.after
+              : TaskHistory.cursor(identity, { sequence, id: lastId }),
+          hasMore: rawEntries.length > limit,
+          truncated: trimmed > 0,
+        } satisfies TaskHistory.Page<string>;
+      }),
       createTask: (task) =>
         offerTask(task).pipe(Effect.map((result) => result.task)),
 

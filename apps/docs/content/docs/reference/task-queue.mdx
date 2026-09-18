@@ -89,7 +89,7 @@ a defect, not a `CompleteError`.
 The handler type is:
 
 ```text
-(task: Task) => Effect<Success, TypedFailure, HandlerRequirements>
+(task: Task, context: TaskHistory.Context<Progress>) => Effect<Success, TypedFailure | ProgressWriteError, HandlerRequirements>
 ```
 
 ## `TaskQueue.completeOne`
@@ -169,3 +169,33 @@ All events contain `id`, `taskId`, `generation`, `protocolVersion`, and
 `ExecuteRequirements` expose the exact Effect service unions for generic
 programs. `OfferError`, `CompleteError`, `WaitError`, and `ExecuteError` expose
 their exact failure unions. See the [error reference](/docs/reference/errors).
+
+## `TaskQueue.readEvents`
+
+```text
+readEvents(queue, handle, { after?, limit? }): Effect<TaskHistory.Page<Progress>, ...>
+```
+
+Reads the exact generation's typed progress and compact lifecycle entries in
+append order. Requires `TaskEngine` and the progress schema's decoding services.
+The page contains `entries`, `cursor`, `hasMore`, and `truncated`. Each entry
+contains `id`, `taskId`, `generation`, `attempt`, `timestamp: Date`, and
+`event: { _tag: "Progress", data } | { _tag: "Lifecycle", data }`.
+Lifecycle data has a `task.created`, `task.updated`, `task.moved`, `task.failed`,
+or `task.completed` tag and transition metadata, without payloads or results.
+
+`limit` defaults to 100 and is bounded to 1–1,000. Pass the opaque returned
+cursor as `after`; an empty page can be polled again. Cursors are bound to queue,
+task, and generation. Reads are non-destructive and independent for each reader.
+
+History is unlimited unless `maxHistoryEntries` is configured. Trimmed history
+sets `truncated`; missing entries after an explicit cursor cause
+`HistoryCursorExpired` with an `earliestCursor` recovery position. Disabled,
+unavailable, malformed-cursor, and incompatible/corrupt-data cases fail with
+typed errors. Task deletion also deletes history, even if its result survives.
+
+`context.progress(value)` on managed handlers encodes the declared progress
+schema and returns `Effect<string, ProgressWriteError, Progress.EncodingServices>`.
+Unhandled progress failures escape through the operational channel without
+business-error encoding or success settlement. See the
+[complete example](/docs/how-to/report-task-progress).

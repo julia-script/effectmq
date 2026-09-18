@@ -320,3 +320,13 @@ const worker = Worker.make(reportQueue, ({ payload }) =>
 ## License
 
 MIT.
+
+### Task progress history
+
+Declare a `progress` schema on `Task.make` to enable task-owned progress and
+lifecycle history. Managed handlers receive `context.progress(value)` as their
+second argument; `TaskQueue.readEvents(queue, handle, { after, limit })` reads
+typed pages while work runs and after completion when the task record is kept.
+History is unlimited by default, with optional oldest-first count trimming,
+and disappears when its task record is removed. See the
+[runnable progress guide](./apps/docs/content/docs/how-to/report-task-progress.mdx).

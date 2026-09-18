@@ -1,6 +1,6 @@
 # Storage protocol v1
 
-EffectMQ stores user payloads, successful results, and typed failures as opaque
+EffectMQ stores user payloads, successful results, typed failures, and progress as opaque
 v1 envelopes. Redis and the Lua state engine do not interpret these values.
 
 ## Compatibility contract
@@ -10,7 +10,7 @@ v1 envelopes. Redis and the Lua state engine do not interpret these values.
 - A future writer version is not rollable until the previous reader can decode
   its committed golden fixtures. Otherwise, workers must be stopped and stored
   data migrated before the new writer starts.
-- `schemaId` identifies a queue's payload/success/failure schema family. It
+- `schemaId` identifies a queue's payload/success/failure/progress schema family. It
   defaults to the task name, but applications should set a stable explicit id
   when a task may be renamed. A mismatched id is an error, never a best-effort
   decode.
@@ -23,7 +23,7 @@ The canonical MessagePack tuple is:
 [1, schemaId, kind, value]
 ```
 
-`kind` is `payload`, `success`, or `failure`. The bytes are stored as the ASCII
+`kind` is `payload`, `success`, `failure`, or `progress`. The bytes are stored as the ASCII
 string `effectmq:v1:` followed by canonical base64. The outer ASCII form is
 intentional: Redis Lua's bundled `cmsgpack` does not preserve nested binary
 strings reliably when it decodes and re-encodes failure history. Lua can append
@@ -50,12 +50,12 @@ After a task's Effect Schema has encoded it, v1 accepts:
 
 Empty arrays and objects, nested nulls, Unicode, binary bytes, and fractional
 safe numbers round-trip losslessly. A top-level `undefined` success is accepted
-for `Schema.Void`; `undefined` payloads, failures, and nested values remain
+for `Schema.Void`; `undefined` payloads, failures, progress, and nested values remain
 invalid. Negative zero, `bigint`, non-finite and unsafe numbers, class
 instances, symbols, functions, and cyclic objects are rejected.
 Encoded user values are limited to 1 MiB by default. A task definition can
 override `storageLimits.maxValueBytes`; the same bound applies independently to
-payload, success, and typed-failure envelopes.
+payload, success, typed-failure, and progress envelopes.
 
 Error history keeps the newest 100 entries by default and discards the oldest
 before appending beyond `storageLimits.maxErrorEntries`. Each task generation
@@ -91,3 +91,31 @@ The v1 engine reserves these canonical built-in error tags:
 
 Built-in errors are protocol control values. A task's own typed failures always
 use a `failure` envelope and cannot be mistaken for them.
+
+## Task-owned history v1
+
+Declaring `Task.make({ progress: schema, ... })` enables one stream at
+`~effectmq:v1:<queue>:task:<id>:<generation>:history`. Every entry stores
+`protocolVersion`, `schemaId`, `taskId`, `generation`, `attempt`, `timestamp`,
+`sequence`, `kind`, and `data`. `Progress` data is the opaque progress envelope;
+`Lifecycle` data is compact JSON containing the lifecycle tag and transition
+metadata. Sequence numbers are contiguous within the generation.
+
+The task hash stores enablement, the effective cap, the last sequence, and the
+trimmed-through sequence/Redis ID. Missing legacy enablement means disabled.
+In Redis, a zero cap represents unlimited history; the public API uses null.
+History has no count limit by default. A positive `maxHistoryEntries` applies
+exact `MAXLEN` trimming after each append; custom and lifecycle events share
+the cap. History does not inherit the queue-wide event cap or expiry window.
+
+Task disposal deletes its generation's history, including under delete
+completion policies, replacement, administrative removal, and record expiry.
+Holds that retain the record retain history too. Retained terminal results do
+not independently keep history alive.
+
+A v1 opaque history cursor binds queue, task ID, generation, sequence, and Redis
+ID. Atomic page reads check identity and trim metadata before a bounded
+`limit + 1` range read. New readers see truncation; lagging explicit cursors
+fail with `HistoryCursorExpired` and a recovery boundary. Pages are live views.
+Upgrade all queue processes before enabling history; see
+[upgrade and rollback](./upgrade-and-rollback.md).

@@ -7,8 +7,8 @@ page describes the intended entry points and their contracts.
 ## `Task`
 
 - `Task.make(config)` synchronously defines payload, success, and typed-failure
-  schemas, stable `schemaId`, idempotency key, retry schedule/cap, storage
-  limits, and retention. It does not evaluate an Effect or validate runtime
+  schemas, an optional progress schema, stable `schemaId`, idempotency key,
+  retry schedule/cap, storage limits, and retention. It does not evaluate an Effect or validate runtime
   invariants.
 - `defaultRetentionPolicy` is 7 days for task records and terminal indexes,
   1 day for results, 30 days for dead-letter entries, and 7 days for events.
@@ -26,13 +26,37 @@ page describes the intended entry points and their contracts.
 - `completeOne(queue, handler, processing?)` acquires and supervises at most one
   attempt, returning whether work was processed.
 - `complete(queue, handler)` processes one task and returns its id.
-- `stream(queue, options?)` decodes versioned lifecycle events from a cursor.
+- `stream(queue, options?)` decodes versioned queue-wide lifecycle events from
+  a cursor.
+- `readEvents(queue, handle, options?)` pages typed progress and compact lifecycle
+  history for one generation, using an independent opaque history cursor.
 
 Important offer options include `taskId`, `delay`, `maxRetries`, completion
 policies, `onDuplicate`, and
 `retainResultUntil: "current-task-settles"`. Numeric overrides are validated
 before Redis is mutated. Processing options configure lease duration,
 heartbeat interval, and bounded heartbeat transport retry.
+
+## `TaskHistory`
+
+Declare `progress` on `Task.make` to enable history for new generations;
+`Schema.Never` enables lifecycle-only history. Managed handlers in `complete`,
+`completeOne`, and `Worker` receive `TaskHistory.Context` as their second argument.
+Its `progress(value)` Effect encodes the declared schema and returns the stored
+entry id. Progress failures use `ProgressWriteError`, outside the business-error
+schema; an uncaught failure leaves the attempt for lease recovery.
+
+`TaskHistory.Entry` contains generation/attempt identity, a timestamp, and a
+`Progress` or `Lifecycle` event. `Page` contains `entries`, `cursor`, `hasMore`,
+and `truncated`; `ReadOptions` accepts `after` and a `limit` of 1–1,000 (default
+100). Readers are independent and can poll empty pages while work is running.
+
+History follows the task record's lifetime, including deletion and retention
+holds. It is unlimited unless `storageLimits.maxHistoryEntries` is a positive
+safe integer. Trimming can produce `HistoryCursorExpired`; result retention
+does not preserve history after record deletion. See the
+[progress guide](../apps/docs/content/docs/how-to/report-task-progress.mdx) and
+[upgrade requirements](./upgrade-and-rollback.md#enabling-task-progress-history).
 
 ## `EventQueue`, `EventEngine`, and `EventRecord`
 
@@ -81,8 +105,9 @@ retention policies, delivery guarantees, and operational bounds.
 
 `TaskEngine` is the lower-level storage protocol. Its public operations include
 offer/get/result, fenced acquire/renew/succeed/fail/release, bounded maintenance,
-paginated state inspection, event cursors/streaming, schedule cursor
-coordination, ordinary removal, and administrative force removal. Prefer
+paginated state inspection, event cursors/streaming, progress append/history
+reads, schedule cursor coordination, ordinary removal, and administrative force
+removal. Prefer
 `TaskQueue`, `Worker`, and `Scheduler` unless building tooling or an alternate
 runtime.
 
@@ -107,6 +132,7 @@ version, schema, value, size, and count errors. `Observability` exports Effect
 metrics for depth/age/backlogs, Redis errors/reconnects/script reloads,
 ownership loss, and retention failure.
 
-Stable subpaths are `./NodeRedisPool`, `./Observability`, `./RedisPool`,
-`./Scheduler`, `./StorageProtocol`, `./Task`, `./TaskEngine`, `./TaskEvent`,
+Stable subpaths are `./EventEngine`, `./EventQueue`, `./EventRecord`,
+`./NodeRedisPool`, `./Observability`, `./RedisPool`, `./Scheduler`,
+`./StorageProtocol`, `./Task`, `./TaskEngine`, `./TaskEvent`, `./TaskHistory`,
 `./TaskQueue`, `./TaskRecord`, and `./Worker`.

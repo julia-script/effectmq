@@ -4,7 +4,11 @@ description: Await an exact task generation or consume a queue's lifecycle strea
 ---
 
 This guide shows you how to await one task outcome and how to consume lifecycle
-events for a whole queue.
+events for a whole queue. For typed updates emitted by a running handler, use
+[task progress history](/docs/how-to/report-task-progress). For application events
+with named recipients and independent acknowledgements, use
+[EventQueue](/docs/reference/event-queue). These APIs have separate retention and
+cursor contracts; a task-history cursor cannot be used with `TaskQueue.stream`.
 
 ## Persist the handle returned by offer
 

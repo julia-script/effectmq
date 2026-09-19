@@ -1,8 +1,8 @@
 # effectmq
 
 **A typed, Redis-backed task queue for Effect 4.** Define work with schemas, run
-handlers as Effects, and keep payloads, results, and failures typed from producer
-to worker.
+handlers as Effects, and keep payloads, results, failures, and progress typed
+from producer to worker.
 
 [Website](https://docs-one-eta-87.vercel.app/) ·
 [Documentation](https://docs-one-eta-87.vercel.app/docs) ·
@@ -19,17 +19,20 @@ a scheduled report. It provides:
 - Effect `Schedule` retries, delayed offers, deduplication, and durable cron;
 - bounded local worker concurrency, graceful draining, and maintenance;
 - typed lifecycle streams plus `wait` and `execute` for durable results;
+- opt-in task progress history with typed updates, resumable readers, and optional
+  count limits;
 - [durable application events](./docs/events.md) with named subscriptions, independent
   acknowledgements, optional deadlines, and deletion or archival.
 
 ## Install
 
-These docs target `0.3.0-rc.1` with Effect `4.0.0-rc.115`. Check the
-[current release record](./docs/release-readiness.md) for publication status
-before installing. `0.3.0-rc.0` uses the older Effect beta dependency set.
+These docs target the published `@effectmq/core@0.3.0` release with Effect
+`4.0.0-rc.115`. npm’s `latest` tag points to `0.3.0`; Effect itself remains a
+release candidate. See the [release record](./docs/release-readiness.md) for
+verified publication and compatibility evidence.
 
 ```bash
-pnpm add @effectmq/core@0.3.0-rc.1 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
+pnpm add @effectmq/core@0.3.0 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
 ```
 
 > [!IMPORTANT]
@@ -226,6 +229,80 @@ const offerAndWait = Effect.gen(function* () {
 
 ---
 
+## Report task progress
+
+Declare a `progress` schema to record typed updates and compact lifecycle events
+for each task generation. Managed handlers receive an attempt-bound
+`context.progress(value)` writer:
+
+```ts
+import { Effect, Schema } from "effect";
+import { Task, TaskEngine, TaskQueue } from "@effectmq/core";
+
+const Report = Task.make({
+  name: "build-report",
+  payload: { reportId: Schema.String },
+  success: Schema.String,
+  error: Schema.Never,
+  progress: Schema.Struct({ percent: Schema.Number }),
+  storageLimits: { maxHistoryEntries: 1_000 },
+});
+const reports = TaskQueue.make("reports", Report);
+
+const program = Effect.gen(function* () {
+  const { handle } = yield* TaskQueue.offer(
+    reports,
+    { reportId: "daily" },
+    { onSuccessPolicy: "keep", onFailurePolicy: "keep" },
+  );
+  yield* TaskQueue.complete(reports, ({ payload }, context) =>
+    Effect.gen(function* () {
+      yield* context.progress({ percent: 50 });
+      yield* context.progress({ percent: 100 });
+      return `Report ${payload.reportId} ready`;
+    }),
+  );
+  const page = yield* TaskQueue.readEvents(reports, handle, { limit: 20 });
+  yield* Effect.log(JSON.stringify(page.entries, null, 2));
+}).pipe(Effect.provide(TaskEngine.layer()));
+
+Effect.runPromise(program);
+```
+
+`readEvents` can be polled while work runs. Persist `page.cursor` and pass it as
+`after` for later pages; readers do not consume one another's entries. History
+is unlimited unless `maxHistoryEntries` is set. The default completion policy
+is `delete`, which removes history with the task record, so retain the record
+when readers need history after completion. Results have separate retention.
+
+Use `progress: Schema.Never` for lifecycle-only history. Upgrade every queue
+process before enabling history; see [upgrade and rollback](./docs/upgrade-and-rollback.md).
+The [progress guide](https://docs-one-eta-87.vercel.app/docs/how-to/report-task-progress)
+covers concurrent polling, trimming gaps, and progress-write failures.
+
+## Deliver application events
+
+Use `EventQueue` when each named consumer must acknowledge an application event.
+Register subscriptions before emitting: the event captures those recipients,
+and later registrations receive future events only. Workers sharing a subscription
+name share its deliveries; different subscriptions acknowledge independently.
+
+`EventQueue.processOne` manages the delivery lease and acknowledges on success.
+Run `EventQueue.runMaintenance` alongside consumers for expiry and cleanup.
+Events support optional deadlines and either deletion or archival after settlement.
+Provide `EventEngine.layer()` for event operations. See the
+[durable events guide](./docs/events.md) for a complete producer and consumer example.
+
+### Choose the event API
+
+| Need | API | Lifetime |
+| --- | --- | --- |
+| Observe task state changes across a queue | `TaskQueue.stream` | Queue-wide lifecycle stream with its own retention. |
+| Read typed progress for one task generation | `TaskQueue.readEvents` | Opt-in history owned by the task record. |
+| Deliver an application event to independent consumers | `EventQueue` | Durable subscription obligations until acknowledgement, waiver, or expiry. |
+
+---
+
 ## Run a worker
 
 `complete` processes exactly one task. For a long-running process, `Worker`
@@ -308,6 +385,7 @@ const worker = Worker.make(reportQueue, ({ payload }) =>
 | --- | --- |
 | learn the library from a running example | [Getting started](https://docs-one-eta-87.vercel.app/docs/tutorials/getting-started) |
 | process, schedule, retry, or await tasks | [How-to guides](https://docs-one-eta-87.vercel.app/docs/how-to/process-tasks) |
+| report progress or deliver application events | [Task progress](https://docs-one-eta-87.vercel.app/docs/how-to/report-task-progress) · [Durable events](./docs/events.md) |
 | look up exact API behavior | [API reference](./docs/api-reference.md) |
 | understand delivery and task identity | [Delivery guarantees](./docs/delivery-guarantees.md) · [Idempotent offers](./docs/idempotent-offers.md) |
 | operate Redis and plan upgrades | [Operations](./docs/operations.md) · [Upgrade and rollback](./docs/upgrade-and-rollback.md) |
@@ -320,13 +398,3 @@ const worker = Worker.make(reportQueue, ({ payload }) =>
 ## License
 
 MIT.
-
-### Task progress history
-
-Declare a `progress` schema on `Task.make` to enable task-owned progress and
-lifecycle history. Managed handlers receive `context.progress(value)` as their
-second argument; `TaskQueue.readEvents(queue, handle, { after, limit })` reads
-typed pages while work runs and after completion when the task record is kept.
-History is unlimited by default, with optional oldest-first count trimming,
-and disappears when its task record is removed. See the
-[runnable progress guide](./apps/docs/content/docs/how-to/report-task-progress.mdx).

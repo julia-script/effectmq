@@ -1,4 +1,4 @@
-# Release-candidate soak evidence
+# Soak evidence
 
 The soak runner is `scripts/soak.ts`. It runs an ordinary managed worker at
 bounded concurrency, continuously offers 4 KiB typed payloads, waits for every
@@ -18,7 +18,21 @@ by more than 32 MiB, or the forced-GC Node heap grows by more than 64 MiB. CI
 runs a short smoke; a release candidate uses at least the default five-minute
 duration in its target environment.
 
-## Current rc.1 CI smoke
+## Current 0.3.0 CI smoke
+
+On 2026-09-18, [release CI run 35401894239](https://github.com/julia-script/effectmq/actions/runs/35401894239)
+passed at `542b7bbf4fb21319ddb54f1245fc83e3e1ed484e`, using Effect
+`4.0.0-rc.115`, Node 22, and Redis 8.0. The 15-second workload completed all
+6,007 offered tasks, processed the 1,000-item maximum maintenance batch with
+zero remaining due, and reported zero Redis command errors. Redis grew by
+1,782,848 bytes; Node heap fell by 4,350,536 bytes after forced GC. Graceful
+worker shutdown took 4.25 ms.
+
+This ordinary task workload does not measure event-subscription fan-out or
+progress-history capacity. A five-minute run in the target environment remains
+necessary for long-duration evidence for `0.3.0`.
+
+## Historical rc.1 CI smoke
 
 On 2026-09-18, [main CI run 35383526029](https://github.com/julia-script/effectmq/actions/runs/35383526029)
 passed at `d014b10d9240b286b6d823bcf5d2485c23d194bf`, using Effect
@@ -30,8 +44,8 @@ fell by 2,973,600 bytes after forced GC. Graceful worker shutdown took 3.60 ms.
 `pnpm soak` now runs Node with `--expose-gc --import tsx`, so the workload
 itself has access to `globalThis.gc`. The runner rejects a missing GC function
 instead of silently sampling without collection. This preserves the original
-memory limits. A five-minute rc.1 run in the target environment is still
-needed for full candidate soak evidence.
+memory limits. This historical smoke is not long-duration evidence for later
+releases.
 
 ## Historical rc.0 local result
 

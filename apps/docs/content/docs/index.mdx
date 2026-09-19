@@ -9,15 +9,17 @@ typed from the producer through the worker to the caller waiting for a result.
 
 EffectMQ provides fenced, at-least-once task execution. It handles durable task
 state, retries, delays, cron materialization, result retention, and lifecycle
-events. Your application controls handler concurrency and makes external side
-effects idempotent.
+events. Opt-in progress history records typed updates for each task generation.
+Durable application event queues deliver to independently acknowledged named
+subscriptions. Your application controls handler concurrency and makes external
+side effects idempotent.
 
 ## The four parts
 
 EffectMQ separates descriptions from runtime operations:
 
 1. **Define a task** with `Task.make`. This pure value owns the payload,
-   success, and failure schemas plus retry and retention policy.
+   success, failure, and optional progress schemas plus retry and retention policy.
 2. **Define a queue** with `TaskQueue.make`. This pure value binds a queue name
    to the task definition.
 3. **Offer work** with `TaskQueue.offer`. This Effect encodes a payload and
@@ -41,6 +43,8 @@ waiting, scheduling, and Redis wiring need an Effect runtime.
 
 - [Retry, delay, and deduplicate work](/docs/how-to/retry-delay-and-deduplicate)
 - [Wait for results and consume events](/docs/how-to/wait-for-results)
+- [Report and read task progress](/docs/how-to/report-task-progress)
+- [Deliver durable application events](/docs/reference/event-queue)
 - [Schedule recurring tasks](/docs/how-to/schedule-tasks)
 - [Make handler side effects idempotent](/docs/how-to/make-handlers-idempotent)
 - [Operate Redis for EffectMQ](/docs/how-to/operate-redis)
@@ -49,6 +53,7 @@ waiting, scheduling, and Redis wiring need an Effect runtime.
 
 - [Task reference](/docs/reference/task)
 - [TaskQueue reference](/docs/reference/task-queue)
+- [EventQueue reference](/docs/reference/event-queue)
 - [Worker and Scheduler reference](/docs/reference/worker-and-scheduler)
 - [Redis and runtime reference](/docs/reference/redis-and-runtime)
 - [Error reference](/docs/reference/errors)

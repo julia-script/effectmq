@@ -1,6 +1,8 @@
 # Support and compatibility policy
 
-The first production release has a deliberately narrow platform contract.
+The published `0.3.0` release has a deliberately narrow platform contract.
+The package is on npm’s stable `latest` channel while its Effect dependency
+remains `4.0.0-rc.115`; it is not compatible with Effect 3.
 Supported means the combination is exercised in required CI, receives bug and
 security fixes, and is eligible for production incident reports.
 

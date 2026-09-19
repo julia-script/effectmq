@@ -1,6 +1,65 @@
-# 0.3.0-rc.1 release record
+# 0.3.0 release record
 
-Status checked on 2026-09-18: the version PR is merged and every required CI
+Status checked on 2026-09-19: `@effectmq/core@0.3.0` is published, and npm's
+`latest` tag resolves to `0.3.0`. The historical `rc` tag still resolves to
+`0.3.0-rc.0`; use the stable version for current installs. The
+[Release workflow](https://github.com/julia-script/effectmq/actions/runs/35401964359)
+completed successfully for commit `542b7bbf4fb21319ddb54f1245fc83e3e1ed484e`.
+Releases now publish automatically after successful CI, as described in
+[Releasing](./releasing.md).
+
+This release includes durable application event queues with named subscriptions
+and opt-in typed task progress history. It uses Effect and `@effect/platform-node`
+`4.0.0-rc.115`, with the same Effect peer minimum. EffectMQ's stable package
+channel does not change its requirement for the Effect 4 release candidate.
+See the [changelog](../CHANGELOG.md#030) and [support policy](./support-policy.md).
+
+## Published artifact
+
+Registry metadata from [npm](https://www.npmjs.com/package/@effectmq/core/v/0.3.0):
+
+- Package: `@effectmq/core@0.3.0`
+- Source commit: `542b7bbf4fb21319ddb54f1245fc83e3e1ed484e` (successful CI and release workflow)
+- Registry tarball: `https://registry.npmjs.org/@effectmq/core/-/core-0.3.0.tgz`
+- Entries: 109
+- Registry integrity: `sha512-CpAtfsEmBrM5bUuhH+c80qMTyEAcXMipkp14CzWWI/jbZFf4u93ClRkCCD8kiYa2SFpEdTjUM4K3+xSixsnC8A==`
+- Registry SHA-1: `025726003b11c874e082fe7090e0422d2d405a47`
+- Registry advertises a SLSA v1 provenance attestation.
+
+## Release commit evidence
+
+[CI run 35401894239](https://github.com/julia-script/effectmq/actions/runs/35401894239)
+verified the exact release commit:
+
+| Gate | Result |
+| --- | --- |
+| Formatting, lint, source/test/script/docs typechecks, architecture, Lua drift, docs, release configuration | Passed |
+| Effect test lifecycle | 4 tests passed |
+| Unit and Docker integration suite | 203 passed; 2 environment-gated tests skipped |
+| Separate restart/Sentinel fault suite | 3 tests passed |
+| Redis 7.2/7.4/8.0, RESP2/RESP3 | All six combinations passed |
+| Packed ESM consumer | Passed on Node 22 and 24 |
+| 15-second soak smoke | 6,007 offered and completed; zero Redis command errors |
+| Forced-GC heap growth | −4,350,536 bytes; unchanged 64 MiB limit |
+| Maximum maintenance batch | 1,000 processed; zero remaining due |
+| Exact-commit release gate | Passed |
+
+The short CI soak checks an ordinary task workload. It is not a long-duration
+benchmark of event subscriptions or progress history. The historical throughput,
+five-minute soak, and rollback measurements below remain evidence for rc.0,
+not measurements of the published `0.3.0` artifact. This record does not claim
+a fresh registry-consumer run or independent attestation verification for
+`0.3.0`; those remain deployment checks in the release runbook.
+
+Before enabling progress history, upgrade every queue process. Old engines
+cannot maintain or remove enabled generations even though the envelope remains
+protocol v1. Follow [Upgrade and rollback](./upgrade-and-rollback.md).
+
+---
+
+# Historical 0.3.0-rc.1 release record
+
+Historical status checked on 2026-09-18: the version PR is merged and every required CI
 job passed for candidate commit `d014b10d9240b286b6d823bcf5d2485c23d194bf`.
 The [Release workflow](https://github.com/julia-script/effectmq/actions/runs/35383640669)
 is waiting for the protected `npm-production` environment approval.
@@ -9,7 +68,7 @@ At this check, npm had not published `0.3.0-rc.1`: `rc` still resolved to
 
 The candidate uses `effect`, `@effect/platform-node`, and `@effect/vitest`
 `4.0.0-rc.115`; its Effect peer minimum is `4.0.0-rc.115`. Install commands
-in the README and docs target this candidate and require its publication.
+in the README and docs targeted this candidate at the time of this check.
 
 ## Candidate evidence
 
@@ -48,7 +107,7 @@ artifact digests or provenance below as evidence for rc.1. Follow
 # Historical 0.3.0-rc.0 release record
 
 This section preserves the previous release record and its dependency baseline;
-its evidence does not certify rc.1. At rc.0 publication, the `rc` tag pointed to
+its evidence does not certify later releases. At rc.0 publication, the `rc` tag pointed to
 `0.3.0-rc.0`; npm's `latest` tag
 intentionally remained on `0.2.0` until the observation period and an explicit
 stable promotion decision.

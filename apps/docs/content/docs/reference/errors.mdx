@@ -52,12 +52,46 @@ invariants do not appear in typed error unions.
 Built-in terminal task failures are tagged `~effectmq/Error/Stalled` and
 `~effectmq/Error/Canceled`.
 
+## Task progress and history
+
+These errors are exported by `TaskHistory` (including the stable
+`@effectmq/core/TaskHistory` subpath):
+
+| Tag | Fields | Meaning |
+| --- | --- | --- |
+| `HistoryDisabled` | `queue`, `taskId`, `generation` | The definition or stored generation has no enabled history. |
+| `HistoryUnavailable` | `queue`, `taskId`, `generation` | This generation's task record is no longer available. |
+| `InvalidHistoryCursor` | `reason`, optional `cursor` | The cursor is malformed, belongs to another history, or the page size is invalid. |
+| `HistoryCursorExpired` | `requested`, `earliestCursor` | Entries after the requested position were trimmed. |
+| `CorruptHistory` | `cause` | Stored history has an invalid structure. |
+| `ProgressWriteError` | `queue`, `taskId`, `generation`, `reason`, `cause` | Progress encoding or persistence failed; `reason` is `WriteFailed` or `IndeterminateWrite`. |
+
+An uncaught `ProgressWriteError` leaves the attempt unsettled for lease recovery;
+it is not encoded as a handler-domain failure. An indeterminate append may
+already be stored and is not automatically replayed. History reads also expose
+handle, schema, storage, and engine failures. See
+[reporting progress](/docs/how-to/report-task-progress) for gap recovery and
+retention behavior.
+
+## Application event queues
+
+`EventEngine.EventEngineError` carries `code`, `message`, and optional `cause`,
+`operation`, and `eventId`. Its codes are `InvalidInput`, `ConfigurationConflict`,
+`CapacityExceeded`, `SubscriptionMissing`, `LeaseLost`, `EventNotActive`,
+`CorruptStorage`, `IndeterminateWrite`, and `IdentityError`.
+
+For `IndeterminateWrite`, inspect the supplied event identity before deciding
+whether to emit again: emissions are not deduplicated. Stale delivery ownership
+uses the `LeaseLost` code. `processOne` also propagates typed handler failures
+after releasing the delivery for retry. See the
+[EventQueue reference](/docs/reference/event-queue).
+
 ## Storage protocol
 
 | Tag | Meaning |
 | --- | --- |
 | `UnsupportedStorageValue` | The value includes an unsupported type, unsafe number, class instance, or cycle. |
-| `StorageLimitExceeded` | Encoded payload, success, or failure exceeds `maxValueBytes`. |
+| `StorageLimitExceeded` | Encoded payload, success, failure, or progress exceeds `maxValueBytes`. |
 | `StorageCountLimitExceeded` | A task-retention relationship collection reached its limit. |
 | `CorruptStorageValue` | Stored data has an invalid envelope or semantic shape. |
 | `StorageEncodingError` | MessagePack or base64 encoding failed. |
@@ -83,6 +117,9 @@ Built-in terminal task failures are tagged `~effectmq/Error/Stalled` and
 | `IndeterminateWriteError` | Retry the same queue and task identity with `return-existing`. |
 | `CallerTimeout` | Continue waiting later with the same handle if the result retention window permits. |
 | `CursorExpired` | Reconcile durable state, then resume from an acceptable cursor. |
+| `HistoryCursorExpired` | Surface the gap, then use `earliestCursor` if the reader accepts resuming at the oldest retained entry. |
+| `HistoryUnavailable` | Stop polling this history; a separately retained result may still be available through `wait`. |
+| `ProgressWriteError` | Inspect `reason`; an indeterminate append may already exist, so do not blindly replay it. |
 | `ResultExpired` | Read the result from an application-owned durable store if longer retention is required. |
 | `LeaseLost` | Stop treating the attempt as owner; do not acknowledge it again. |
 | `SchemaIdentityMismatch` | Restore the matching schema/version or migrate stored data explicitly. |

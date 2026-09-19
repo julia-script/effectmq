@@ -45,11 +45,10 @@ GitHub OIDC publication identity.
    environment approval, using npm's `latest` tag. A merged PR alone does not
    mean publication has completed.
 
-The transition out of `rc` mode is recorded by running `pnpm changeset pre exit`.
-Until the next version PR is generated, `.changeset/pre.json` keeps `mode: "exit"`
-and the package retains its current prerelease version. Changesets removes the
-prerelease suffix and the state file when generating that PR. Subsequent version
-PRs continue producing stable versions.
+The repository exited `rc` mode for `0.3.0`: the version PR removed
+`.changeset/pre.json`, and subsequent version PRs produce stable versions.
+The old npm `rc` tag is historical; use the exact stable version or `latest`
+for current installs. See the [release record](./release-readiness.md).
 
 Run the short CI-equivalent soak against an isolated Redis instance with:
 

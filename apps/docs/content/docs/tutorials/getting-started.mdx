@@ -56,16 +56,17 @@ PONG
 
 ## Create the project
 
-These examples target `0.3.0-rc.1` and Effect `4.0.0-rc.115`. Check the
+These examples target the published `@effectmq/core@0.3.0` release and Effect
+`4.0.0-rc.115`. EffectMQ uses npm's `latest` channel; its Effect dependency is
+still a release candidate. See the
 [release record](https://github.com/julia-script/effectmq/blob/main/docs/release-readiness.md)
-for publication status. If npm reports that `0.3.0-rc.1` is unavailable, wait
-for publication; do not substitute `0.3.0-rc.0`, which uses the older Effect beta.
+for publication and compatibility evidence.
 
 Initialize the package and install the pinned EffectMQ dependencies:
 
 ```bash
 pnpm init
-pnpm add @effectmq/core@0.3.0-rc.1 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
+pnpm add @effectmq/core@0.3.0 effect@4.0.0-rc.115 @effect/platform-node@4.0.0-rc.115
 pnpm add --save-dev tsx@4.22.4
 mkdir src
 ```
